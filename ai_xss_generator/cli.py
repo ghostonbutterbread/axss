@@ -138,6 +138,18 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
         help="--json-out PATH (always write the full JSON result), e.g. -j result.json",
     )
     parser.add_argument(
+        "-r",
+        "--rate",
+        metavar="N",
+        type=float,
+        default=25.0,
+        help=(
+            "--rate N  Max requests per second against the target (default: 25). "
+            "Use 0 to run uncapped. Lower values help avoid rate-limit bans on strict platforms, "
+            "e.g. -r 5 for 5 req/sec, -r 0 for no limit."
+        ),
+    )
+    parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
@@ -375,6 +387,12 @@ def main(argv: list[str] | None = None) -> int:
         print(_render_table(rows))
         return 0
 
+    # --- Validate rate ---
+    if args.rate < 0:
+        parser.error("--rate must be >= 0 (use 0 for uncapped)")
+    rate_label = "uncapped" if args.rate == 0 else f"{args.rate:g} req/sec"
+    info(f"Rate limit: {rate_label}")
+
     # --- Resolve WAF (auto-detect or manual) ---
     resolved_waf: str | None = args.waf  # may be None; will be filled by auto-detect below
 
@@ -435,7 +453,7 @@ def main(argv: list[str] | None = None) -> int:
 
         step(f"Fetching and parsing {len(urls)} URL(s)...")
         try:
-            contexts, errors = parse_targets(urls=urls, parser_plugins=registry.parsers)
+            contexts, errors = parse_targets(urls=urls, parser_plugins=registry.parsers, rate=args.rate)
         except Exception as exc:
             parser.error(str(exc))
 
@@ -528,7 +546,7 @@ def main(argv: list[str] | None = None) -> int:
 
     step(f"Fetching/parsing target: {target}")
     try:
-        context = parse_target(url=args.url, html_value=args.input, parser_plugins=registry.parsers)
+        context = parse_target(url=args.url, html_value=args.input, parser_plugins=registry.parsers, rate=args.rate)
     except Exception as exc:
         parser.error(str(exc))
 

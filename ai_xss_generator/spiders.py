@@ -100,9 +100,32 @@ class AxssSpider(scrapy.Spider):
         }
 
 
-def crawl_urls(urls: Iterable[str]) -> dict[str, dict[str, Any]]:
+def _rate_settings(rate: float) -> dict[str, Any]:
+    """Convert req/sec rate to Scrapy throttle settings. 0 = uncapped."""
+    if rate > 0:
+        return {
+            "DOWNLOAD_DELAY": 1.0 / rate,
+            "CONCURRENT_REQUESTS": 1,
+            "CONCURRENT_REQUESTS_PER_DOMAIN": 1,
+            "AUTOTHROTTLE_ENABLED": False,
+        }
+    return {
+        "DOWNLOAD_DELAY": 0,
+        "AUTOTHROTTLE_ENABLED": False,
+    }
+
+
+def crawl_urls(urls: Iterable[str], rate: float = 25.0) -> dict[str, dict[str, Any]]:
+    """Crawl a list of URLs and return parsed results keyed by URL.
+
+    Parameters
+    ----------
+    urls:  URLs to fetch.
+    rate:  Max requests per second. 0 disables throttling entirely.
+    """
     results: dict[str, dict[str, Any]] = {}
-    process = CrawlerProcess(settings={"LOG_ENABLED": False})
+    settings = {"LOG_ENABLED": False, **_rate_settings(rate)}
+    process = CrawlerProcess(settings=settings)
     process.crawl(AxssSpider, urls=list(urls), results=results)
     process.start(stop_after_crawl=True, install_signal_handlers=False)
     return results

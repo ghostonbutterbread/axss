@@ -31,6 +31,7 @@ Qwen3.5 is a strong default for this project because the task is not just "write
 - `--public` is also usable standalone (no target required) to dump a filtered public payload list.
 - Fetched payload lists are cached in `~/.cache/axss/` with a 24-hour TTL (6 hours for social sources).
 - Color-coded output: risk scores are red / yellow / green by severity; step-by-step progress indicators are always visible during a run.
+- `-r, --rate N` caps requests per second against the target (default: 25). Set to `0` for uncapped. Keeps you out of rate-limit bans on strict platforms.
 - Lists local models with `-l, --list-models` and searches model names with `-s, --search-models QUERY`.
 - Ranks payloads in `list`, `heat`, or `json` output modes.
 - Ships with `setup.sh`, which installs Ollama with the official curl script when needed, auto-selects a Qwen3.5 tier, pulls it, creates `~/.axss/config.json`, builds the venv, and symlinks `~/.local/bin/axss`.
@@ -169,6 +170,18 @@ Force the smaller Qwen3.5 model when you want lower memory usage:
 axss -u https://example.com -m qwen3.5:4b -o list -t 5
 ```
 
+Slow down to 5 req/sec for a strict target:
+
+```bash
+axss -u https://example.com -r 5 -o list
+```
+
+Run uncapped (no rate limit):
+
+```bash
+axss --urls urls.txt -r 0 -o list
+```
+
 Fetch public payloads and scan a live target with WAF context:
 
 ```bash
@@ -239,6 +252,8 @@ options:
   -t, --top N           --top N (limit ranked payloads), e.g. -t 10 (default: 20)
   -j, --json-out PATH   --json-out PATH (always write the full JSON result),
                         e.g. -j result.json
+  -r, --rate N          --rate N  Max requests per second against the target
+                        (default: 25). Use 0 for uncapped, e.g. -r 5 or -r 0
   -v, --verbose         --verbose (print detailed sub-step progress),
                         e.g. -v -i sample_target.html
   --merge-batch         --merge-batch (combine batch contexts into one payload set),
