@@ -32,9 +32,8 @@ VARIABLE_RE = re.compile(
 OBJECT_RE = re.compile(r"\b([A-Za-z_$][\w$]*)\s*:\s*{", re.IGNORECASE)
 
 try:
-    from scrapy import Selector
-    from scrapy.http import Response
-except Exception:  # pragma: no cover - exercised only when scrapy is unavailable
+    from scrapling.engines.toolbelt.custom import Selector, Response
+except Exception:  # pragma: no cover - exercised only when scrapling is unavailable
     Selector = None
     Response = Any
 
@@ -140,7 +139,7 @@ def _extract_with_selectors(selector: Any) -> MarkupExtraction:
                 handlers.add(attr_name)
 
     for field in selector.css("input, textarea, select, button"):
-        inputs.append(_field_from_attrs(field.root.tag, dict(field.attrib)))
+        inputs.append(_field_from_attrs(field.tag, dict(field.attrib)))
 
     for form in selector.css("form"):
         form_context = FormContext(
@@ -148,7 +147,7 @@ def _extract_with_selectors(selector: Any) -> MarkupExtraction:
             method=(form.attrib.get("method", "get") or "get").upper(),
         )
         for field in form.css("input, textarea, select, button"):
-            form_context.fields.append(_field_from_attrs(field.root.tag, dict(field.attrib)))
+            form_context.fields.append(_field_from_attrs(field.tag, dict(field.attrib)))
         forms.append(form_context)
 
     for script in selector.css("script"):
@@ -164,7 +163,7 @@ def _extract_with_selectors(selector: Any) -> MarkupExtraction:
         inputs=inputs,
         handlers=sorted(handlers),
         inline_scripts=inline_scripts,
-        notes=["Parsed HTML with Scrapy selectors."],
+        notes=["Parsed HTML with Scrapling selectors."],
     )
 
 
@@ -183,12 +182,15 @@ def _extract_with_stdlib(html: str) -> MarkupExtraction:
 
 def _extract_html_context(html: str) -> MarkupExtraction:
     if Selector is not None:
-        return _extract_with_selectors(Selector(text=html))
+        return _extract_with_selectors(
+            Selector(content=html.encode("utf-8"), url="", encoding="utf-8")
+        )
     return _extract_with_stdlib(html)
 
 
 def extract_markup_from_response(response: Response) -> MarkupExtraction:
-    return _extract_with_selectors(response.selector)
+    # Scrapling Response extends Selector — pass it directly
+    return _extract_with_selectors(response)
 
 
 def _extract_frameworks(html: str, scripts: list[str]) -> list[str]:

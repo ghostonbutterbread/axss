@@ -187,6 +187,8 @@ source "$VENV_DIR/bin/activate"
 
 python -m pip install --upgrade pip
 python -m pip install -r "$ROOT_DIR/requirements.txt"
+# Install Playwright browser binaries required by Scrapling's stealth fetcher
+python -m playwright install chromium --with-deps 2>/dev/null || true
 
 mkdir -p "$BIN_DIR"
 
