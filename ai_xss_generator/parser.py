@@ -301,7 +301,7 @@ def fetch_target(url: str) -> str:
     response = requests.get(
         url,
         headers={
-            "User-Agent": "ai-xss-generator/0.1 (+authorized security testing)",
+            "User-Agent": "axss/0.1 (+authorized security testing)",
         },
         timeout=20,
     )

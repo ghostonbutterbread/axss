@@ -1,4 +1,4 @@
-"""AI-assisted XSS payload generator."""
+"""axss: AI-assisted XSS payload generator."""
 
 __all__ = ["__version__"]
 

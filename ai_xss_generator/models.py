@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import replace
 from typing import Any
+from urllib.parse import quote_plus
 
 import requests
 
@@ -15,6 +17,18 @@ from ai_xss_generator.types import ParsedContext, PayloadCandidate
 
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
 OPENAI_MODEL = "gpt-4o-mini"
+MODEL_ALIASES = {
+    "qwen2.5-coder:7b-instruct-q5_K_M": [
+        "qwen2.5-coder:7b-instruct-q5_K_M",
+        "qwen2.5-coder:7b-instruct-q5_K_M.gguf",
+        "qwen2.5-coder:7b",
+    ],
+    "qwen2.5-coder:7b-instruct-q5_K_M.gguf": [
+        "qwen2.5-coder:7b-instruct-q5_K_M.gguf",
+        "qwen2.5-coder:7b-instruct-q5_K_M",
+        "qwen2.5-coder:7b",
+    ],
+}
 
 
 def _prompt_for_context(context: ParsedContext) -> str:
@@ -79,41 +93,127 @@ def _extract_json_blob(text: str) -> dict[str, Any]:
     return json.loads(text[start : end + 1])
 
 
-def _ensure_ollama_model(model: str) -> tuple[bool, str]:
+def _candidate_models(model: str) -> list[str]:
+    candidates = [model, *MODEL_ALIASES.get(model, [])]
+    deduped: list[str] = []
+    for candidate in candidates:
+        if candidate and candidate not in deduped:
+            deduped.append(candidate)
+    return deduped
+
+
+def _parse_ollama_table(text: str) -> list[dict[str, str]]:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return []
+    headers = re.split(r"\s{2,}", lines[0])
+    rows: list[dict[str, str]] = []
+    for line in lines[1:]:
+        columns = re.split(r"\s{2,}", line, maxsplit=max(0, len(headers) - 1))
+        if len(columns) < len(headers):
+            columns.extend([""] * (len(headers) - len(columns)))
+        rows.append({header: value for header, value in zip(headers, columns)})
+    return rows
+
+
+def _run_ollama_command(*args: str) -> subprocess.CompletedProcess[str]:
     if shutil.which("ollama") is None:
-        return False, "ollama binary not found"
-    try:
-        response = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=3)
-        response.raise_for_status()
-        models = response.json().get("models", [])
-        if any(entry.get("name") == model for entry in models):
-            return True, "model already available"
-    except Exception:
-        pass
-    pull = subprocess.run(
-        ["ollama", "pull", model],
+        raise RuntimeError("ollama binary not found")
+    result = subprocess.run(
+        ["ollama", *args],
         check=False,
         capture_output=True,
         text=True,
     )
-    if pull.returncode == 0:
-        return True, "model pulled"
-    return False, (pull.stderr or pull.stdout or "ollama pull failed").strip()
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or result.stdout or f"ollama {' '.join(args)} failed").strip())
+    return result
 
 
-def _generate_with_ollama(context: ParsedContext, model: str) -> list[PayloadCandidate]:
-    ready, reason = _ensure_ollama_model(model)
+def list_ollama_models() -> tuple[list[dict[str, str]], str]:
+    result = _run_ollama_command("list")
+    return _parse_ollama_table(result.stdout), "ollama list"
+
+
+def _search_ollama_library(query: str) -> list[dict[str, str]]:
+    response = requests.get(
+        f"https://ollama.com/search?q={quote_plus(query)}",
+        timeout=10,
+        headers={"User-Agent": "axss/0.1 (+authorized security testing)"},
+    )
+    response.raise_for_status()
+    matches = re.findall(r'href="/library/([^"?#]+)"', response.text)
+    rows: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for match in matches:
+        name = match.strip("/")
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        rows.append({"NAME": name, "SOURCE": "ollama.com"})
+    return rows[:20]
+
+
+def search_ollama_models(query: str) -> tuple[list[dict[str, str]], str]:
+    if shutil.which("ollama") is not None:
+        result = subprocess.run(
+            ["ollama", "search", query],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            return _parse_ollama_table(result.stdout), "ollama search"
+        stderr = (result.stderr or result.stdout or "").lower()
+        unsupported_markers = ("unknown command", "no such command", "usage:")
+        if not any(marker in stderr for marker in unsupported_markers):
+            raise RuntimeError((result.stderr or result.stdout or "ollama search failed").strip())
+
+    rows = _search_ollama_library(query)
+    return rows, "ollama.com search"
+
+
+def _ensure_ollama_model(model: str) -> tuple[bool, str, str]:
+    candidates = _candidate_models(model)
+    if shutil.which("ollama") is None:
+        return False, model, "ollama binary not found"
+    try:
+        response = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=3)
+        response.raise_for_status()
+        models = response.json().get("models", [])
+        available = {entry.get("name") for entry in models if entry.get("name")}
+        for candidate in candidates:
+            if candidate in available:
+                return True, candidate, "model already available"
+    except Exception:
+        pass
+    errors: list[str] = []
+    for candidate in candidates:
+        pull = subprocess.run(
+            ["ollama", "pull", candidate],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if pull.returncode == 0:
+            return True, candidate, "model pulled"
+        errors.append(f"{candidate}: {(pull.stderr or pull.stdout or 'ollama pull failed').strip()}")
+    return False, model, "; ".join(errors)
+
+
+def _generate_with_ollama(context: ParsedContext, model: str) -> tuple[list[PayloadCandidate], str]:
+    ready, resolved_model, reason = _ensure_ollama_model(model)
     if not ready:
         raise RuntimeError(f"Ollama unavailable: {reason}")
     response = requests.post(
         f"{OLLAMA_BASE_URL}/api/generate",
-        json={"model": model, "prompt": _prompt_for_context(context), "stream": False},
+        json={"model": resolved_model, "prompt": _prompt_for_context(context), "stream": False},
         timeout=90,
     )
     response.raise_for_status()
     body = response.json()
     data = _extract_json_blob(body.get("response", ""))
-    return _normalize_payloads(data.get("payloads", []), source="ollama")
+    return _normalize_payloads(data.get("payloads", []), source="ollama"), resolved_model
 
 
 def _generate_with_openai(context: ParsedContext) -> list[PayloadCandidate]:
@@ -167,14 +267,15 @@ def generate_payloads(
     context: ParsedContext,
     model: str,
     mutator_plugins: list[Any] | None = None,
-) -> tuple[list[PayloadCandidate], str, bool]:
+) -> tuple[list[PayloadCandidate], str, bool, str]:
     mutator_plugins = mutator_plugins or []
     heuristics = base_payloads_for_context(context)
     engine = "heuristic"
     used_fallback = True
+    resolved_model = model
     ai_payloads: list[PayloadCandidate] = []
     try:
-        ai_payloads = _generate_with_ollama(context, model)
+        ai_payloads, resolved_model = _generate_with_ollama(context, model)
         engine = "ollama"
         used_fallback = False
     except Exception:
@@ -182,10 +283,12 @@ def generate_payloads(
             ai_payloads = _generate_with_openai(context)
             engine = "openai"
             used_fallback = True
+            resolved_model = OPENAI_MODEL
         except Exception:
             ai_payloads = []
             engine = "heuristic"
             used_fallback = True
+            resolved_model = model
 
     combined = heuristics + ai_payloads
     combined = _apply_mutators(combined, context, mutator_plugins)
@@ -198,4 +301,4 @@ def generate_payloads(
             for payload in ranked
         ]
         ranked = sorted(ranked, key=lambda item: (-item.risk_score, item.payload))
-    return ranked, engine, used_fallback
+    return ranked, engine, used_fallback, resolved_model

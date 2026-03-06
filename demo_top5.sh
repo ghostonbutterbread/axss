@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PUBLIC_TARGET="https://xss-game.appspot.com/level1/frame"
-RUNNER=("$ROOT_DIR/venv/bin/python" "$ROOT_DIR/ai-xss-generator.py")
+RUNNER=("$ROOT_DIR/venv/bin/python" "$ROOT_DIR/axss.py")
 
 if "${RUNNER[@]}" -u "$PUBLIC_TARGET" -o list -t 5; then
   exit 0

@@ -5,53 +5,67 @@ import sys
 from pathlib import Path
 
 from ai_xss_generator import __version__
-from ai_xss_generator.models import generate_payloads
+from ai_xss_generator.config import APP_NAME, CONFIG_PATH, DEFAULT_MODEL, load_config
+from ai_xss_generator.models import generate_payloads, list_ollama_models, search_ollama_models
 from ai_xss_generator.output import render_heat, render_json, render_list, render_summary
 from ai_xss_generator.parser import parse_target
 from ai_xss_generator.plugin_system import PluginRegistry
 from ai_xss_generator.types import GenerationResult
 
 
-DEFAULT_MODEL = "qwen2.5-coder:7b-instruct-q5_K_M"
-
-
 class _HelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter):
     pass
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser(config_default_model: str) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="ai-xss-generator",
+        prog=APP_NAME,
         description="Context-aware XSS payload generator with Ollama-first AI fallback.",
         epilog=(
             "Examples:\n"
-            "  ai-xss-generator -h sample_target.html -o list -t 10\n"
-            "  ai-xss-generator -h '<div onclick=\"{{user}}\"></div>' -o heat\n"
-            "  ai-xss-generator -u https://example.com -o json --json-out result.json\n"
-            f"  ai-xss-generator -u https://example.com -m {DEFAULT_MODEL} -o list -t 3"
+            "  axss -h sample_target.html -o list -t 10\n"
+            "  axss -h '<div onclick=\"{{user}}\"></div>' -o heat\n"
+            "  axss -l\n"
+            "  axss -s qwen\n"
+            f"  axss -u https://example.com -m {config_default_model} -o list -t 3"
         ),
         formatter_class=_HelpFormatter,
         add_help=False,
     )
     parser.add_argument("--help", action="help", help="Show this help message and exit.")
-    source_group = parser.add_mutually_exclusive_group(required=True)
-    source_group.add_argument(
+    action_group = parser.add_mutually_exclusive_group(required=True)
+    action_group.add_argument(
         "-u",
         "--url",
         metavar="TARGET",
         help="Fetch and parse a target URL. Example: -u https://example.com",
     )
-    source_group.add_argument(
+    action_group.add_argument(
         "-h",
         "--html",
         metavar="FILE_OR_SNIPPET",
         help="Parse a local HTML file or a raw HTML snippet. Example: -h sample_target.html",
     )
+    action_group.add_argument(
+        "-l",
+        "--list-models",
+        action="store_true",
+        help="List locally available Ollama models.",
+    )
+    action_group.add_argument(
+        "-s",
+        "--search-models",
+        metavar="QUERY",
+        help="Search Ollama models by name or keyword.",
+    )
     parser.add_argument(
         "-m",
         "--model",
-        default=DEFAULT_MODEL,
-        help=f"Ollama model name. Example: -m {DEFAULT_MODEL}",
+        default=None,
+        help=(
+            "Override the Ollama model for generation. "
+            f"Default comes from {CONFIG_PATH} or falls back to {DEFAULT_MODEL}."
+        ),
     )
     parser.add_argument(
         "-o",
@@ -77,6 +91,24 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _render_table(rows: list[dict[str, str]]) -> str:
+    if not rows:
+        return "No results."
+
+    headers = list(rows[0].keys())
+    widths = {
+        header: max(len(header), *(len(str(row.get(header, ""))) for row in rows))
+        for header in headers
+    }
+    header_line = "  ".join(f"{header:<{widths[header]}}" for header in headers)
+    separator = "  ".join("-" * widths[header] for header in headers)
+    body = [
+        "  ".join(f"{str(row.get(header, '')):<{widths[header]}}" for header in headers)
+        for row in rows
+    ]
+    return "\n".join([header_line, separator, *body])
+
+
 def _print_context_banner(result: GenerationResult) -> None:
     context = result.context
     print(
@@ -93,8 +125,29 @@ def _print_context_banner(result: GenerationResult) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = build_parser()
+    config = load_config()
+    parser = build_parser(config.default_model)
     args = parser.parse_args(argv)
+
+    if args.list_models:
+        try:
+            rows, source = list_ollama_models()
+        except Exception as exc:
+            parser.exit(1, f"Error: {exc}\n")
+        print(f"Local Ollama models ({source})")
+        print(_render_table(rows))
+        return 0
+
+    if args.search_models:
+        try:
+            rows, source = search_ollama_models(args.search_models)
+        except Exception as exc:
+            parser.exit(1, f"Error: {exc}\n")
+        print(f"Ollama model search for {args.search_models!r} ({source})")
+        print(_render_table(rows))
+        return 0
+
+    selected_model = args.model or config.default_model
     registry = PluginRegistry()
     registry.load_from(Path(__file__).resolve().parent.parent)
 
@@ -103,14 +156,14 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         parser.error(str(exc))
 
-    payloads, engine, used_fallback = generate_payloads(
+    payloads, engine, used_fallback, resolved_model = generate_payloads(
         context=context,
-        model=args.model,
+        model=selected_model,
         mutator_plugins=registry.mutators,
     )
     result = GenerationResult(
         engine=engine,
-        model=args.model if engine != "openai" else "gpt-4o-mini",
+        model=resolved_model,
         used_fallback=used_fallback,
         context=context,
         payloads=payloads,
