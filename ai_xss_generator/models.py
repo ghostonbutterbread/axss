@@ -278,8 +278,11 @@ def generate_payloads(
     context: ParsedContext,
     model: str,
     mutator_plugins: list[Any] | None = None,
+    progress: Any | None = None,
 ) -> tuple[list[PayloadCandidate], str, bool, str]:
     mutator_plugins = mutator_plugins or []
+    if progress is not None:
+        progress("Generating payloads...")
     heuristics = base_payloads_for_context(context)
     engine = "heuristic"
     used_fallback = True
@@ -302,6 +305,8 @@ def generate_payloads(
             resolved_model = model
 
     combined = heuristics + ai_payloads
+    if progress is not None:
+        progress("Ranking/mutating...")
     combined = _apply_mutators(combined, context, mutator_plugins)
     ranked = rank_payloads(combined, context)
     if engine != "heuristic":

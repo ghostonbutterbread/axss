@@ -36,7 +36,7 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
             "Common combos:\n"
             "  axss -u https://example.com -t 10 -o list\n"
             f"  axss -u https://example.com -m {config_default_model} -o list -t 3\n"
-            "  axss -i sample_target.html -o heat\n"
+            "  axss -v -i sample_target.html -o heat\n"
             "  axss -l\n"
             "  axss -s qwen3.5\n"
             "  axss -u https://example.com -m qwen3.5:4b -j result.json"
@@ -54,9 +54,9 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
     )
     action_group.add_argument(
         "-i",
-        "--html",
+        "--input",
         metavar="FILE_OR_SNIPPET",
-        help="--html FILE_OR_SNIPPET (parse a local file or raw HTML), e.g. -i sample_target.html",
+        help="--input FILE_OR_SNIPPET (parse a local file or raw HTML), e.g. -i sample_target.html",
     )
     action_group.add_argument(
         "-l",
@@ -102,6 +102,12 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
         metavar="PATH",
         help="--json-out PATH (always write the full JSON result), e.g. -j result.json",
     )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="--verbose (print stage-by-stage progress), e.g. -v -i sample_target.html",
+    )
     parser.add_argument("-V", "--version", action="version", version=f"%(prog)s {__version__}")
     return parser
 
@@ -139,6 +145,11 @@ def _print_context_banner(result: GenerationResult) -> None:
         print("notes:", " ".join(context.notes))
 
 
+def _verbose(message: str, *, enabled: bool) -> None:
+    if enabled:
+        print(message, flush=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     config = load_config()
     parser = build_parser(config.default_model)
@@ -167,14 +178,19 @@ def main(argv: list[str] | None = None) -> int:
     registry.load_from(Path(__file__).resolve().parent.parent)
 
     try:
-        context = parse_target(url=args.url, html_value=args.html, parser_plugins=registry.parsers)
+        target = args.url or args.input or ""
+        _verbose("Fetching/parsing target...", enabled=args.verbose)
+        _verbose("Fetching target: {}...".format(target), enabled=args.verbose)
+        context = parse_target(url=args.url, html_value=args.input, parser_plugins=registry.parsers)
     except Exception as exc:
         parser.error(str(exc))
 
+    _verbose("Loading model...", enabled=args.verbose)
     payloads, engine, used_fallback, resolved_model = generate_payloads(
         context=context,
         model=selected_model,
         mutator_plugins=registry.mutators,
+        progress=lambda message: _verbose(message, enabled=args.verbose),
     )
     result = GenerationResult(
         engine=engine,
@@ -184,6 +200,7 @@ def main(argv: list[str] | None = None) -> int:
         payloads=payloads,
     )
 
+    _verbose("Rendering output...", enabled=args.verbose)
     _print_context_banner(result)
     print(render_summary(result, limit=min(args.top, 10)))
     print()

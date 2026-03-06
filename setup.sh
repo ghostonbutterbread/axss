@@ -124,11 +124,15 @@ install_ollama_if_needed() {
   if have_cmd ollama; then
     return 0
   fi
-  if ! have_cmd brew; then
-    echo "Warning: Homebrew is required to install Ollama automatically." >&2
+  if ! have_cmd curl; then
+    echo "Warning: curl is required to install Ollama automatically." >&2
     return 1
   fi
-  HOMEBREW_NO_AUTO_UPDATE=1 brew install ollama
+  if curl -fsSL https://ollama.com/install.sh | sh; then
+    echo "Ollama installed via official script"
+    return 0
+  fi
+  return 1
 }
 
 ensure_ollama_ready() {

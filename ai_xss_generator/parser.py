@@ -323,7 +323,7 @@ def parse_target(
     parser_plugins: list[Any] | None = None,
 ) -> ParsedContext:
     if bool(url) == bool(html_value):
-        raise ValueError("Choose exactly one of --url or --html")
+        raise ValueError("Choose exactly one of --url or --input")
     parser_plugins = parser_plugins or []
     if url:
         html = fetch_target(url)

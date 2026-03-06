@@ -18,12 +18,12 @@ Qwen3.5 is a strong default for this project because the task is not just "write
 
 ## Features
 
-- Parses a live URL with `-u, --url TARGET` or local HTML/snippets with `-i, --html FILE_OR_SNIPPET`.
+- Parses a live URL with `-u, --url TARGET` or local HTML/snippets with `-i, --input FILE_OR_SNIPPET`.
 - Detects forms, inputs, inline scripts, DOM sinks, variables, objects, and framework fingerprints.
 - Uses Ollama-first generation with Qwen3.5 model overrides via `-m, --model`.
 - Lists local models with `-l, --list-models` and searches model names with `-s, --search-models QUERY`.
 - Ranks payloads in `list`, `heat`, or `json` output modes.
-- Ships with `setup.sh`, which auto-selects a Qwen3.5 tier, pulls it, creates `~/.axss/config.json`, builds the venv, and symlinks `~/.local/bin/axss`.
+- Ships with `setup.sh`, which installs Ollama with the official curl script when needed, auto-selects a Qwen3.5 tier, pulls it, creates `~/.axss/config.json`, builds the venv, and symlinks `~/.local/bin/axss`.
 
 ## Setup
 
@@ -36,7 +36,7 @@ axss --help
 
 `setup.sh` does all of the following:
 
-- Installs Ollama automatically on Homebrew-based systems when `ollama` is missing.
+- Installs Ollama automatically with `curl -fsSL https://ollama.com/install.sh | sh` when `ollama` is missing.
 - Detects RAM and NVIDIA VRAM, then selects a Qwen3.5 tier.
 - Starts `ollama serve` if needed and runs `ollama pull` for the selected model.
 - Writes `~/.axss/config.json` with `default_model`.
@@ -49,14 +49,14 @@ If you want to control the install yourself:
 1. Install Ollama.
 
 ```bash
-# macOS with Homebrew
-brew install ollama
+# official installer
+curl -fsSL https://ollama.com/install.sh | sh
 
 # then start the local runtime
 ollama serve
 ```
 
-If you are not using Homebrew, install Ollama with the official package for your OS first, then start `ollama serve`.
+`setup.sh` uses that same official installer automatically when `ollama` is missing.
 
 2. Pull the Qwen3.5 size that matches your machine.
 
@@ -147,6 +147,12 @@ Force the smaller Qwen3.5 model when you want lower memory usage:
 axss -u https://example.com -m qwen3.5:4b -o list -t 5
 ```
 
+Show stage-by-stage progress while scanning a local target:
+
+```bash
+axss -v -i sample_target.html -t 5 -o list
+```
+
 Run the bundled demo:
 
 ```bash
@@ -158,7 +164,7 @@ Run the bundled demo:
 ```text
 $ axss --help
 usage: axss [-h] (-u TARGET | -i FILE_OR_SNIPPET | -l | -s QUERY)
-            [-m MODEL] [-o {json,list,heat}] [-t N] [-j PATH] [-V]
+            [-m MODEL] [-o {json,list,heat}] [-t N] [-j PATH] [-v] [-V]
 
 Parse local or live HTML, identify likely XSS execution points, and rank payloads with Ollama-first generation.
 
@@ -166,8 +172,8 @@ options:
   -h, --help            Show this help message and exit.
   -u, --url TARGET      --url TARGET (fetch live HTML), e.g. -u
                         https://example.com
-  -i, --html FILE_OR_SNIPPET
-                        --html FILE_OR_SNIPPET (parse a local file or raw
+  -i, --input FILE_OR_SNIPPET
+                        --input FILE_OR_SNIPPET (parse a local file or raw
                         HTML), e.g. -i sample_target.html
   -l, --list-models     --list-models (show locally available Ollama models),
                         e.g. -l
@@ -183,12 +189,14 @@ options:
                         20)
   -j, --json-out PATH   --json-out PATH (always write the full JSON result),
                         e.g. -j result.json
+  -v, --verbose         --verbose (print stage-by-stage progress), e.g. -v -i
+                        sample_target.html
   -V, --version         show program's version number and exit
 
 Common combos:
   axss -u https://example.com -t 10 -o list
   axss -u https://example.com -m qwen3.5:9b -o list -t 3
-  axss -i sample_target.html -o heat
+  axss -v -i sample_target.html -o heat
   axss -l
 ```
 
@@ -203,7 +211,13 @@ Common combos:
 Sample run against `sample_target.html`:
 
 ```text
-$ ./axss -i sample_target.html -o heat -t 8
+$ ./axss -v -i sample_target.html -o heat -t 8
+Fetching/parsing target...
+Fetching target: sample_target.html...
+Loading model...
+Generating payloads...
+Ranking/mutating...
+Rendering output...
 Target: file:sample_target.html (html) | engine=heuristic | model=qwen3.5:9b | fallback=True
 title=XSS Demo Target | frameworks=React | forms=1 | inputs=3 | handlers=0 | sinks=4
 notes: Parsed HTML with BeautifulSoup. Parsed scripts with esprima AST.

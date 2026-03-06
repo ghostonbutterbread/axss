@@ -10,15 +10,16 @@ class CliHelpTest(unittest.TestCase):
 
         self.assertIn("-h, --help", help_text)
         self.assertIn("-u, --url TARGET", help_text)
-        self.assertIn("-i, --html FILE_OR_SNIPPET", help_text)
+        self.assertIn("-i, --input FILE_OR_SNIPPET", help_text)
         self.assertIn("-l, --list-models", help_text)
         self.assertIn("-s, --search-models QUERY", help_text)
         self.assertIn("-m, --model MODEL", help_text)
         self.assertIn("-o, --output {json,list,heat}", help_text)
         self.assertIn("-t, --top N", help_text)
         self.assertIn("-j, --json-out PATH", help_text)
+        self.assertIn("-v, --verbose", help_text)
         self.assertIn("-V, --version", help_text)
-        self.assertNotIn("-h, --html", help_text)
+        self.assertNotIn("--html", help_text)
         self.assertNotIn("(default: None)", help_text)
 
 
