@@ -1,0 +1,26 @@
+<!doctype html>
+<html>
+  <head>
+    <title>XSS Demo Target</title>
+  </head>
+  <body>
+    <div id="app">
+      <form action="/search" method="get">
+        <input type="text" name="q" placeholder="search query">
+        <input type="text" id="term" name="term">
+        <button type="submit">Go</button>
+      </form>
+      <a id="result" href="#">Result</a>
+      <div id="preview"></div>
+    </div>
+    <script>
+      const params = new URLSearchParams(location.search);
+      const q = params.get('q') || '';
+      const state = { html: q };
+      document.querySelector('#preview').innerHTML = q;
+      setTimeout("console.log('" + q + "')", 200);
+      document.querySelector('#result').setAttribute('onclick', q);
+      const dangerouslySetInnerHTML = { __html: q };
+    </script>
+  </body>
+</html>
