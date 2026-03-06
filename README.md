@@ -7,6 +7,8 @@
 
 `axss` is a context-aware XSS recon CLI that parses target HTML, detects likely DOM sinks and framework fingerprints, then generates ranked payloads with an Ollama-first Qwen3.5 workflow plus heuristic fallback.
 
+Live crawling now uses a quiet Scrapy spider with selector-based parsing, which makes multi-URL recon less noisy and scales better than the earlier BeautifulSoup fetch path.
+
 ## Why Qwen3.5
 
 Qwen3.5 is a strong default for this project because the task is not just "write an XSS string." It has to read HTML, follow JavaScript context, notice framework clues, and mutate payloads toward likely execution paths.
@@ -18,8 +20,9 @@ Qwen3.5 is a strong default for this project because the task is not just "write
 
 ## Features
 
-- Parses a live URL with `-u, --url TARGET` or local HTML/snippets with `-i, --input FILE_OR_SNIPPET`.
+- Parses a live URL with `-u, --url TARGET`, a batch file with `--urls FILE`, or local HTML/snippets with `-i, --input FILE_OR_SNIPPET`.
 - Detects forms, inputs, inline scripts, DOM sinks, variables, objects, and framework fingerprints.
+- Uses Scrapy selectors for HTML extraction and a quiet `AxssSpider` for larger live recon runs.
 - Uses Ollama-first generation with Qwen3.5 model overrides via `-m, --model`.
 - Lists local models with `-l, --list-models` and searches model names with `-s, --search-models QUERY`.
 - Ranks payloads in `list`, `heat`, or `json` output modes.
@@ -141,6 +144,18 @@ Fetch a live target and write the full JSON result to disk:
 axss -u https://example.com -m qwen3.5:9b -o json -j result.json
 ```
 
+Scan a batch list and print the top payloads for each URL:
+
+```bash
+axss --urls urls.txt -t 5 -o list
+```
+
+Merge a batch into one combined payload set while still writing per-URL JSON:
+
+```bash
+axss --urls urls.txt --merge-batch -o json -j batch.json
+```
+
 Force the smaller Qwen3.5 model when you want lower memory usage:
 
 ```bash
@@ -163,8 +178,9 @@ Run the bundled demo:
 
 ```text
 $ axss --help
-usage: axss [-h] (-u TARGET | -i FILE_OR_SNIPPET | -l | -s QUERY)
-            [-m MODEL] [-o {json,list,heat}] [-t N] [-j PATH] [-v] [-V]
+usage: axss [-h] (-u TARGET | --urls FILE | -i FILE_OR_SNIPPET | -l | -s QUERY)
+            [-m MODEL] [-o {json,list,heat}] [-t N] [-j PATH] [-v]
+            [--merge-batch] [-V]
 
 Parse local or live HTML, identify likely XSS execution points, and rank payloads with Ollama-first generation.
 
@@ -172,6 +188,8 @@ options:
   -h, --help            Show this help message and exit.
   -u, --url TARGET      --url TARGET (fetch live HTML), e.g. -u
                         https://example.com
+  --urls FILE           --urls FILE (fetch one URL per line), e.g. --urls
+                        urls.txt
   -i, --input FILE_OR_SNIPPET
                         --input FILE_OR_SNIPPET (parse a local file or raw
                         HTML), e.g. -i sample_target.html
@@ -191,10 +209,14 @@ options:
                         e.g. -j result.json
   -v, --verbose         --verbose (print stage-by-stage progress), e.g. -v -i
                         sample_target.html
+  --merge-batch         --merge-batch (combine batch contexts into one payload
+                        set), e.g. --urls urls.txt --merge-batch
   -V, --version         show program's version number and exit
 
 Common combos:
   axss -u https://example.com -t 10 -o list
+  axss --urls urls.txt -t 5 -o list
+  axss --urls urls.txt --merge-batch -o json -j result.json
   axss -u https://example.com -m qwen3.5:9b -o list -t 3
   axss -v -i sample_target.html -o heat
   axss -l
@@ -220,7 +242,7 @@ Ranking/mutating...
 Rendering output...
 Target: file:sample_target.html (html) | engine=heuristic | model=qwen3.5:9b | fallback=True
 title=XSS Demo Target | frameworks=React | forms=1 | inputs=3 | handlers=0 | sinks=4
-notes: Parsed HTML with BeautifulSoup. Parsed scripts with esprima AST.
+notes: Parsed HTML with Scrapy selectors. Parsed scripts with esprima AST.
 # | Risk | Payload                                      | Focus                | Title
 --+------+----------------------------------------------+----------------------+-------------------------
 1 | 72   | <form id=forms><input name=innerHTML value=… | innerHTML            | DOM clobber + property …
@@ -258,4 +280,5 @@ notes: Parsed HTML with BeautifulSoup. Parsed scripts with esprima AST.
 - Supported Qwen3.5 sizes in this project are `qwen3.5:4b`, `qwen3.5:9b`, `qwen3.5:27b`, and `qwen3.5:35b`.
 - `axss -l` wraps `ollama list` and formats the results as a table.
 - `axss -s qwen3.5` prefers `ollama search qwen3.5` and falls back to Ollama web search if the installed CLI does not support local search.
+- Live crawling suppresses Scrapy logs by default and can rotate request user-agents or proxies with `AXSS_USER_AGENTS` and `AXSS_PROXIES`.
 - Without Ollama, the CLI still runs with heuristic generation. If `OPENAI_API_KEY` is set, it can also use `gpt-4o-mini` as a fallback path.

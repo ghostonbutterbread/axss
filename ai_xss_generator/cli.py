@@ -10,7 +10,7 @@ from ai_xss_generator.models import generate_payloads, list_ollama_models, searc
 from ai_xss_generator.output import render_batch_json, render_heat, render_json, render_list, render_summary
 from ai_xss_generator.parser import BatchParseError, parse_target, parse_targets, read_url_list
 from ai_xss_generator.plugin_system import PluginRegistry
-from ai_xss_generator.types import DomSink, FormContext, FormField, GenerationResult, ParsedContext, ScriptVariable
+from ai_xss_generator.types import GenerationResult, ParsedContext
 
 
 class _HelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter):
