@@ -18,6 +18,17 @@ from ai_xss_generator.types import ParsedContext, PayloadCandidate
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
 OPENAI_MODEL = "gpt-4o-mini"
 MODEL_ALIASES = {
+    "qwen3.5": [
+        "qwen3.5",
+        "qwen3.5:9b",
+        "qwen3.5:4b",
+        "qwen3.5:27b",
+        "qwen3.5:35b",
+    ],
+    "qwen3.5:4b": ["qwen3.5:4b"],
+    "qwen3.5:9b": ["qwen3.5:9b", "qwen3.5"],
+    "qwen3.5:27b": ["qwen3.5:27b"],
+    "qwen3.5:35b": ["qwen3.5:35b"],
     "qwen2.5-coder:7b-instruct-q5_K_M": [
         "qwen2.5-coder:7b-instruct-q5_K_M",
         "qwen2.5-coder:7b-instruct-q5_K_M.gguf",

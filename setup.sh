@@ -11,13 +11,10 @@ DEMO_SCRIPT="$ROOT_DIR/demo_top5.sh"
 ENTRYPOINT="$ROOT_DIR/axss.py"
 OLLAMA_LOG="$CONFIG_DIR/ollama-serve.log"
 
-LOW_MEM_MODELS=(
-  "qwen2.5-coder:7b-instruct-q5_K_M"
-  "qwen2.5-coder:7b-instruct-q5_K_M.gguf"
-  "qwen2.5-coder:7b"
-)
-MID_MEM_MODELS=("qwen2.5-coder:14b")
-HIGH_MEM_MODELS=("qwen2.5-coder:32b")
+LOW_MEM_MODEL="qwen3.5:4b"
+DEFAULT_MEM_MODEL="qwen3.5:9b"
+HIGH_MEM_MODEL="qwen3.5:27b"
+GPU_MODEL="qwen3.5:35b"
 SELECTED_MODEL=""
 
 have_cmd() {
@@ -54,7 +51,32 @@ ram_summary() {
 
 gpu_memory_gb() {
   if have_cmd nvidia-smi; then
-    local max_mib
+    local max_gb max_mib
+    max_gb="$(
+      nvidia-smi --query-gpu=memory.total --format=csv,noheader 2>/dev/null \
+        | cut -d: -f1 \
+        | grep 'GB' || true \
+    )"
+    max_gb="$(printf '%s\n' "$max_gb" \
+        | awk '
+            {
+              value = $1 + 0
+              if (value > max) {
+                max = value
+              }
+            }
+            END {
+              if (max > 0) {
+                printf "%d\n", max
+              }
+            }
+          '
+    )"
+    if [ -n "${max_gb:-}" ]; then
+      echo "$max_gb"
+      return 0
+    fi
+
     max_mib="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | sort -nr | head -n1)"
     if [ -n "${max_mib:-}" ]; then
       awk -v mib="$max_mib" 'BEGIN { printf "%d\n", (mib + 1023) / 1024 }'
@@ -85,13 +107,16 @@ select_model_profile() {
 
   if [ "${detected_gpu_gb:-0}" -ge 24 ]; then
     SELECTED_PROFILE="gpu-24g+"
-    SELECTED_MODEL_CANDIDATES=("${HIGH_MEM_MODELS[@]}")
-  elif [ "${detected_ram_gb:-0}" -ge 16 ]; then
-    SELECTED_PROFILE="ram-16g+"
-    SELECTED_MODEL_CANDIDATES=("${MID_MEM_MODELS[@]}")
+    SELECTED_MODEL="$GPU_MODEL"
+  elif [ "${detected_ram_gb:-0}" -ge 32 ]; then
+    SELECTED_PROFILE="ram-32g+"
+    SELECTED_MODEL="$HIGH_MEM_MODEL"
+  elif [ "${detected_ram_gb:-0}" -ge 8 ]; then
+    SELECTED_PROFILE="ram-8g+"
+    SELECTED_MODEL="$DEFAULT_MEM_MODEL"
   else
     SELECTED_PROFILE="low-mem"
-    SELECTED_MODEL_CANDIDATES=("${LOW_MEM_MODELS[@]}")
+    SELECTED_MODEL="$LOW_MEM_MODEL"
   fi
 }
 
@@ -123,18 +148,12 @@ ensure_ollama_ready() {
 
 pull_selected_model() {
   if ! have_cmd ollama; then
-    SELECTED_MODEL="${SELECTED_MODEL_CANDIDATES[0]}"
     return 1
   fi
-  local candidate
-  for candidate in "${SELECTED_MODEL_CANDIDATES[@]}"; do
-    if ollama pull "$candidate"; then
-      SELECTED_MODEL="$candidate"
-      return 0
-    fi
-  done
-  SELECTED_MODEL="${SELECTED_MODEL_CANDIDATES[0]}"
-  echo "Warning: unable to pull any preferred model variant, keeping default_model=$SELECTED_MODEL" >&2
+  if ollama pull "$SELECTED_MODEL"; then
+    return 0
+  fi
+  echo "Warning: unable to pull selected model $SELECTED_MODEL; keeping it as default_model in config" >&2
   return 1
 }
 
@@ -146,14 +165,13 @@ write_config() {
 echo "Detected RAM: $(ram_summary)"
 echo "Detected GPU: $(gpu_summary)"
 select_model_profile
-echo "Selected model profile: $SELECTED_PROFILE (${SELECTED_MODEL_CANDIDATES[0]})"
+echo "Selected model profile: $SELECTED_PROFILE ($SELECTED_MODEL)"
 
 install_ollama_if_needed || echo "Warning: continuing without automatic Ollama install." >&2
 if have_cmd ollama; then
   ensure_ollama_ready || true
   pull_selected_model || true
 else
-  SELECTED_MODEL="${SELECTED_MODEL_CANDIDATES[0]}"
   echo "Warning: Ollama is unavailable; axss will fall back to heuristics or OPENAI_API_KEY." >&2
 fi
 write_config

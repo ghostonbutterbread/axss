@@ -26,8 +26,9 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
             "  axss -h sample_target.html -o list -t 10\n"
             "  axss -h '<div onclick=\"{{user}}\"></div>' -o heat\n"
             "  axss -l\n"
-            "  axss -s qwen\n"
-            f"  axss -u https://example.com -m {config_default_model} -o list -t 3"
+            "  axss -s qwen3.5\n"
+            f"  axss -u https://example.com -m {config_default_model} -o list -t 3\n"
+            "  axss -u https://example.com -m qwen3.5:4b -t 5 -o list"
         ),
         formatter_class=_HelpFormatter,
         add_help=False,
@@ -63,7 +64,8 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
         "--model",
         default=None,
         help=(
-            "Override the Ollama model for generation. "
+            "Override the Ollama model for generation, including qwen3.5 size tags such as "
+            "qwen3.5:4b, qwen3.5:9b, qwen3.5:27b, or qwen3.5:35b. "
             f"Default comes from {CONFIG_PATH} or falls back to {DEFAULT_MODEL}."
         ),
     )

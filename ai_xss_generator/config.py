@@ -7,7 +7,7 @@ from typing import Any
 
 
 APP_NAME = "axss"
-DEFAULT_MODEL = "qwen2.5-coder:7b-instruct-q5_K_M"
+DEFAULT_MODEL = "qwen3.5:9b"
 CONFIG_DIR = Path.home() / ".axss"
 CONFIG_PATH = CONFIG_DIR / "config.json"
 
