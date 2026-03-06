@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Iterable
 
 from ai_xss_generator.console import RESET, colorize_score, risk_color, _tty
 from ai_xss_generator.types import GenerationResult, PayloadCandidate
+
+_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
 
 
 def _truncate(value: str, width: int) -> str:
@@ -15,10 +18,8 @@ def _truncate(value: str, width: int) -> str:
 
 def _table(headers: list[str], rows: list[list[str]]) -> str:
     # Strip ANSI codes when measuring column widths so colors don't break alignment
-    _ansi = __import__("re").compile(r"\033\[[0-9;]*m")
-
     def _visible(s: str) -> int:
-        return len(_ansi.sub("", s))
+        return len(_ANSI_RE.sub("", s))
 
     widths = [len(h) for h in headers]
     for row in rows:

@@ -241,7 +241,11 @@ def _fetch_source(spec: dict) -> list[PayloadCandidate]:
     """Fetch one remote source, using cache if fresh."""
     cached = cache_get(spec["key"], ttl=spec["ttl"])
     if cached is not None:
-        return [PayloadCandidate(**item) for item in cached]
+        try:
+            return [PayloadCandidate(**item) for item in cached]
+        except Exception:
+            # Cache schema mismatch or corruption — fall through to re-fetch
+            pass
 
     lines = _fetch_lines(spec["url"])
     candidates = _raw_lines_to_candidates(lines, source=spec["source"], tags=spec["tags"])
@@ -254,7 +258,10 @@ def _fetch_nitter(timeout: int = 8) -> list[PayloadCandidate]:
     cache_key = "social_nitter"
     cached = cache_get(cache_key, ttl=_SOCIAL_TTL)
     if cached is not None:
-        return [PayloadCandidate(**item) for item in cached]
+        try:
+            return [PayloadCandidate(**item) for item in cached]
+        except Exception:
+            pass  # stale schema — re-fetch
 
     for instance in _NITTER_INSTANCES:
         try:
@@ -359,13 +366,11 @@ def fetch_public_payloads(
     -------
     FetchResult with .payloads (list[PayloadCandidate]) and per-source metadata.
     """
-    from ai_xss_generator.cache import cache_get as _cg  # local import to avoid circular
-
     result = FetchResult()
 
     # Generic sources
     for spec in _GENERIC_SOURCES:
-        is_cached = _cg(spec["key"], ttl=spec["ttl"]) is not None
+        is_cached = cache_get(spec["key"], ttl=spec["ttl"]) is not None
         label = f"{spec['key']} [cached]" if is_cached else spec["key"]
         if progress:
             progress(f"  Fetching {label}...")
@@ -380,7 +385,7 @@ def fetch_public_payloads(
     # Social / community sources
     if include_social:
         for spec in _SOCIAL_SOURCES:
-            is_cached = _cg(spec["key"], ttl=spec["ttl"]) is not None
+            is_cached = cache_get(spec["key"], ttl=spec["ttl"]) is not None
             label = f"{spec['key']} [cached]" if is_cached else spec["key"]
             if progress:
                 progress(f"  Fetching {label}...")

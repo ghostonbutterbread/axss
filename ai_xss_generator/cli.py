@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from pathlib import Path
 
@@ -388,13 +389,16 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     # --- Validate rate ---
-    if args.rate < 0:
-        parser.error("--rate must be >= 0 (use 0 for uncapped)")
-    rate_label = "uncapped" if args.rate == 0 else f"{args.rate:g} req/sec"
-    info(f"Rate limit: {rate_label}")
+    if not math.isfinite(args.rate) or args.rate < 0:
+        parser.error("--rate must be a finite number >= 0 (use 0 for uncapped)")
+    # Only display rate info when we will actually make HTTP requests
+    if has_target and (args.url or args.urls):
+        rate_label = "uncapped" if args.rate == 0 else f"{args.rate:g} req/sec"
+        info(f"Rate limit: {rate_label}")
 
     # --- Resolve WAF (auto-detect or manual) ---
     resolved_waf: str | None = args.waf  # may be None; will be filled by auto-detect below
+    _waf_manual = args.waf is not None    # True when user explicitly passed --waf
 
     # --- Fetch public payloads if requested ---
     fetch_result: FetchResult | None = None
@@ -417,7 +421,8 @@ def main(argv: list[str] | None = None) -> int:
 
     # --- Standalone --public mode (no target) ---
     if args.public and not has_target:
-        assert fetch_result is not None
+        if fetch_result is None:
+            parser.error("--public fetch produced no result; check network connectivity")
         return _handle_public_payloads(fetch_result, args.output, args.top, args.json_out)
 
     # --- Target-based modes below ---
@@ -443,8 +448,8 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 info("No WAF fingerprint detected.")
 
-        # If public + waf now resolved but fetch didn't include waf payloads yet, add them
-        if args.public and resolved_waf and fetch_result is not None:
+        # If WAF was auto-detected (not manually set), add its bypass payloads now
+        if args.public and resolved_waf and fetch_result is not None and not _waf_manual:
             from ai_xss_generator.public_payloads import _waf_candidates
             waf_extra = _waf_candidates(resolved_waf)
             if waf_extra:
@@ -536,8 +541,8 @@ def main(argv: list[str] | None = None) -> int:
         else:
             info("No WAF fingerprint detected — use --waf to set manually.")
 
-    # Add WAF-specific payloads to reference set if detected after initial fetch
-    if args.public and resolved_waf and fetch_result is not None:
+    # If WAF was auto-detected (not manually set), add its bypass payloads now
+    if args.public and resolved_waf and fetch_result is not None and not _waf_manual:
         from ai_xss_generator.public_payloads import _waf_candidates
         waf_extra = _waf_candidates(resolved_waf)
         if waf_extra:

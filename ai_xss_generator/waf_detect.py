@@ -82,7 +82,10 @@ def detect_waf(response: "_req.Response") -> str | None:
     """
     headers_lower = {k.lower(): v.lower() for k, v in response.headers.items()}
     server = headers_lower.get("server", "")
-    body_snippet = (response.text or "")[:8192].lower()
+    try:
+        body_snippet = (response.text or "")[:8192].lower()
+    except Exception:
+        body_snippet = ""
 
     for waf_name, fingerprints in _FINGERPRINTS.items():
         if any(h in headers_lower for h in fingerprints["headers"]):
