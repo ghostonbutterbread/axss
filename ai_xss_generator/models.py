@@ -42,8 +42,40 @@ MODEL_ALIASES = {
 }
 
 
-def _prompt_for_context(context: ParsedContext) -> str:
+def _prompt_for_context(
+    context: ParsedContext,
+    reference_payloads: list[Any] | None = None,
+    waf: str | None = None,
+) -> str:
     context_blob = json.dumps(context.to_dict(), indent=2)
+
+    reference_section = ""
+    if reference_payloads:
+        ref_items = [
+            {
+                "payload": p.payload if hasattr(p, "payload") else p.get("payload", ""),
+                "tags": p.tags if hasattr(p, "tags") else p.get("tags", []),
+                "source": p.source if hasattr(p, "source") else p.get("source", ""),
+            }
+            for p in reference_payloads[:20]
+        ]
+        ref_blob = json.dumps(ref_items, indent=2)
+        reference_section = f"""
+Reference payloads (study the TECHNIQUES and PATTERNS — do NOT copy these verbatim):
+{ref_blob}
+
+Use the bypass techniques above as inspiration. Understand why each payload works,
+then synthesize NEW payloads tailored specifically to the target context below.
+"""
+
+    waf_section = ""
+    if waf:
+        waf_section = f"""
+WAF context: The target is protected by {waf.title()}. Prioritise evasion techniques
+known to bypass {waf.title()} (encoding variants, alternative event handlers,
+namespace confusion, case mixing, whitespace tricks, etc.).
+"""
+
     return f"""
 You are generating offensive-security test payloads for an authorized XSS assessment.
 Return only JSON with this shape:
@@ -68,7 +100,7 @@ Requirements:
 - Include polyglots, encodings, JS obfuscation, DOM clobbering/property chains, and framework-specific probes.
 - Keep payloads compact and executable.
 - Avoid markdown and commentary outside the JSON object.
-
+{reference_section}{waf_section}
 Parsed context:
 {context_blob}
 """.strip()
@@ -212,13 +244,19 @@ def _ensure_ollama_model(model: str) -> tuple[bool, str, str]:
     return False, model, "; ".join(errors)
 
 
-def _generate_with_ollama(context: ParsedContext, model: str) -> tuple[list[PayloadCandidate], str]:
+def _generate_with_ollama(
+    context: ParsedContext,
+    model: str,
+    reference_payloads: list[Any] | None = None,
+    waf: str | None = None,
+) -> tuple[list[PayloadCandidate], str]:
     ready, resolved_model, reason = _ensure_ollama_model(model)
     if not ready:
         raise RuntimeError(f"Ollama unavailable: {reason}")
+    prompt = _prompt_for_context(context, reference_payloads=reference_payloads, waf=waf)
     response = requests.post(
         f"{OLLAMA_BASE_URL}/api/generate",
-        json={"model": resolved_model, "prompt": _prompt_for_context(context), "stream": False},
+        json={"model": resolved_model, "prompt": prompt, "stream": False},
         timeout=90,
     )
     response.raise_for_status()
@@ -227,10 +265,15 @@ def _generate_with_ollama(context: ParsedContext, model: str) -> tuple[list[Payl
     return _normalize_payloads(data.get("payloads", []), source="ollama"), resolved_model
 
 
-def _generate_with_openai(context: ParsedContext) -> list[PayloadCandidate]:
+def _generate_with_openai(
+    context: ParsedContext,
+    reference_payloads: list[Any] | None = None,
+    waf: str | None = None,
+) -> list[PayloadCandidate]:
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is not set")
+    prompt = _prompt_for_context(context, reference_payloads=reference_payloads, waf=waf)
     response = requests.post(
         "https://api.openai.com/v1/chat/completions",
         headers={
@@ -245,7 +288,7 @@ def _generate_with_openai(context: ParsedContext) -> list[PayloadCandidate]:
                     "role": "system",
                     "content": "You return strict JSON for authorized XSS testing payload generation.",
                 },
-                {"role": "user", "content": _prompt_for_context(context)},
+                {"role": "user", "content": prompt},
             ],
             "temperature": 0.4,
         },
@@ -279,6 +322,8 @@ def generate_payloads(
     model: str,
     mutator_plugins: list[Any] | None = None,
     progress: Any | None = None,
+    reference_payloads: list[Any] | None = None,
+    waf: str | None = None,
 ) -> tuple[list[PayloadCandidate], str, bool, str]:
     mutator_plugins = mutator_plugins or []
     if progress is not None:
@@ -289,12 +334,16 @@ def generate_payloads(
     resolved_model = model
     ai_payloads: list[PayloadCandidate] = []
     try:
-        ai_payloads, resolved_model = _generate_with_ollama(context, model)
+        ai_payloads, resolved_model = _generate_with_ollama(
+            context, model, reference_payloads=reference_payloads, waf=waf
+        )
         engine = "ollama"
         used_fallback = False
     except Exception:
         try:
-            ai_payloads = _generate_with_openai(context)
+            ai_payloads = _generate_with_openai(
+                context, reference_payloads=reference_payloads, waf=waf
+            )
             engine = "openai"
             used_fallback = True
             resolved_model = OPENAI_MODEL

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from typing import Iterable
 
+from ai_xss_generator.console import RESET, colorize_score, risk_color, _tty
 from ai_xss_generator.types import GenerationResult, PayloadCandidate
 
 
@@ -13,13 +14,23 @@ def _truncate(value: str, width: int) -> str:
 
 
 def _table(headers: list[str], rows: list[list[str]]) -> str:
-    widths = [len(header) for header in headers]
+    # Strip ANSI codes when measuring column widths so colors don't break alignment
+    _ansi = __import__("re").compile(r"\033\[[0-9;]*m")
+
+    def _visible(s: str) -> int:
+        return len(_ansi.sub("", s))
+
+    widths = [len(h) for h in headers]
     for row in rows:
-        for index, cell in enumerate(row):
-            widths[index] = max(widths[index], len(cell))
-    header_line = " | ".join(header.ljust(widths[index]) for index, header in enumerate(headers))
-    divider = "-+-".join("-" * width for width in widths)
-    body = [" | ".join(cell.ljust(widths[index]) for index, cell in enumerate(row)) for row in rows]
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], _visible(cell))
+
+    def _pad(s: str, width: int) -> str:
+        return s + " " * (width - _visible(s))
+
+    header_line = " | ".join(_pad(h, widths[i]) for i, h in enumerate(headers))
+    divider = "-+-".join("-" * w for w in widths)
+    body = [" | ".join(_pad(cell, widths[i]) for i, cell in enumerate(row)) for row in rows]
     return "\n".join([header_line, divider, *body])
 
 
@@ -29,7 +40,7 @@ def render_summary(result: GenerationResult, limit: int = 10) -> str:
         rows.append(
             [
                 str(index),
-                str(payload.risk_score),
+                colorize_score(payload.risk_score),
                 _truncate(payload.payload, 44),
                 _truncate(payload.target_sink or payload.framework_hint or ",".join(payload.tags[:2]), 20),
                 _truncate(payload.title, 24),
@@ -44,7 +55,7 @@ def render_list(payloads: Iterable[PayloadCandidate], limit: int = 20) -> str:
         rows.append(
             [
                 str(index),
-                str(payload.risk_score),
+                colorize_score(payload.risk_score),
                 _truncate(payload.payload, 44),
                 _truncate(", ".join(payload.tags[:3]), 28),
                 _truncate(payload.explanation, 46),
@@ -57,8 +68,11 @@ def render_heat(payloads: Iterable[PayloadCandidate], limit: int = 20) -> str:
     lines = []
     for index, payload in enumerate(list(payloads)[:limit], start=1):
         bar = "#" * max(1, round(payload.risk_score / 4))
+        color = risk_color(payload.risk_score)
+        score_str = f"{color}{payload.risk_score:>3}{RESET}" if _tty() else f"{payload.risk_score:>3}"
+        bar_str = f"{color}{bar:<25}{RESET}" if _tty() else f"{bar:<25}"
         lines.append(
-            f"{index:>2}. {payload.risk_score:>3} {bar:<25} {_truncate(payload.title, 26)} {_truncate(payload.payload, 36)}"
+            f"{index:>2}. {score_str} {bar_str} {_truncate(payload.title, 26)} {_truncate(payload.payload, 36)}"
         )
     return "\n".join(lines)
 

@@ -6,11 +6,14 @@ from pathlib import Path
 
 from ai_xss_generator import __version__
 from ai_xss_generator.config import APP_NAME, CONFIG_PATH, DEFAULT_MODEL, load_config
+from ai_xss_generator.console import header, info, step, success, warn, waf_label
 from ai_xss_generator.models import generate_payloads, list_ollama_models, search_ollama_models
 from ai_xss_generator.output import render_batch_json, render_heat, render_json, render_list, render_summary
 from ai_xss_generator.parser import BatchParseError, parse_target, parse_targets, read_url_list
 from ai_xss_generator.plugin_system import PluginRegistry
+from ai_xss_generator.public_payloads import FetchResult, fetch_public_payloads, select_reference_payloads
 from ai_xss_generator.types import GenerationResult, ParsedContext
+from ai_xss_generator.waf_detect import SUPPORTED_WAFS, detect_waf
 
 
 class _HelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter):
@@ -18,7 +21,6 @@ class _HelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescrip
         help_text = action.help or ""
         if "%(default)" in help_text:
             return help_text
-
         default = action.default
         if default in (None, False, argparse.SUPPRESS):
             return help_text
@@ -35,6 +37,9 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
         epilog=(
             "Common combos:\n"
             "  axss -u https://example.com -t 10 -o list\n"
+            "  axss -u https://example.com --public --waf cloudflare -o heat\n"
+            "  axss --public --waf modsecurity -o list          (standalone — no target needed)\n"
+            "  axss --public -o list                            (all public payloads)\n"
             "  axss --urls urls.txt -t 5 -o list\n"
             "  axss --urls urls.txt --merge-batch -o json -j result.json\n"
             f"  axss -u https://example.com -m {config_default_model} -o list -t 3\n"
@@ -47,7 +52,9 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
         add_help=False,
     )
     parser.add_argument("-h", "--help", action="help", help="Show this help message and exit.")
-    action_group = parser.add_mutually_exclusive_group(required=True)
+
+    # Action group — no longer required=True because --public can be standalone
+    action_group = parser.add_mutually_exclusive_group(required=False)
     action_group.add_argument(
         "-u",
         "--url",
@@ -77,14 +84,35 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
         metavar="QUERY",
         help="--search-models QUERY (search Ollama model names), e.g. -s qwen3.5",
     )
+
+    # Payload sourcing flags
+    parser.add_argument(
+        "--public",
+        action="store_true",
+        help=(
+            "--public  Fetch known XSS payloads from public/community sources and inject "
+            "them as reference context into the model prompt. Can be used standalone "
+            "(no target required) to dump a payload list."
+        ),
+    )
+    parser.add_argument(
+        "--waf",
+        metavar="NAME",
+        choices=SUPPORTED_WAFS,
+        help=(
+            f"--waf NAME  Target WAF ({', '.join(SUPPORTED_WAFS)}). "
+            "Auto-detected from response headers when -u/--urls is used; "
+            "use this flag to override or set manually. "
+            "Loads WAF-specific bypass payloads and primes the model."
+        ),
+    )
+
     parser.add_argument(
         "-m",
         "--model",
         default=None,
         help=(
-            "--model MODEL (override the Ollama model), e.g. -m qwen3.5:4b. Supports "
-            "qwen3.5 size tags such as "
-            "qwen3.5:4b, qwen3.5:9b, qwen3.5:27b, or qwen3.5:35b. "
+            "--model MODEL (override the Ollama model), e.g. -m qwen3.5:4b. "
             f"Default comes from {CONFIG_PATH} or falls back to {DEFAULT_MODEL}."
         ),
     )
@@ -113,7 +141,7 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
         "-v",
         "--verbose",
         action="store_true",
-        help="--verbose (print stage-by-stage progress), e.g. -v -i sample_target.html",
+        help="--verbose (print detailed sub-step progress), e.g. -v -i sample_target.html",
     )
     parser.add_argument(
         "--merge-batch",
@@ -124,10 +152,13 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
     return parser
 
 
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
 def _render_table(rows: list[dict[str, str]]) -> str:
     if not rows:
         return "No results."
-
     headers = list(rows[0].keys())
     widths = {
         header: max(len(header), *(len(str(row.get(header, ""))) for row in rows))
@@ -142,11 +173,13 @@ def _render_table(rows: list[dict[str, str]]) -> str:
     return "\n".join([header_line, separator, *body])
 
 
-def _print_context_banner(result: GenerationResult) -> None:
+def _print_context_banner(result: GenerationResult, waf: str | None = None) -> None:
     context = result.context
+    waf_str = f" | waf={waf_label(waf)}" if waf else ""
     print(
         f"Target: {context.source} ({context.source_type}) | "
         f"engine={result.engine} | model={result.model} | fallback={result.used_fallback}"
+        f"{waf_str}"
     )
     print(
         f"title={context.title or '-'} | frameworks={','.join(context.frameworks) or '-'} | "
@@ -157,9 +190,10 @@ def _print_context_banner(result: GenerationResult) -> None:
         print("notes:", " ".join(context.notes))
 
 
-def _verbose(message: str, *, enabled: bool) -> None:
+def _vlog(message: str, *, enabled: bool) -> None:
+    """Verbose-only sub-step messages (indented, dimmed)."""
     if enabled:
-        print(message, flush=True)
+        info(f"  {message}")
 
 
 def _merge_contexts(contexts: list[ParsedContext], source: str) -> ParsedContext:
@@ -190,12 +224,16 @@ def _build_result(
     model: str,
     registry: PluginRegistry,
     verbose: bool,
+    reference_payloads: list | None = None,
+    waf: str | None = None,
 ) -> GenerationResult:
     payloads, engine, used_fallback, resolved_model = generate_payloads(
         context=context,
         model=model,
         mutator_plugins=registry.mutators,
-        progress=lambda message: _verbose(message, enabled=verbose),
+        progress=lambda message: _vlog(message, enabled=verbose),
+        reference_payloads=reference_payloads,
+        waf=waf,
     )
     return GenerationResult(
         engine=engine,
@@ -206,8 +244,8 @@ def _build_result(
     )
 
 
-def _print_single_result(result: GenerationResult, output_mode: str, top: int) -> None:
-    _print_context_banner(result)
+def _print_single_result(result: GenerationResult, output_mode: str, top: int, waf: str | None = None) -> None:
+    _print_context_banner(result, waf=waf)
     print(render_summary(result, limit=min(top, 10)))
     print()
     if output_mode == "json":
@@ -224,6 +262,7 @@ def _print_batch_results(
     output_mode: str,
     top: int,
     errors: list[BatchParseError],
+    waf: str | None = None,
 ) -> None:
     if output_mode == "json":
         print(render_batch_json(results, errors=[error.to_dict() for error in errors]))
@@ -233,7 +272,7 @@ def _print_batch_results(
         if index > 1:
             print()
         print(f"[{index}/{len(results)}] {result.context.source}")
-        _print_context_banner(result)
+        _print_context_banner(result, waf=waf)
         print(render_summary(result, limit=min(top, 10)))
         print()
         if output_mode == "heat":
@@ -248,11 +287,76 @@ def _print_batch_results(
             print(f"- {error.url}: {error.error}")
 
 
+def _try_detect_waf(url: str, verbose: bool) -> str | None:
+    """Attempt WAF detection from a live URL's response headers."""
+    try:
+        import requests as _req
+        resp = _req.get(
+            url,
+            timeout=10,
+            allow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; axss-waf-probe)"},
+        )
+        detected = detect_waf(resp)
+        return detected
+    except Exception as exc:
+        _vlog(f"WAF probe failed: {exc}", enabled=verbose)
+        return None
+
+
+def _handle_public_payloads(
+    fetch_result: FetchResult,
+    output_mode: str,
+    top: int,
+    json_out: str | None,
+) -> int:
+    """Print standalone --public payload dump (no target, no AI call)."""
+    payloads = fetch_result.payloads[:top]
+    if not payloads:
+        warn("No public payloads fetched.")
+        return 1
+
+    header(f"\n=== Public XSS Payload Dump ({len(payloads)} shown of {fetch_result.total()}) ===")
+
+    if output_mode == "heat":
+        print(render_heat(payloads, limit=top))
+    elif output_mode == "json":
+        import json as _json
+        print(_json.dumps([p.to_dict() for p in payloads], indent=2))
+    else:
+        print(render_list(payloads, limit=top))
+
+    if json_out:
+        import json as _json
+        Path(json_out).write_text(
+            _json.dumps([p.to_dict() for p in payloads], indent=2),
+            encoding="utf-8",
+        )
+        success(f"JSON written to {json_out}")
+
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
 def main(argv: list[str] | None = None) -> int:
     config = load_config()
     parser = build_parser(config.default_model)
     args = parser.parse_args(argv)
 
+    has_target = bool(args.url or args.urls or args.input)
+    is_utility = args.list_models or args.search_models
+
+    # Validate: need at least one of: target, --public, or a utility action
+    if not has_target and not args.public and not is_utility:
+        parser.error(
+            "one of the arguments -u/--url --urls -i/--input -l/--list-models "
+            "-s/--search-models --public is required"
+        )
+
+    # --- Utility: list / search models ---
     if args.list_models:
         try:
             rows, source = list_ollama_models()
@@ -271,15 +375,66 @@ def main(argv: list[str] | None = None) -> int:
         print(_render_table(rows))
         return 0
 
+    # --- Resolve WAF (auto-detect or manual) ---
+    resolved_waf: str | None = args.waf  # may be None; will be filled by auto-detect below
+
+    # --- Fetch public payloads if requested ---
+    fetch_result: FetchResult | None = None
+    reference_payloads: list | None = None
+
+    if args.public:
+        step("Fetching public XSS payloads...")
+        fetch_result = fetch_public_payloads(
+            waf=resolved_waf,
+            include_social=True,
+            progress=lambda msg: _vlog(msg, enabled=args.verbose),
+        )
+        counts_str = ", ".join(f"{k}={v}" for k, v in fetch_result.counts.items())
+        cached_note = f" ({len(fetch_result.cached_keys)} cached)" if fetch_result.cached_keys else ""
+        success(f"Loaded {fetch_result.total()} public payloads{cached_note} — {counts_str}")
+        if fetch_result.errors:
+            for err in fetch_result.errors:
+                warn(f"Source error: {err}")
+        reference_payloads = select_reference_payloads(fetch_result.payloads, limit=20)
+
+    # --- Standalone --public mode (no target) ---
+    if args.public and not has_target:
+        assert fetch_result is not None
+        return _handle_public_payloads(fetch_result, args.output, args.top, args.json_out)
+
+    # --- Target-based modes below ---
     selected_model = args.model or config.default_model
     registry = PluginRegistry()
     registry.load_from(Path(__file__).resolve().parent.parent)
 
+    # --- Batch URLs mode ---
     if args.urls:
+        step(f"Reading URL list: {args.urls}")
         try:
             urls = read_url_list(args.urls)
-            _verbose("Fetching/parsing targets...", enabled=args.verbose)
-            _verbose(f"Fetching {len(urls)} URLs from {args.urls}...", enabled=args.verbose)
+        except Exception as exc:
+            parser.error(str(exc))
+
+        # WAF auto-detect from first URL if not manually set
+        if not resolved_waf and urls:
+            step(f"Probing for WAF on {urls[0]}...")
+            detected = _try_detect_waf(urls[0], args.verbose)
+            if detected:
+                resolved_waf = detected
+                success(f"WAF detected: {waf_label(detected)}")
+            else:
+                info("No WAF fingerprint detected.")
+
+        # If public + waf now resolved but fetch didn't include waf payloads yet, add them
+        if args.public and resolved_waf and fetch_result is not None:
+            from ai_xss_generator.public_payloads import _waf_candidates
+            waf_extra = _waf_candidates(resolved_waf)
+            if waf_extra:
+                fetch_result.add(f"waf_{resolved_waf}", waf_extra)
+                reference_payloads = select_reference_payloads(fetch_result.payloads, limit=20)
+
+        step(f"Fetching and parsing {len(urls)} URL(s)...")
+        try:
             contexts, errors = parse_targets(urls=urls, parser_plugins=registry.parsers)
         except Exception as exc:
             parser.error(str(exc))
@@ -287,19 +442,35 @@ def main(argv: list[str] | None = None) -> int:
         if not contexts and errors:
             parser.error(errors[0].error)
 
-        _verbose("Loading model...", enabled=args.verbose)
-        results = [_build_result(context, model=selected_model, registry=registry, verbose=args.verbose) for context in contexts]
+        step(f"Generating payloads with {selected_model}...")
+        results = [
+            _build_result(
+                context,
+                model=selected_model,
+                registry=registry,
+                verbose=args.verbose,
+                reference_payloads=reference_payloads,
+                waf=resolved_waf,
+            )
+            for context in contexts
+        ]
+
         merged_result: GenerationResult | None = None
         if args.merge_batch and contexts:
+            step("Merging batch contexts...")
             merged_context = _merge_contexts(contexts, source=f"batch:{args.urls}")
             merged_result = _build_result(
                 merged_context,
                 model=selected_model,
                 registry=registry,
                 verbose=args.verbose,
+                reference_payloads=reference_payloads,
+                waf=resolved_waf,
             )
 
-        _verbose("Rendering output...", enabled=args.verbose)
+        success(f"Done. {sum(len(r.payloads) for r in results)} total payloads ranked.")
+        print()
+
         if args.merge_batch and merged_result is not None:
             if args.output == "json":
                 rendered = render_batch_json(
@@ -309,14 +480,20 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 print(rendered)
             else:
-                _print_single_result(merged_result, args.output, args.top)
+                _print_single_result(merged_result, args.output, args.top, waf=resolved_waf)
                 if errors:
                     print()
                     print("Errors:")
                     for error in errors:
                         print(f"- {error.url}: {error.error}")
         else:
-            _print_batch_results(results, output_mode=args.output, top=args.top, errors=errors)
+            _print_batch_results(
+                results,
+                output_mode=args.output,
+                top=args.top,
+                errors=errors,
+                waf=resolved_waf,
+            )
 
         if args.json_out:
             json_body = render_batch_json(
@@ -325,26 +502,59 @@ def main(argv: list[str] | None = None) -> int:
                 merged_result=merged_result,
             )
             Path(args.json_out).write_text(json_body, encoding="utf-8")
-            print(f"\nJSON written to {args.json_out}")
+            success(f"JSON written to {args.json_out}")
         return 0
 
+    # --- Single target mode (-u / -i) ---
+    target = args.url or args.input or ""
+
+    # WAF auto-detect for live URL
+    if args.url and not resolved_waf:
+        step(f"Probing for WAF on {args.url}...")
+        detected = _try_detect_waf(args.url, args.verbose)
+        if detected:
+            resolved_waf = detected
+            success(f"WAF detected: {waf_label(detected)}")
+        else:
+            info("No WAF fingerprint detected — use --waf to set manually.")
+
+    # Add WAF-specific payloads to reference set if detected after initial fetch
+    if args.public and resolved_waf and fetch_result is not None:
+        from ai_xss_generator.public_payloads import _waf_candidates
+        waf_extra = _waf_candidates(resolved_waf)
+        if waf_extra:
+            fetch_result.add(f"waf_{resolved_waf}", waf_extra)
+            reference_payloads = select_reference_payloads(fetch_result.payloads, limit=20)
+
+    step(f"Fetching/parsing target: {target}")
     try:
-        target = args.url or args.input or ""
-        _verbose("Fetching/parsing target...", enabled=args.verbose)
-        _verbose("Fetching target: {}...".format(target), enabled=args.verbose)
         context = parse_target(url=args.url, html_value=args.input, parser_plugins=registry.parsers)
     except Exception as exc:
         parser.error(str(exc))
 
-    _verbose("Loading model...", enabled=args.verbose)
-    result = _build_result(context, model=selected_model, registry=registry, verbose=args.verbose)
+    step(f"Generating payloads with {selected_model}...")
+    if resolved_waf:
+        info(f"WAF context: {waf_label(resolved_waf)}")
+    if reference_payloads:
+        info(f"Reference payloads: {len(reference_payloads)} examples loaded into prompt.")
 
-    _verbose("Rendering output...", enabled=args.verbose)
-    _print_single_result(result, args.output, args.top)
+    result = _build_result(
+        context,
+        model=selected_model,
+        registry=registry,
+        verbose=args.verbose,
+        reference_payloads=reference_payloads,
+        waf=resolved_waf,
+    )
+
+    success(f"Done. {len(result.payloads)} payloads ranked.")
+    print()
+
+    _print_single_result(result, args.output, args.top, waf=resolved_waf)
 
     if args.json_out:
         Path(args.json_out).write_text(render_json(result), encoding="utf-8")
-        print(f"\nJSON written to {args.json_out}")
+        success(f"JSON written to {args.json_out}")
     return 0
 
 
