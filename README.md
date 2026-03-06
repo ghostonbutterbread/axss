@@ -18,7 +18,7 @@ Qwen3.5 is a strong default for this project because the task is not just "write
 
 ## Features
 
-- Parses a live URL with `-u, --url TARGET` or local HTML/snippets with `-h, --html FILE_OR_SNIPPET`.
+- Parses a live URL with `-u, --url TARGET` or local HTML/snippets with `-i, --html FILE_OR_SNIPPET`.
 - Detects forms, inputs, inline scripts, DOM sinks, variables, objects, and framework fingerprints.
 - Uses Ollama-first generation with Qwen3.5 model overrides via `-m, --model`.
 - Lists local models with `-l, --list-models` and searches model names with `-s, --search-models QUERY`.
@@ -126,19 +126,19 @@ axss -s qwen3.5
 Scan the included sample target and print the top payloads:
 
 ```bash
-axss -h sample_target.html -o list -t 10
+axss -i sample_target.html -o list -t 10
 ```
 
 Probe an inline HTML snippet and render the heat view:
 
 ```bash
-axss -h '<div onclick="{{user}}"></div><script>eval(location.hash.slice(1))</script>' -o heat
+axss -i '<div onclick="{{user}}"></div><script>eval(location.hash.slice(1))</script>' -o heat
 ```
 
 Fetch a live target and write the full JSON result to disk:
 
 ```bash
-axss -u https://example.com -m qwen3.5:9b -o json --json-out result.json
+axss -u https://example.com -m qwen3.5:9b -o json -j result.json
 ```
 
 Force the smaller Qwen3.5 model when you want lower memory usage:
@@ -153,6 +153,45 @@ Run the bundled demo:
 ./demo_top5.sh
 ```
 
+### Help excerpt
+
+```text
+$ axss --help
+usage: axss [-h] (-u TARGET | -i FILE_OR_SNIPPET | -l | -s QUERY)
+            [-m MODEL] [-o {json,list,heat}] [-t N] [-j PATH] [-V]
+
+Parse local or live HTML, identify likely XSS execution points, and rank payloads with Ollama-first generation.
+
+options:
+  -h, --help            Show this help message and exit.
+  -u, --url TARGET      --url TARGET (fetch live HTML), e.g. -u
+                        https://example.com
+  -i, --html FILE_OR_SNIPPET
+                        --html FILE_OR_SNIPPET (parse a local file or raw
+                        HTML), e.g. -i sample_target.html
+  -l, --list-models     --list-models (show locally available Ollama models),
+                        e.g. -l
+  -s, --search-models QUERY
+                        --search-models QUERY (search Ollama model names),
+                        e.g. -s qwen3.5
+  -m, --model MODEL     --model MODEL (override the Ollama model), e.g. -m
+                        qwen3.5:4b
+  -o, --output {json,list,heat}
+                        --output {json,list,heat} (choose terminal format),
+                        e.g. -o list (default: list)
+  -t, --top N           --top N (limit ranked payloads), e.g. -t 10 (default:
+                        20)
+  -j, --json-out PATH   --json-out PATH (always write the full JSON result),
+                        e.g. -j result.json
+  -V, --version         show program's version number and exit
+
+Common combos:
+  axss -u https://example.com -t 10 -o list
+  axss -u https://example.com -m qwen3.5:9b -o list -t 3
+  axss -i sample_target.html -o heat
+  axss -l
+```
+
 ## Output Modes
 
 - `list`: ranked table with payload, tags, and rationale.
@@ -164,7 +203,7 @@ Run the bundled demo:
 Sample run against `sample_target.html`:
 
 ```text
-$ ./axss -h sample_target.html -o heat -t 8
+$ ./axss -i sample_target.html -o heat -t 8
 Target: file:sample_target.html (html) | engine=heuristic | model=qwen3.5:9b | fallback=True
 title=XSS Demo Target | frameworks=React | forms=1 | inputs=3 | handlers=0 | sinks=4
 notes: Parsed HTML with BeautifulSoup. Parsed scripts with esprima AST.

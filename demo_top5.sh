@@ -11,4 +11,4 @@ fi
 
 echo
 echo "Public target fetch failed; falling back to local sample_target.html" >&2
-"${RUNNER[@]}" -h "$ROOT_DIR/sample_target.html" -o list -t 5
+"${RUNNER[@]}" -i "$ROOT_DIR/sample_target.html" -o list -t 5
