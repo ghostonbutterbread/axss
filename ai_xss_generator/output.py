@@ -65,3 +65,18 @@ def render_heat(payloads: Iterable[PayloadCandidate], limit: int = 20) -> str:
 
 def render_json(result: GenerationResult) -> str:
     return json.dumps(result.to_dict(), indent=2)
+
+
+def render_batch_json(
+    results: list[GenerationResult],
+    *,
+    errors: list[dict[str, str]] | None = None,
+    merged_result: GenerationResult | None = None,
+) -> str:
+    body: dict[str, object] = {
+        "results": [result.to_dict() for result in results],
+        "errors": errors or [],
+    }
+    if merged_result is not None:
+        body["merged_result"] = merged_result.to_dict()
+    return json.dumps(body, indent=2)
