@@ -15,30 +15,63 @@ from ai_xss_generator.types import GenerationResult
 DEFAULT_MODEL = "qwen2.5-coder:7b-instruct-q5_K_M"
 
 
+class _HelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter):
+    pass
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="ai-xss-generator.py",
+        prog="ai-xss-generator",
         description="Context-aware XSS payload generator with Ollama-first AI fallback.",
+        epilog=(
+            "Examples:\n"
+            "  ai-xss-generator -h sample_target.html -o list -t 10\n"
+            "  ai-xss-generator -h '<div onclick=\"{{user}}\"></div>' -o heat\n"
+            "  ai-xss-generator -u https://example.com -o json --json-out result.json\n"
+            f"  ai-xss-generator -u https://example.com -m {DEFAULT_MODEL} -o list -t 3"
+        ),
+        formatter_class=_HelpFormatter,
+        add_help=False,
     )
+    parser.add_argument("--help", action="help", help="Show this help message and exit.")
     source_group = parser.add_mutually_exclusive_group(required=True)
-    source_group.add_argument("--url", metavar="TARGET", help="Fetch and parse a target URL.")
     source_group.add_argument(
+        "-u",
+        "--url",
+        metavar="TARGET",
+        help="Fetch and parse a target URL. Example: -u https://example.com",
+    )
+    source_group.add_argument(
+        "-h",
         "--html",
         metavar="FILE_OR_SNIPPET",
-        help="Parse a local HTML file or a raw HTML snippet.",
+        help="Parse a local HTML file or a raw HTML snippet. Example: -h sample_target.html",
     )
-    parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Ollama model name. Default: {DEFAULT_MODEL}")
     parser.add_argument(
+        "-m",
+        "--model",
+        default=DEFAULT_MODEL,
+        help=f"Ollama model name. Example: -m {DEFAULT_MODEL}",
+    )
+    parser.add_argument(
+        "-o",
         "--output",
         choices=["json", "list", "heat"],
         default="list",
-        help="Output format. Default: list",
+        help="Output format. Example: -o list",
     )
-    parser.add_argument("--top", type=int, default=20, help="How many ranked payloads to show. Default: 20")
+    parser.add_argument(
+        "-t",
+        "--top",
+        metavar="N",
+        type=int,
+        default=20,
+        help="How many ranked payloads to show. Example: -t 5",
+    )
     parser.add_argument(
         "--json-out",
         metavar="PATH",
-        help="Optional path to write the full JSON result regardless of terminal format.",
+        help="Optional path to write the full JSON result regardless of terminal format. Example: --json-out result.json",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser
