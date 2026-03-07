@@ -169,9 +169,28 @@ init_axss_dir() {
   # 2. Findings store directory
   mkdir -p "$CONFIG_DIR/findings"
 
-  # 3. config.json — written every run so model selection is always fresh
-  printf '{\n  "default_model": "%s",\n  "use_cloud": true,\n  "cloud_model": "anthropic/claude-3-5-sonnet"\n}\n' \
-    "$SELECTED_MODEL" >"$CONFIG_PATH"
+  # 3. config.json — create with defaults on first run; on subsequent runs only
+  #    update default_model so user edits to use_cloud / cloud_model are preserved.
+  if [ -f "$CONFIG_PATH" ]; then
+    python3 - "$CONFIG_PATH" "$SELECTED_MODEL" <<'PYEOF'
+import json, sys
+path, model = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f:
+        cfg = json.load(f)
+    if not isinstance(cfg, dict):
+        cfg = {}
+except Exception:
+    cfg = {}
+cfg["default_model"] = model
+with open(path, "w") as f:
+    json.dump(cfg, f, indent=2)
+    f.write("\n")
+PYEOF
+  else
+    printf '{\n  "default_model": "%s",\n  "use_cloud": true,\n  "cloud_model": "anthropic/claude-3-5-sonnet"\n}\n' \
+      "$SELECTED_MODEL" >"$CONFIG_PATH"
+  fi
 
   # 4. keys — created once with strict permissions so the user can add API keys
   if [ ! -f "$CONFIG_DIR/keys" ]; then

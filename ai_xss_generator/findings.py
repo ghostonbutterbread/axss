@@ -155,6 +155,9 @@ def _load_partition(path: Path) -> list[Finding]:
 
 def _write_partition(path: Path, findings: list[Finding]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    if not findings:
+        path.write_text("", encoding="utf-8")
+        return
     path.write_text(
         "\n".join(json.dumps(asdict(f)) for f in findings) + "\n",
         encoding="utf-8",
@@ -246,21 +249,24 @@ except Exception:
 # Storage
 # ---------------------------------------------------------------------------
 
-def save_finding(finding: Finding) -> None:
+def save_finding(finding: Finding) -> bool:
     """Append *finding* to the appropriate partition.
 
     Silently deduplicates (same payload + sink_type) within the partition.
     Trims the partition to MAX_PER_PARTITION after appending.
+
+    Returns True if the finding was actually written, False if it was a duplicate.
     """
     path = _partition_path(finding.context_type)
     existing = _load_partition(path)
     for f in existing:
         if f.payload == finding.payload and f.sink_type == finding.sink_type:
-            return  # already stored
+            return False  # already stored
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(asdict(finding)) + "\n")
     _trim_partition(path)
+    return True
 
 
 def load_findings(context_type: str | None = None) -> list[Finding]:
@@ -322,7 +328,7 @@ def relevant_findings(
         # so related contexts (e.g. html_attr_url + html_attr_href) cross-pollinate.
         candidates: list[Finding] = []
         seen_partitions = {_partition_key(context_type), "unknown"}
-        if sink_type:
+        if sink_type and FINDINGS_DIR.exists():
             for path in FINDINGS_DIR.glob("*.jsonl"):
                 if path.stem not in seen_partitions and sink_type.split("_")[0] in path.stem:
                     candidates.extend(_load_partition(path))
@@ -391,7 +397,7 @@ def infer_bypass_family(payload_str: str, tags: list[str]) -> str:
         return "unicode-whitespace"
     if "whitespace-in-scheme" in tag_set:
         return "whitespace-in-scheme"
-    if "case-variant" in tag_set or "jaVasCript" in payload_str:
+    if "case-variant" in tag_set or ("javascript" in text and "javascript" not in payload_str):
         return "case-variant"
     if "html-entity" in tag_set or "&#" in payload_str:
         return "html-entity-encoding"

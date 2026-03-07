@@ -39,7 +39,7 @@ from pathlib import Path
 # Ensure the project root is on the path when run directly
 sys.path.insert(0, str(Path(__file__).parent))
 
-from ai_xss_generator.config import DEFAULT_MODEL, load_config
+from ai_xss_generator.config import DEFAULT_MODEL, load_api_key, load_config
 from ai_xss_generator.console import (
     _ensure_utf8,
     dim_line,
@@ -103,8 +103,8 @@ def _persist_payloads(
             tags=p.tags + [f"xssy:{lab.id}", f"lab:{lab.name}"],
         )
         try:
-            save_finding(finding)
-            saved += 1
+            if save_finding(finding):
+                saved += 1
         except Exception:
             pass
     return saved
@@ -224,6 +224,8 @@ def main(argv: list[str] | None = None) -> int:
 
     model = args.model or config.default_model
     use_cloud = config.use_cloud and not args.no_cloud
+    # Fall back to xssy_jwt from ~/.axss/keys if --xssy-token not given on CLI
+    xssy_token = args.xssy_token or load_api_key("xssy_jwt") or None
 
     registry = PluginRegistry()
     registry.load_from(Path(__file__).resolve().parent)
@@ -232,7 +234,7 @@ def main(argv: list[str] | None = None) -> int:
     step("Fetching xssy.uk lab catalogue...")
     try:
         labs = load_labs(
-            jwt=args.xssy_token,
+            jwt=xssy_token,
             min_rating=args.min_rating,
             max_rating=args.max_rating,
             objective_filter=args.objective,
@@ -275,9 +277,9 @@ def main(argv: list[str] | None = None) -> int:
 
         # ── Optionally get a fresh isolated instance ──────────────────────────
         effective_token = lab.token
-        if args.xssy_token:
+        if xssy_token:
             try:
-                effective_token = get_lab_instance(lab.id, args.xssy_token)
+                effective_token = get_lab_instance(lab.id, xssy_token)
                 if args.verbose:
                     info(f"  Fresh instance token: {effective_token}")
             except Exception as exc:

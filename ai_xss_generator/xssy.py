@@ -121,7 +121,10 @@ def get_lab_instance(lab_id: int, jwt: str) -> str:
             timeout=_TIMEOUT,
         )
         resp.raise_for_status()
-    return resp.json()["token"]
+    token = resp.json().get("token", "")
+    if not token:
+        raise RuntimeError(f"getInstance response missing 'token' field: {resp.text[:200]}")
+    return token
 
 
 def fetch_lab_html(token: str, timeout: int = _TIMEOUT) -> str:
@@ -152,9 +155,10 @@ def _parse_lab(detail: dict[str, Any]) -> XssyLab:
     tags_raw = detail.get("tags", [])
     tags = [t.get("name", str(t)) if isinstance(t, dict) else str(t) for t in (tags_raw or [])]
 
+    lab_id = int(detail.get("id") or 0)
     return XssyLab(
-        id=int(detail["id"]),
-        name=detail.get("name", f"Lab {detail['id']}"),
+        id=lab_id,
+        name=detail.get("name", f"Lab {lab_id}"),
         token=detail.get("token") or detail.get("qtoken") or "",
         rating=rating_int,
         rating_label=rating_label,
