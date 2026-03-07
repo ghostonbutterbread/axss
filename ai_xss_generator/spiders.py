@@ -6,7 +6,7 @@ from itertools import cycle
 from pathlib import Path
 from typing import Any, Iterable
 
-from scrapling.fetchers import Fetcher, FetcherSession
+from scrapling.fetchers import FetcherSession
 
 from ai_xss_generator.parser import extract_markup_from_response
 
@@ -47,6 +47,7 @@ def crawl_urls(urls: Iterable[str], rate: float = 25.0) -> dict[str, dict[str, A
         stealthy_headers=True,
         timeout=20,
         follow_redirects=True,
+        retries=1,
     ) as session:
         for index, url in enumerate(url_list):
             if index > 0 and delay > 0:

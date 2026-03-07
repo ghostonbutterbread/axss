@@ -50,19 +50,21 @@ def render_summary(result: GenerationResult, limit: int = 10) -> str:
     return _table(["#", "Risk", "Payload", "Focus", "Title"], rows)
 
 
-def render_list(payloads: Iterable[PayloadCandidate], limit: int = 20) -> str:
-    rows = []
+def render_list(payloads: Iterable[PayloadCandidate], limit: int = 20, *, source: str = "") -> str:
+    lines = []
+    if source:
+        lines.append(f"Target: {source}")
+        lines.append("")
     for index, payload in enumerate(list(payloads)[:limit], start=1):
-        rows.append(
-            [
-                str(index),
-                colorize_score(payload.risk_score),
-                _truncate(payload.payload, 44),
-                _truncate(", ".join(payload.tags[:3]), 28),
-                _truncate(payload.explanation, 46),
-            ]
-        )
-    return _table(["#", "Risk", "Payload", "Tags", "Why"], rows)
+        score_str = colorize_score(payload.risk_score)
+        tags_str = ", ".join(payload.tags[:3])
+        lines.append(f"{index:>2}. [{score_str}] {payload.title}")
+        lines.append(f"    payload: {payload.payload}")
+        lines.append(f"    inject:  {payload.test_vector}")
+        if tags_str:
+            lines.append(f"    tags:    {tags_str}")
+        lines.append("")
+    return "\n".join(lines).rstrip()
 
 
 def render_heat(payloads: Iterable[PayloadCandidate], limit: int = 20) -> str:
@@ -72,9 +74,8 @@ def render_heat(payloads: Iterable[PayloadCandidate], limit: int = 20) -> str:
         color = risk_color(payload.risk_score)
         score_str = f"{color}{payload.risk_score:>3}{RESET}" if _tty() else f"{payload.risk_score:>3}"
         bar_str = f"{color}{bar:<25}{RESET}" if _tty() else f"{bar:<25}"
-        lines.append(
-            f"{index:>2}. {score_str} {bar_str} {_truncate(payload.title, 26)} {_truncate(payload.payload, 36)}"
-        )
+        lines.append(f"{index:>2}. {score_str} {bar_str} {_truncate(payload.title, 26)}")
+        lines.append(f"    {payload.payload}")
     return "\n".join(lines)
 
 

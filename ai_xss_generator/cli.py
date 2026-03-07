@@ -120,9 +120,9 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
     parser.add_argument(
         "-o",
         "--output",
-        choices=["json", "list", "heat"],
+        choices=["json", "list", "heat", "interactive"],
         default="list",
-        help="--output {json,list,heat} (choose terminal format), e.g. -o list",
+        help="--output {json,list,heat,interactive} (choose terminal format), e.g. -o interactive",
     )
     parser.add_argument(
         "-t",
@@ -259,14 +259,18 @@ def _build_result(
 
 def _print_single_result(result: GenerationResult, output_mode: str, top: int, waf: str | None = None) -> None:
     _print_context_banner(result, waf=waf)
-    print(render_summary(result, limit=min(top, 10)))
-    print()
+    if output_mode == "interactive":
+        from ai_xss_generator.interactive import run_interactive
+        run_interactive(result.payloads[:top], title=result.context.source)
+        return
     if output_mode == "json":
         print(render_json(result))
     elif output_mode == "heat":
+        print(render_summary(result, limit=min(top, 10)))
+        print()
         print(render_heat(result.payloads, limit=top))
     else:
-        print(render_list(result.payloads, limit=top))
+        print(render_list(result.payloads, limit=top, source=result.context.source))
 
 
 def _print_batch_results(
@@ -277,6 +281,16 @@ def _print_batch_results(
     errors: list[BatchParseError],
     waf: str | None = None,
 ) -> None:
+    if output_mode == "interactive":
+        from ai_xss_generator.interactive import run_interactive
+        all_payloads = [p for r in results for p in r.payloads][:top]
+        run_interactive(all_payloads, title=f"batch ({len(results)} targets)")
+        if errors:
+            print()
+            print("Errors:")
+            for error in errors:
+                print(f"- {error.url}: {error.error}")
+        return
     if output_mode == "json":
         print(render_batch_json(results, errors=[error.to_dict() for error in errors]))
         return
@@ -286,9 +300,9 @@ def _print_batch_results(
             print()
         print(f"[{index}/{len(results)}] {result.context.source}")
         _print_context_banner(result, waf=waf)
-        print(render_summary(result, limit=min(top, 10)))
-        print()
         if output_mode == "heat":
+            print(render_summary(result, limit=min(top, 10)))
+            print()
             print(render_heat(result.payloads, limit=top))
         else:
             print(render_list(result.payloads, limit=top))

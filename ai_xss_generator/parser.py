@@ -176,7 +176,7 @@ def _extract_with_stdlib(html: str) -> MarkupExtraction:
         inputs=parser.inputs,
         handlers=sorted(parser.handlers),
         inline_scripts=parser.inline_scripts,
-        notes=["Scrapy unavailable; used stdlib HTMLParser fallback."],
+        notes=["Scrapling unavailable; used stdlib HTMLParser fallback."],
     )
 
 
