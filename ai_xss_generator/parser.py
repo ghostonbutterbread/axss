@@ -30,6 +30,11 @@ VARIABLE_RE = re.compile(
     re.IGNORECASE,
 )
 OBJECT_RE = re.compile(r"\b([A-Za-z_$][\w$]*)\s*:\s*{", re.IGNORECASE)
+# Matches JS string variable assignments: var/let/const name = "..." or '...'
+_JS_VAR_STRING_RE = re.compile(
+    r"(?:var|let|const)\s+(\w+)\s*=\s*[\"']([^\"']*)[\"']",
+    re.IGNORECASE,
+)
 
 try:
     from scrapling.engines.toolbelt.custom import Selector, Response
@@ -337,6 +342,117 @@ def _extract_variables(scripts: list[str]) -> tuple[list[ScriptVariable], list[s
     return variables, sorted(set(objects))
 
 
+def _try_uudecode(data: bytes) -> str | None:
+    """Attempt to UU-decode bytes. Returns decoded text or None on failure."""
+    try:
+        text = data.decode("ascii", errors="replace")
+        result = bytearray()
+        for line in text.splitlines():
+            if not line:
+                continue
+            expected_len = ord(line[0]) - 32
+            if expected_len <= 0:
+                break
+            decoded = bytearray()
+            i = 1
+            while i + 3 < len(line):
+                a = (ord(line[i])     - 32) & 0x3F
+                b = (ord(line[i + 1]) - 32) & 0x3F
+                c = (ord(line[i + 2]) - 32) & 0x3F
+                d = (ord(line[i + 3]) - 32) & 0x3F
+                decoded.append((a << 2) | (b >> 4))
+                decoded.append(((b & 0xF) << 4) | (c >> 2))
+                decoded.append(((c & 0x3) << 6) | d)
+                i += 4
+            result += bytes(decoded[:expected_len])
+        return result.decode("utf-8", errors="replace") if result else None
+    except Exception:
+        return None
+
+
+def _detect_encoded_param_reflections(
+    url: str, scripts: list[str]
+) -> tuple[list[DomSink], list[str]]:
+    """Detect URL params decoded through encoding chains and reflected into JS string sinks.
+
+    Handles:
+    - base64 → reflected into ``var x = "..."``
+    - base64 → UUdecode → reflected into ``var x = "..."``  (level19-style)
+    """
+    import base64
+    import urllib.parse
+
+    sinks: list[DomSink] = []
+    notes: list[str] = []
+
+    try:
+        parsed = urllib.parse.urlparse(url)
+        params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+    except Exception:
+        return sinks, notes
+
+    if not params or not scripts:
+        return sinks, notes
+
+    for param_name, param_values in params.items():
+        for raw_value in param_values:
+            if not raw_value or len(raw_value) < 4:
+                continue
+
+            decoded_candidates: list[tuple[str, str]] = []
+
+            # Try plain base64
+            try:
+                padding = "=" * ((-len(raw_value)) % 4)
+                b64_bytes = base64.b64decode(raw_value + padding)
+                b64_text = b64_bytes.decode("utf-8", errors="replace")
+                if b64_text.isprintable() and b64_text.strip():
+                    decoded_candidates.append((b64_text.strip(), "base64"))
+            except Exception:
+                pass
+
+            # Try base64 → UUdecode (the pattern from sudo.co.il level19)
+            try:
+                padding = "=" * ((-len(raw_value)) % 4)
+                b64_bytes = base64.b64decode(raw_value + padding)
+                uu_text = _try_uudecode(b64_bytes)
+                if uu_text and uu_text.strip():
+                    decoded_candidates.append((uu_text.strip(), "base64+uuencode"))
+            except Exception:
+                pass
+
+            for decoded_text, chain in decoded_candidates:
+                if len(decoded_text) < 4:
+                    continue
+                probe = decoded_text[:30]
+                for script_idx, script in enumerate(scripts, start=1):
+                    pos = script.find(probe)
+                    if pos == -1:
+                        continue
+                    # Find the nearest JS variable assignment enclosing the reflected value
+                    snippet = script[max(0, pos - 60): pos + len(decoded_text) + 4]
+                    all_var_matches = list(_JS_VAR_STRING_RE.finditer(snippet))
+                    var_name = all_var_matches[-1].group(1) if all_var_matches else "unknown"
+                    sinks.append(
+                        DomSink(
+                            sink=f"js_string_via_{chain}",
+                            source=(
+                                f"param={param_name!r} decoded via {chain} "
+                                f"→ var {var_name} = \"...\""
+                            ),
+                            location=f"script[{script_idx}]:param:{param_name}",
+                            confidence=0.92,
+                        )
+                    )
+                    notes.append(
+                        f"Parameter '{param_name}' is {chain}-encoded; decoded value "
+                        f"reflected unescaped into JS string (var {var_name}). "
+                        f"Quote injection may bypass server-side escaping."
+                    )
+
+    return sinks, notes
+
+
 def _run_parser_plugins(html: str, context: ParsedContext, parser_plugins: list[Any]) -> None:
     for plugin in parser_plugins:
         try:
@@ -380,12 +496,18 @@ def _build_context(
     frameworks = _extract_frameworks(html, markup.inline_scripts)
     esprima_sinks, esprima_variables, esprima_objects, esprima_notes = _extract_with_esprima(markup.inline_scripts)
     dom_sinks = esprima_sinks + _extract_sinks(markup.inline_scripts)
+    enc_sinks, enc_notes = (
+        _detect_encoded_param_reflections(source, markup.inline_scripts)
+        if source_type == "url" and "?" in source
+        else ([], [])
+    )
+    dom_sinks = enc_sinks + dom_sinks
     variables, objects = _extract_variables(markup.inline_scripts)
     if esprima_variables:
         variables = esprima_variables + variables
     if esprima_objects:
         objects = sorted(set(objects + esprima_objects))
-    notes = [*markup.notes, *esprima_notes]
+    notes = [*markup.notes, *esprima_notes, *enc_notes]
     context = ParsedContext(
         source=source,
         source_type=source_type,
