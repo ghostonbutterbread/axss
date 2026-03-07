@@ -29,7 +29,7 @@ Run once:  python axss_seed_apprentice.py
 """
 from __future__ import annotations
 import sys, os
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from ai_xss_generator.findings import Finding, save_finding, load_findings
 

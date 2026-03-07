@@ -15,7 +15,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from ai_xss_generator.console import _ensure_utf8, header, info, success, warn
 from ai_xss_generator.findings import Finding, save_finding

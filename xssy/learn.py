@@ -8,25 +8,25 @@ model keeps getting better with every session.
 Usage examples
 --------------
 # Run all labs (Novice → Impossible), generate payloads, store findings
-python axss_learn.py
+python xssy/learn.py
 
 # Only Novice + Intermediate (rating 1-2)
-python axss_learn.py --max-rating 2
+python xssy/learn.py --max-rating 2
 
 # Only labs whose objective mentions "cookie"
-python axss_learn.py --objective cookie
+python xssy/learn.py --objective cookie
 
 # Use your xssy.uk JWT to get isolated instances instead of the demo token
-python axss_learn.py --xssy-token <paste token from localStorage>
+python xssy/learn.py --xssy-token <paste token from localStorage>
 
 # Dry-run: list labs without fetching HTML or generating payloads
-python axss_learn.py --list
+python xssy/learn.py --list
 
 # Save a JSON report of all generated payloads
-python axss_learn.py --json-out xssy_results.json
+python xssy/learn.py --json-out xssy_results.json
 
 # Use a specific local Ollama model
-python axss_learn.py --model qwen3.5:4b
+python xssy/learn.py --model qwen3.5:4b
 """
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ import time
 from pathlib import Path
 
 # Ensure the project root is on the path when run directly
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from ai_xss_generator.config import DEFAULT_MODEL, load_api_key, load_config
 from ai_xss_generator.console import (
@@ -59,7 +59,7 @@ from ai_xss_generator.models import generate_payloads
 from ai_xss_generator.parser import parse_target
 from ai_xss_generator.plugin_system import PluginRegistry
 from ai_xss_generator.types import PayloadCandidate
-from ai_xss_generator.xssy import (
+from xssy.client import (
     RATING_LABELS,
     XssyLab,
     fetch_lab_html,
