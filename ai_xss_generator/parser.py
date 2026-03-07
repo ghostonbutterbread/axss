@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from ai_xss_generator.encodings import decode_candidates, uudecode_line
 from ai_xss_generator.types import DomSink, FormContext, FormField, ParsedContext, ScriptVariable
 
 EVENT_HANDLER_RE = re.compile(r"\bon[a-z0-9_-]+\b", re.IGNORECASE)
@@ -529,117 +530,13 @@ def _detect_html_param_reflections(
 
 
 def _try_uudecode(data: bytes) -> str | None:
-    """Attempt to UU-decode bytes. Returns decoded text or None on failure."""
-    try:
-        text = data.decode("ascii", errors="replace")
-        result = bytearray()
-        for line in text.splitlines():
-            if not line:
-                continue
-            expected_len = ord(line[0]) - 32
-            if expected_len <= 0:
-                break
-            decoded = bytearray()
-            i = 1
-            while i + 3 < len(line):
-                a = (ord(line[i])     - 32) & 0x3F
-                b = (ord(line[i + 1]) - 32) & 0x3F
-                c = (ord(line[i + 2]) - 32) & 0x3F
-                d = (ord(line[i + 3]) - 32) & 0x3F
-                decoded.append((a << 2) | (b >> 4))
-                decoded.append(((b & 0xF) << 4) | (c >> 2))
-                decoded.append(((c & 0x3) << 6) | d)
-                i += 4
-            result += bytes(decoded[:expected_len])
-        return result.decode("utf-8", errors="replace") if result else None
-    except Exception:
-        return None
+    """Attempt to UU-decode bytes. Thin wrapper around encodings.uudecode_line."""
+    return uudecode_line(data)
 
 
 def _decode_candidates(raw_value: str) -> list[tuple[str, str]]:
-    """Return (decoded_text, encoding_chain) pairs for all applicable decoding attempts."""
-    import base64
-
-    results: list[tuple[str, str]] = []
-
-    def _add(text: str, chain: str) -> None:
-        if text and text.strip() and len(text.strip()) >= 4 and text.isprintable():
-            results.append((text.strip(), chain))
-
-    # ── Plain base64 ──────────────────────────────────────────────────────────
-    try:
-        padding = "=" * ((-len(raw_value)) % 4)
-        b64_bytes = base64.b64decode(raw_value + padding)
-        _add(b64_bytes.decode("utf-8", errors="replace"), "base64")
-        # base64 → UUdecode (level19 pattern)
-        uu = _try_uudecode(b64_bytes)
-        if uu:
-            _add(uu, "base64+uuencode")
-    except Exception:
-        pass
-
-    # ── Base32 ───────────────────────────────────────────────────────────────
-    try:
-        padding = "=" * ((-len(raw_value)) % 8)
-        b32_bytes = base64.b32decode(raw_value.upper() + padding)
-        _add(b32_bytes.decode("utf-8", errors="replace"), "base32")
-    except Exception:
-        pass
-
-    # ── HTML entity decode → check if it looks like JS ───────────────────────
-    try:
-        from html import unescape as html_unescape
-        unescaped = html_unescape(raw_value)
-        if unescaped != raw_value:
-            _add(unescaped, "html_entity")
-    except Exception:
-        pass
-
-    # ── Hex string (%xx or \xNN or 0xNN...) ─────────────────────────────────
-    try:
-        import urllib.parse
-        decoded_url = urllib.parse.unquote(raw_value)
-        if decoded_url != raw_value:
-            _add(decoded_url, "url_percent")
-        # Double URL-encoded
-        double_decoded = urllib.parse.unquote(decoded_url)
-        if double_decoded != decoded_url:
-            _add(double_decoded, "double_url_percent")
-    except Exception:
-        pass
-
-    # ── Gzip + base64 ────────────────────────────────────────────────────────
-    try:
-        import gzip
-        padding = "=" * ((-len(raw_value)) % 4)
-        gz_bytes = base64.b64decode(raw_value + padding)
-        gz_text = gzip.decompress(gz_bytes).decode("utf-8", errors="replace")
-        _add(gz_text, "gzip+base64")
-    except Exception:
-        pass
-
-    # ── JSON string value ─────────────────────────────────────────────────────
-    try:
-        import json
-        # Value might be a JSON-encoded string (with surrounding quotes or as array/object)
-        parsed = json.loads(raw_value)
-        if isinstance(parsed, str):
-            _add(parsed, "json_string")
-        elif isinstance(parsed, list) and parsed and isinstance(parsed[0], str):
-            _add(parsed[0], "json_array")
-    except Exception:
-        pass
-
-    # ── ROT13 (rare, but occasionally seen in obfuscated challenges) ──────────
-    try:
-        import codecs
-        rot13 = codecs.decode(raw_value, "rot_13")
-        if rot13 != raw_value and rot13.isprintable():
-            _add(rot13, "rot13")
-    except Exception:
-        pass
-
-    return results
+    """Return (decoded_text, encoding_chain) pairs. Delegates to encodings module."""
+    return decode_candidates(raw_value)
 
 
 def _detect_encoded_param_reflections(
