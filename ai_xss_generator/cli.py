@@ -190,6 +190,14 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
             "Always shows at least 5 payloads even if all are below threshold."
         ),
     )
+    parser.add_argument(
+        "--no-cloud",
+        action="store_true",
+        help=(
+            "--no-cloud  Never escalate to a cloud LLM, even if an API key is set "
+            "and the local model output is weak. Use this to guarantee offline-only operation."
+        ),
+    )
     parser.add_argument("-V", "--version", action="version", version=f"%(prog)s {__version__}")
     return parser
 
@@ -317,6 +325,8 @@ def _build_result(
     verbose: bool,
     reference_payloads: list | None = None,
     waf: str | None = None,
+    use_cloud: bool = True,
+    cloud_model: str = "anthropic/claude-3-5-sonnet",
 ) -> GenerationResult:
     payloads, engine, used_fallback, resolved_model = generate_payloads(
         context=context,
@@ -325,6 +335,8 @@ def _build_result(
         progress=lambda message: _vlog(message, enabled=verbose),
         reference_payloads=reference_payloads,
         waf=waf,
+        use_cloud=use_cloud,
+        cloud_model=cloud_model,
     )
     return GenerationResult(
         engine=engine,
@@ -519,6 +531,8 @@ def main(argv: list[str] | None = None) -> int:
 
     # --- Target-based modes below ---
     selected_model = args.model or config.default_model
+    use_cloud = config.use_cloud and not getattr(args, "no_cloud", False)
+    cloud_model = config.cloud_model
     registry = PluginRegistry()
     registry.load_from(Path(__file__).resolve().parent.parent)
 
@@ -566,6 +580,8 @@ def main(argv: list[str] | None = None) -> int:
                 verbose=args.verbose,
                 reference_payloads=reference_payloads,
                 waf=resolved_waf,
+                use_cloud=use_cloud,
+                cloud_model=cloud_model,
             )
             for context in contexts
         ]
@@ -581,6 +597,8 @@ def main(argv: list[str] | None = None) -> int:
                 verbose=args.verbose,
                 reference_payloads=reference_payloads,
                 waf=resolved_waf,
+                use_cloud=use_cloud,
+                cloud_model=cloud_model,
             )
 
         success(f"Done. {sum(len(r.payloads) for r in results)} total payloads ranked.")
@@ -690,6 +708,8 @@ def main(argv: list[str] | None = None) -> int:
         verbose=args.verbose,
         reference_payloads=reference_payloads,
         waf=resolved_waf,
+        use_cloud=use_cloud,
+        cloud_model=cloud_model,
     )
 
     # Apply threshold filter to final payloads
