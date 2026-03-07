@@ -1,5 +1,25 @@
+# Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.egg-info/
+dist/
+build/
 .pytest_cache/
+
+# Virtual environment
+venv/
+.venv/
+
+# axss runtime data — never commit user data or secrets
+*.jsonl
+xssy_*.json
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

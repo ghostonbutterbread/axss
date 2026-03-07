@@ -1,6 +1,19 @@
 from __future__ import annotations
 
+import io
 import sys
+
+
+def _ensure_utf8() -> None:
+    """Re-wrap stdout/stderr with UTF-8 + replace so Unicode payloads never crash."""
+    for attr in ("stdout", "stderr"):
+        stream = getattr(sys, attr)
+        enc = getattr(stream, "encoding", None) or ""
+        if hasattr(stream, "buffer") and enc.lower().replace("-", "") != "utf8":
+            setattr(sys, attr, io.TextIOWrapper(stream.buffer, encoding="utf-8", errors="replace"))
+
+
+_ensure_utf8()
 
 # ANSI escape codes
 RESET = "\033[0m"

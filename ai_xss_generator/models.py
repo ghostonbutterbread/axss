@@ -449,7 +449,8 @@ def _generate_with_openrouter(
     waf: str | None = None,
     past_findings: list[Finding] | None = None,
 ) -> list[PayloadCandidate]:
-    api_key = os.environ.get("OPENROUTER_API_KEY", "")
+    from ai_xss_generator.config import load_api_key
+    api_key = os.environ.get("OPENROUTER_API_KEY", "") or load_api_key("openrouter_api_key")
     if not api_key:
         raise RuntimeError("OPENROUTER_API_KEY not set")
     return _generate_with_openai_compat(
@@ -470,7 +471,8 @@ def _generate_with_openai(
     waf: str | None = None,
     past_findings: list[Finding] | None = None,
 ) -> list[PayloadCandidate]:
-    api_key = os.environ.get("OPENAI_API_KEY", "")
+    from ai_xss_generator.config import load_api_key
+    api_key = os.environ.get("OPENAI_API_KEY", "") or load_api_key("openai_api_key")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY not set")
     return _generate_with_openai_compat(
@@ -507,14 +509,15 @@ def _try_cloud(
         waf=waf,
         past_findings=past_findings,
     )
-    if os.environ.get("OPENROUTER_API_KEY"):
+    from ai_xss_generator.config import load_api_key
+    if os.environ.get("OPENROUTER_API_KEY") or load_api_key("openrouter_api_key"):
         try:
             payloads = _generate_with_openrouter(context, cloud_model, **kwargs)
             return payloads, "openrouter"
         except Exception:
             pass
 
-    if os.environ.get("OPENAI_API_KEY"):
+    if os.environ.get("OPENAI_API_KEY") or load_api_key("openai_api_key"):
         try:
             payloads = _generate_with_openai(context, **kwargs)
             return payloads, "openai"

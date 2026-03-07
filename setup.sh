@@ -161,9 +161,41 @@ pull_selected_model() {
   return 1
 }
 
-write_config() {
+init_axss_dir() {
+  # 1. Main config dir — private to owner
   mkdir -p "$CONFIG_DIR"
-  printf '{\n  "default_model": "%s"\n}\n' "$SELECTED_MODEL" >"$CONFIG_PATH"
+  chmod 700 "$CONFIG_DIR"
+
+  # 2. Findings store directory
+  mkdir -p "$CONFIG_DIR/findings"
+
+  # 3. config.json — written every run so model selection is always fresh
+  printf '{\n  "default_model": "%s",\n  "use_cloud": true,\n  "cloud_model": "anthropic/claude-3-5-sonnet"\n}\n' \
+    "$SELECTED_MODEL" >"$CONFIG_PATH"
+
+  # 4. keys — created once with strict permissions so the user can add API keys
+  if [ ! -f "$CONFIG_DIR/keys" ]; then
+    cat >"$CONFIG_DIR/keys" <<'KEYS'
+# axss API keys — do NOT commit this file
+# Lines: KEY = VALUE  (# = comment, whitespace around = is ignored)
+#
+# Cloud LLM escalation (optional — axss works fine with local Ollama only)
+openrouter_api_key =
+openai_api_key     =
+#
+# xssy.uk JWT — copy from localStorage key userData.token after logging in
+# Used by axss_learn.py --xssy-token to get private lab instances
+xssy_jwt           =
+KEYS
+    chmod 600 "$CONFIG_DIR/keys"
+    echo "Created $CONFIG_DIR/keys (chmod 600) — add API keys there."
+  else
+    # Ensure perms are correct even if file already existed
+    chmod 600 "$CONFIG_DIR/keys"
+  fi
+
+  # 5. ollama serve log placeholder (created lazily, just ensure dir is ready)
+  : >"$OLLAMA_LOG" 2>/dev/null || true
 }
 
 echo "Detected RAM: $(ram_summary)"
@@ -178,7 +210,7 @@ if have_cmd ollama; then
 else
   echo "Warning: Ollama is unavailable; axss will fall back to heuristics or OPENAI_API_KEY." >&2
 fi
-write_config
+init_axss_dir
 
 if [ ! -d "$VENV_DIR" ]; then
   python3 -m venv "$VENV_DIR"
