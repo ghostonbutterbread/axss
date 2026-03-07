@@ -513,6 +513,13 @@ def score_payload(payload: PayloadCandidate, context: ParsedContext) -> int:
     elif any(s in tags or s == target for s in sink_names):
         score += 20
 
+    # ── Active probe confirmed sinks — highest confidence ────────────────────
+    if "probe-confirmed" in tags and target and any(s.startswith(target[:15]) for s in sink_names):
+        score += 30
+    probe_sinks = {s for s in sink_names if s.startswith("probe:")}
+    if probe_sinks and "probe-confirmed" in tags:
+        score += 20
+
     # ── Pre-encoded delivery — highest reward when chain matches ──────────────
     if "pre-encoded" in tags:
         # Already scored via target_sink above; boost further if chain exactly matches

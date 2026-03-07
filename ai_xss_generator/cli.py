@@ -4,6 +4,7 @@ import argparse
 import math
 import sys
 from pathlib import Path
+from typing import Callable
 
 from ai_xss_generator import __version__
 from ai_xss_generator.config import APP_NAME, CONFIG_PATH, DEFAULT_MODEL, load_config
@@ -161,6 +162,34 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
         action="store_true",
         help="--merge-batch (combine batch contexts into one payload set), e.g. --urls urls.txt --merge-batch",
     )
+    parser.add_argument(
+        "--no-probe",
+        action="store_true",
+        help=(
+            "--no-probe  Skip active parameter probing. By default, axss sends two "
+            "probe requests per query parameter to confirm reflection contexts and "
+            "which characters survive filtering before generating payloads."
+        ),
+    )
+    parser.add_argument(
+        "--no-live",
+        action="store_true",
+        help=(
+            "--no-live  Run probing silently (no live output per parameter). "
+            "Probe results still enrich the final payload generation."
+        ),
+    )
+    parser.add_argument(
+        "--threshold",
+        metavar="N",
+        type=int,
+        default=60,
+        help=(
+            "--threshold N  Minimum risk_score to include in final output (default: 60). "
+            "Filters out generic payloads that don't match the detected context. "
+            "Always shows at least 5 payloads even if all are below threshold."
+        ),
+    )
     parser.add_argument("-V", "--version", action="version", version=f"%(prog)s {__version__}")
     return parser
 
@@ -207,6 +236,55 @@ def _vlog(message: str, *, enabled: bool) -> None:
     """Verbose-only sub-step messages (indented, dimmed)."""
     if enabled:
         info(f"  {message}")
+
+
+def _apply_threshold(
+    payloads: list,
+    threshold: int,
+    top: int,
+) -> list:
+    """Return payloads above *threshold*, always keeping at least min(5, len(payloads))."""
+    above = [p for p in payloads if p.risk_score >= threshold]
+    if not above:
+        above = payloads[:5]
+    return above[:top]
+
+
+def _make_live_callback(
+    threshold: int,
+    output_mode: str,
+) -> "Callable":
+    """Return an on_result callback for the active prober that streams live output."""
+    from ai_xss_generator.probe import ProbeResult, payloads_for_probe_result
+
+    def _on_result(result: ProbeResult) -> None:
+        if result.error:
+            warn(f"[probe] {result.param_name}: {result.error}")
+            return
+        if not result.is_reflected:
+            info(f"[probe] {result.param_name}: not reflected")
+            return
+
+        for ctx in result.reflections:
+            chars = "".join(sorted(ctx.surviving_chars)) if ctx.surviving_chars else "?"
+            status = "INJECTABLE" if ctx.is_exploitable else "no useful chars"
+            msg = f"[probe] {result.param_name!r} → {ctx.short_label} | chars={chars!r} | {status}"
+            if ctx.is_exploitable:
+                success(msg)
+            else:
+                info(msg)
+
+        if output_mode == "json":
+            return
+
+        live_payloads = payloads_for_probe_result(result)
+        to_show = [p for p in live_payloads if p.risk_score >= threshold]
+        if to_show:
+            print()
+            print(render_list(to_show[:5]))
+            print()
+
+    return _on_result
 
 
 def _merge_contexts(contexts: list[ParsedContext], source: str) -> ParsedContext:
@@ -569,6 +647,36 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         parser.error(str(exc))
 
+    # --- Active probing (default for live URLs with query params) ---
+    probe_enabled = args.url and not args.no_probe and "?" in args.url
+    if probe_enabled:
+        param_count = len(args.url.split("?", 1)[-1].split("&")) if "?" in args.url else 0
+        step(f"Active probing: {param_count} parameter(s) × 2 requests each...")
+
+        live_cb = (
+            None
+            if args.no_live or args.output == "json"
+            else _make_live_callback(args.threshold, args.output)
+        )
+
+        from ai_xss_generator.probe import enrich_context, probe_url
+
+        probe_results = probe_url(args.url, rate=args.rate, on_result=live_cb)
+        injectable = sum(1 for r in probe_results if r.is_injectable)
+        reflected = sum(1 for r in probe_results if r.is_reflected)
+
+        if injectable:
+            success(
+                f"Probing complete: {injectable}/{param_count} parameter(s) injectable, "
+                f"{reflected} reflected."
+            )
+        elif reflected:
+            info(f"Probing complete: {reflected}/{param_count} parameter(s) reflected (chars filtered).")
+        else:
+            info(f"Probing complete: no reflection found in {param_count} parameter(s).")
+
+        context = enrich_context(context, probe_results)
+
     step(f"Generating payloads with {selected_model}...")
     if resolved_waf:
         info(f"WAF context: {waf_label(resolved_waf)}")
@@ -584,9 +692,21 @@ def main(argv: list[str] | None = None) -> int:
         waf=resolved_waf,
     )
 
-    success(f"Done. {len(result.payloads)} payloads ranked.")
+    # Apply threshold filter to final payloads
+    filtered_payloads = _apply_threshold(result.payloads, args.threshold, args.top)
+    below_count = len(result.payloads) - len(
+        [p for p in result.payloads if p.risk_score >= args.threshold]
+    )
+    success(
+        f"Done. {len(filtered_payloads)} payloads above threshold {args.threshold} "
+        f"({below_count} below threshold, {len(result.payloads)} total)."
+    )
+    if below_count > 0:
+        info(f"Use --threshold {max(1, args.threshold - 20)} to see more, or --threshold 1 for all.")
     print()
 
+    from dataclasses import replace as _dc_replace
+    result = _dc_replace(result, payloads=filtered_payloads)
     _print_single_result(result, args.output, args.top, waf=resolved_waf)
 
     if args.json_out:
