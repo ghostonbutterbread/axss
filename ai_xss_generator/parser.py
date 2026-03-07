@@ -16,14 +16,47 @@ FRAMEWORK_PATTERNS = {
     "AngularJS": re.compile(r"ng-app|ng-controller|\$eval|\$parse", re.IGNORECASE),
 }
 SINK_PATTERNS = {
+    # HTML injection sinks
     "innerHTML": re.compile(r"\.innerHTML\s*=|innerHTML\s*:", re.IGNORECASE),
     "outerHTML": re.compile(r"\.outerHTML\s*=", re.IGNORECASE),
     "insertAdjacentHTML": re.compile(r"insertAdjacentHTML\s*\(", re.IGNORECASE),
+    "createContextualFragment": re.compile(r"createContextualFragment\s*\(", re.IGNORECASE),
+    "DOMParser.parseFromString": re.compile(r"parseFromString\s*\(", re.IGNORECASE),
+    # Code execution sinks
     "eval": re.compile(r"\beval\s*\(", re.IGNORECASE),
     "setTimeout": re.compile(r"\bsetTimeout\s*\(", re.IGNORECASE),
     "setInterval": re.compile(r"\bsetInterval\s*\(", re.IGNORECASE),
-    "document.write": re.compile(r"document\.write\s*\(", re.IGNORECASE),
     "Function": re.compile(r"\bFunction\s*\(", re.IGNORECASE),
+    "execScript": re.compile(r"\bexecScript\s*\(", re.IGNORECASE),
+    # Document write sinks
+    "document.write": re.compile(r"document\.write\s*\(", re.IGNORECASE),
+    "document.writeln": re.compile(r"document\.writeln\s*\(", re.IGNORECASE),
+    # Navigation / JavaScript-URL sinks
+    "location.href": re.compile(r"(?:window\.|document\.)?location(?:\.href)?\s*=", re.IGNORECASE),
+    "location.assign": re.compile(r"location\.assign\s*\(", re.IGNORECASE),
+    "location.replace": re.compile(r"location\.replace\s*\(", re.IGNORECASE),
+    # Dynamic attribute sinks
+    "setAttribute": re.compile(r"\.setAttribute\s*\(", re.IGNORECASE),
+    "setAttributeNS": re.compile(r"\.setAttributeNS\s*\(", re.IGNORECASE),
+    # jQuery HTML-injection sinks
+    "jQuery.html": re.compile(r"\$\([^)]*\)\s*\.html\s*\(|\bjQuery\s*\([^)]*\)\s*\.html\s*\(", re.IGNORECASE),
+    "jQuery.append": re.compile(r"\$\([^)]*\)\s*\.(?:append|prepend|after|before|wrap|wrapAll|replaceWith)\s*\(", re.IGNORECASE),
+    # Framework-specific sinks
+    "dangerouslySetInnerHTML": re.compile(r"dangerouslySetInnerHTML", re.IGNORECASE),
+    "trustAsHtml": re.compile(r"\$sce\.trustAsHtml\s*\(|bypassSecurityTrustHtml\s*\(", re.IGNORECASE),
+    "v-html": re.compile(r"v-html\s*=", re.IGNORECASE),
+    "Handlebars.triple-stache": re.compile(r"\{\{\{", re.IGNORECASE),
+}
+# DOM-based XSS source expressions — these read attacker-controlled data without a request
+DOM_SOURCES: dict[str, re.Pattern[str]] = {
+    "location.hash": re.compile(r"location\.hash\b", re.IGNORECASE),
+    "location.search": re.compile(r"location\.search\b", re.IGNORECASE),
+    "location.href": re.compile(r"location\.href\b", re.IGNORECASE),
+    "window.name": re.compile(r"window\.name\b", re.IGNORECASE),
+    "document.referrer": re.compile(r"document\.referrer\b", re.IGNORECASE),
+    "postMessage": re.compile(r"addEventListener\s*\(\s*['\"]message['\"]", re.IGNORECASE),
+    "document.URL": re.compile(r"document\.URL\b", re.IGNORECASE),
+    "document.baseURI": re.compile(r"document\.baseURI\b", re.IGNORECASE),
 }
 VARIABLE_RE = re.compile(
     r"\b(var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*([^;\n]+)",
@@ -319,7 +352,11 @@ def _extract_sinks(scripts: list[str]) -> list[DomSink]:
                         sink=sink_name,
                         source=script[snippet_start:snippet_end].strip(),
                         location=location,
-                        confidence=0.93 if sink_name in {"innerHTML", "eval", "Function"} else 0.84,
+                        confidence=0.93 if sink_name in {
+                            "innerHTML", "outerHTML", "eval", "Function",
+                            "document.write", "document.writeln",
+                            "createContextualFragment", "dangerouslySetInnerHTML",
+                        } else 0.84,
                     )
                 )
     return sinks
@@ -340,6 +377,155 @@ def _extract_variables(scripts: list[str]) -> tuple[list[ScriptVariable], list[s
         for match in OBJECT_RE.finditer(script):
             objects.append(match.group(1))
     return variables, sorted(set(objects))
+
+
+def _detect_dom_sources(scripts: list[str]) -> tuple[list[DomSink], list[str]]:
+    """Detect DOM-based XSS sources (attacker-controlled inputs) that flow into sinks.
+
+    These indicate DOM XSS that never touches the server — the source reads data from
+    location.hash / window.name / etc. and passes it to a sink without sanitisation.
+    """
+    sinks: list[DomSink] = []
+    notes: list[str] = []
+    for script_idx, script in enumerate(scripts, start=1):
+        sources_found: list[str] = []
+        for source_name, pattern in DOM_SOURCES.items():
+            if pattern.search(script):
+                sources_found.append(source_name)
+
+        if not sources_found:
+            continue
+
+        # Check if any dangerous sink also appears in the same script block
+        sinks_found: list[str] = []
+        for sink_name, pattern in SINK_PATTERNS.items():
+            if pattern.search(script):
+                sinks_found.append(sink_name)
+
+        for source_name in sources_found:
+            confidence = 0.85 if sinks_found else 0.55
+            sinks.append(
+                DomSink(
+                    sink=f"dom_source:{source_name}",
+                    source=f"{source_name} read in script[{script_idx}]"
+                    + (f"; co-located with sinks: {', '.join(sinks_found)}" if sinks_found else ""),
+                    location=f"script[{script_idx}]",
+                    confidence=confidence,
+                )
+            )
+            if sinks_found:
+                notes.append(
+                    f"DOM source '{source_name}' co-located with sink(s) "
+                    f"{sinks_found} in script[{script_idx}] — likely DOM-based XSS."
+                )
+
+    return sinks, notes
+
+
+# Dangerous HTML attribute contexts that accept JavaScript/data URIs or raw JS
+_DANGEROUS_ATTR_RE = re.compile(
+    r"""(?P<attr>href|src|action|formaction|data|srcdoc|on\w+|style)\s*=\s*["']?(?P<value>[^"'\s>]{4,})["']?""",
+    re.IGNORECASE,
+)
+_JAVASCRIPT_URI_RE = re.compile(r"^javascript\s*:", re.IGNORECASE)
+_DATA_URI_RE = re.compile(r"^data\s*:", re.IGNORECASE)
+
+
+def _detect_html_param_reflections(
+    url: str, html: str
+) -> tuple[list[DomSink], list[str]]:
+    """Detect URL param values reflected directly in dangerous HTML attribute contexts.
+
+    Catches cases like:
+    - href="[param_value]" where value starts with javascript: or data:
+    - on[event]="[param_value]" — raw event handler injection
+    - src="[param_value]" — script/img src injection
+    """
+    import urllib.parse
+
+    sinks: list[DomSink] = []
+    notes: list[str] = []
+
+    try:
+        parsed = urllib.parse.urlparse(url)
+        params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+    except Exception:
+        return sinks, notes
+
+    if not params:
+        return sinks, notes
+
+    for param_name, param_values in params.items():
+        for raw_value in param_values:
+            if not raw_value or len(raw_value) < 3:
+                continue
+            if raw_value not in html:
+                continue
+            # Value is literally reflected — find the attribute context
+            for match in _DANGEROUS_ATTR_RE.finditer(html):
+                attr = match.group("attr").lower()
+                val = match.group("value")
+                if raw_value not in val:
+                    continue
+                # Determine severity of the reflection context
+                if attr.startswith("on"):
+                    sinks.append(DomSink(
+                        sink=f"reflected_in_event_handler:{attr}",
+                        source=f"param={param_name!r} → {attr}=\"{val[:60]}\"",
+                        location="html:attribute",
+                        confidence=0.97,
+                    ))
+                    notes.append(
+                        f"Parameter '{param_name}' is reflected directly inside event "
+                        f"handler attribute '{attr}' — direct XSS without JS context escape."
+                    )
+                elif attr in {"href", "action", "formaction", "src", "data"}:
+                    if _JAVASCRIPT_URI_RE.match(val) or _DATA_URI_RE.match(val):
+                        sinks.append(DomSink(
+                            sink=f"reflected_in_{attr}_uri",
+                            source=f"param={param_name!r} → {attr}=\"{val[:60]}\"",
+                            location="html:attribute",
+                            confidence=0.95,
+                        ))
+                        notes.append(
+                            f"Parameter '{param_name}' is reflected in '{attr}' attribute "
+                            f"with a javascript:/data: URI — direct XSS vector."
+                        )
+                    else:
+                        sinks.append(DomSink(
+                            sink=f"reflected_in_{attr}",
+                            source=f"param={param_name!r} → {attr}=\"{val[:60]}\"",
+                            location="html:attribute",
+                            confidence=0.72,
+                        ))
+                        notes.append(
+                            f"Parameter '{param_name}' is reflected in '{attr}' attribute — "
+                            f"may allow javascript:/data: URI injection."
+                        )
+                elif attr == "srcdoc":
+                    sinks.append(DomSink(
+                        sink="reflected_in_srcdoc",
+                        source=f"param={param_name!r} → srcdoc=\"{val[:60]}\"",
+                        location="html:attribute",
+                        confidence=0.93,
+                    ))
+                    notes.append(
+                        f"Parameter '{param_name}' reflected in 'srcdoc' attribute — "
+                        f"HTML parsed in iframe context."
+                    )
+                elif attr == "style":
+                    sinks.append(DomSink(
+                        sink="reflected_in_style",
+                        source=f"param={param_name!r} → style=\"{val[:60]}\"",
+                        location="html:attribute",
+                        confidence=0.65,
+                    ))
+                    notes.append(
+                        f"Parameter '{param_name}' reflected in 'style' attribute — "
+                        f"potential CSS expression/url() injection."
+                    )
+
+    return sinks, notes
 
 
 def _try_uudecode(data: bytes) -> str | None:
@@ -370,16 +556,100 @@ def _try_uudecode(data: bytes) -> str | None:
         return None
 
 
+def _decode_candidates(raw_value: str) -> list[tuple[str, str]]:
+    """Return (decoded_text, encoding_chain) pairs for all applicable decoding attempts."""
+    import base64
+
+    results: list[tuple[str, str]] = []
+
+    def _add(text: str, chain: str) -> None:
+        if text and text.strip() and len(text.strip()) >= 4 and text.isprintable():
+            results.append((text.strip(), chain))
+
+    # ── Plain base64 ──────────────────────────────────────────────────────────
+    try:
+        padding = "=" * ((-len(raw_value)) % 4)
+        b64_bytes = base64.b64decode(raw_value + padding)
+        _add(b64_bytes.decode("utf-8", errors="replace"), "base64")
+        # base64 → UUdecode (level19 pattern)
+        uu = _try_uudecode(b64_bytes)
+        if uu:
+            _add(uu, "base64+uuencode")
+    except Exception:
+        pass
+
+    # ── Base32 ───────────────────────────────────────────────────────────────
+    try:
+        padding = "=" * ((-len(raw_value)) % 8)
+        b32_bytes = base64.b32decode(raw_value.upper() + padding)
+        _add(b32_bytes.decode("utf-8", errors="replace"), "base32")
+    except Exception:
+        pass
+
+    # ── HTML entity decode → check if it looks like JS ───────────────────────
+    try:
+        from html import unescape as html_unescape
+        unescaped = html_unescape(raw_value)
+        if unescaped != raw_value:
+            _add(unescaped, "html_entity")
+    except Exception:
+        pass
+
+    # ── Hex string (%xx or \xNN or 0xNN...) ─────────────────────────────────
+    try:
+        import urllib.parse
+        decoded_url = urllib.parse.unquote(raw_value)
+        if decoded_url != raw_value:
+            _add(decoded_url, "url_percent")
+        # Double URL-encoded
+        double_decoded = urllib.parse.unquote(decoded_url)
+        if double_decoded != decoded_url:
+            _add(double_decoded, "double_url_percent")
+    except Exception:
+        pass
+
+    # ── Gzip + base64 ────────────────────────────────────────────────────────
+    try:
+        import gzip
+        padding = "=" * ((-len(raw_value)) % 4)
+        gz_bytes = base64.b64decode(raw_value + padding)
+        gz_text = gzip.decompress(gz_bytes).decode("utf-8", errors="replace")
+        _add(gz_text, "gzip+base64")
+    except Exception:
+        pass
+
+    # ── JSON string value ─────────────────────────────────────────────────────
+    try:
+        import json
+        # Value might be a JSON-encoded string (with surrounding quotes or as array/object)
+        parsed = json.loads(raw_value)
+        if isinstance(parsed, str):
+            _add(parsed, "json_string")
+        elif isinstance(parsed, list) and parsed and isinstance(parsed[0], str):
+            _add(parsed[0], "json_array")
+    except Exception:
+        pass
+
+    # ── ROT13 (rare, but occasionally seen in obfuscated challenges) ──────────
+    try:
+        import codecs
+        rot13 = codecs.decode(raw_value, "rot_13")
+        if rot13 != raw_value and rot13.isprintable():
+            _add(rot13, "rot13")
+    except Exception:
+        pass
+
+    return results
+
+
 def _detect_encoded_param_reflections(
     url: str, scripts: list[str]
 ) -> tuple[list[DomSink], list[str]]:
     """Detect URL params decoded through encoding chains and reflected into JS string sinks.
 
-    Handles:
-    - base64 → reflected into ``var x = "..."``
-    - base64 → UUdecode → reflected into ``var x = "..."``  (level19-style)
+    Handles: base64, base64+uuencode, base32, html_entity, url_percent,
+    double_url_percent, gzip+base64, json_string, rot13.
     """
-    import base64
     import urllib.parse
 
     sinks: list[DomSink] = []
@@ -394,41 +664,23 @@ def _detect_encoded_param_reflections(
     if not params or not scripts:
         return sinks, notes
 
+    seen: set[tuple[str, str, str]] = set()  # (param, chain, script_idx) dedup
+
     for param_name, param_values in params.items():
         for raw_value in param_values:
             if not raw_value or len(raw_value) < 4:
                 continue
 
-            decoded_candidates: list[tuple[str, str]] = []
-
-            # Try plain base64
-            try:
-                padding = "=" * ((-len(raw_value)) % 4)
-                b64_bytes = base64.b64decode(raw_value + padding)
-                b64_text = b64_bytes.decode("utf-8", errors="replace")
-                if b64_text.isprintable() and b64_text.strip():
-                    decoded_candidates.append((b64_text.strip(), "base64"))
-            except Exception:
-                pass
-
-            # Try base64 → UUdecode (the pattern from sudo.co.il level19)
-            try:
-                padding = "=" * ((-len(raw_value)) % 4)
-                b64_bytes = base64.b64decode(raw_value + padding)
-                uu_text = _try_uudecode(b64_bytes)
-                if uu_text and uu_text.strip():
-                    decoded_candidates.append((uu_text.strip(), "base64+uuencode"))
-            except Exception:
-                pass
-
-            for decoded_text, chain in decoded_candidates:
-                if len(decoded_text) < 4:
-                    continue
+            for decoded_text, chain in _decode_candidates(raw_value):
                 probe = decoded_text[:30]
                 for script_idx, script in enumerate(scripts, start=1):
                     pos = script.find(probe)
                     if pos == -1:
                         continue
+                    key = (param_name, chain, str(script_idx))
+                    if key in seen:
+                        continue
+                    seen.add(key)
                     # Find the nearest JS variable assignment enclosing the reflected value
                     snippet = script[max(0, pos - 60): pos + len(decoded_text) + 4]
                     all_var_matches = list(_JS_VAR_STRING_RE.finditer(snippet))
@@ -496,18 +748,24 @@ def _build_context(
     frameworks = _extract_frameworks(html, markup.inline_scripts)
     esprima_sinks, esprima_variables, esprima_objects, esprima_notes = _extract_with_esprima(markup.inline_scripts)
     dom_sinks = esprima_sinks + _extract_sinks(markup.inline_scripts)
+    dom_src_sinks, dom_src_notes = _detect_dom_sources(markup.inline_scripts)
     enc_sinks, enc_notes = (
         _detect_encoded_param_reflections(source, markup.inline_scripts)
         if source_type == "url" and "?" in source
         else ([], [])
     )
-    dom_sinks = enc_sinks + dom_sinks
+    attr_sinks, attr_notes = (
+        _detect_html_param_reflections(source, html)
+        if source_type == "url" and "?" in source
+        else ([], [])
+    )
+    dom_sinks = enc_sinks + attr_sinks + dom_src_sinks + dom_sinks
     variables, objects = _extract_variables(markup.inline_scripts)
     if esprima_variables:
         variables = esprima_variables + variables
     if esprima_objects:
         objects = sorted(set(objects + esprima_objects))
-    notes = [*markup.notes, *esprima_notes, *enc_notes]
+    notes = [*markup.notes, *esprima_notes, *dom_src_notes, *enc_notes, *attr_notes]
     context = ParsedContext(
         source=source,
         source_type=source_type,
