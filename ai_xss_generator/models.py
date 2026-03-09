@@ -569,6 +569,46 @@ def _persist_cloud_findings(
 
 
 # ---------------------------------------------------------------------------
+# Public cloud escalation — used by the active scanner worker
+# ---------------------------------------------------------------------------
+
+def generate_cloud_payloads(
+    context: "ParsedContext",
+    cloud_model: str,
+    waf: str | None = None,
+    past_findings: "list[Finding] | None" = None,
+) -> "tuple[list[PayloadCandidate], str]":
+    """Call the cloud model directly for active-scanner escalation.
+
+    Skips local Ollama entirely — only used when Phase 1 mechanical transforms
+    AND local model payloads have already failed to confirm execution.
+
+    Returns (payloads, engine_label).  Returns ([], "") when no API key is set
+    or the cloud call fails.
+    """
+    sink_type, context_type, surviving_chars = _extract_probe_context(context)
+    if past_findings is None:
+        past_findings = relevant_findings(
+            sink_type=sink_type,
+            context_type=context_type,
+            surviving_chars=surviving_chars,
+        )
+
+    payloads, engine = _try_cloud(
+        context=context,
+        cloud_model=cloud_model,
+        reference_payloads=None,
+        waf=waf,
+        past_findings=past_findings,
+    )
+
+    if payloads and engine:
+        _persist_cloud_findings(payloads, context, engine)
+
+    return payloads, engine
+
+
+# ---------------------------------------------------------------------------
 # Mutators
 # ---------------------------------------------------------------------------
 

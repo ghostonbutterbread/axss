@@ -199,6 +199,43 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("-V", "--version", action="version", version=f"%(prog)s {__version__}")
+
+    # ── Active scanner ────────────────────────────────────────────────────────
+    parser.add_argument(
+        "-a",
+        "--active",
+        action="store_true",
+        help=(
+            "--active  Enable active scanning mode. Fires payloads into a real "
+            "Playwright browser and detects confirmed XSS execution (alert() dialogs, "
+            "console output, network beacons). Requires -u or --urls. "
+            "Writes a markdown report to ~/.axss/reports/. "
+            "Limited to reflected XSS; stored/DOM XSS deferred."
+        ),
+    )
+    parser.add_argument(
+        "--workers",
+        metavar="N",
+        type=int,
+        default=1,
+        help=(
+            "--workers N  Maximum parallel active-scan workers (default: 1). "
+            "Each worker is an isolated process scanning one URL at a time. "
+            "Workers also auto-scale with --rate (floor(rate/5)), but never exceed N. "
+            "Increase only when scanning multiple distinct domains simultaneously."
+        ),
+    )
+    parser.add_argument(
+        "--timeout",
+        metavar="N",
+        type=int,
+        default=300,
+        help=(
+            "--timeout N  Per-URL timeout in seconds for active scan workers (default: 300). "
+            "Workers that exceed this are marked inconclusive and terminated cleanly."
+        ),
+    )
+
     return parser
 
 
@@ -455,6 +492,61 @@ def _handle_public_payloads(
 
 
 # ---------------------------------------------------------------------------
+# Active scan entry point
+# ---------------------------------------------------------------------------
+
+def _run_active_scan(args: Any, config: Any, resolved_waf: str | None) -> int:
+    """Route --active scans through the orchestrator."""
+    from ai_xss_generator.active.orchestrator import ActiveScanConfig, run_active_scan
+    from ai_xss_generator.active.reporter import write_report
+    from ai_xss_generator.parser import read_url_list
+
+    use_cloud = config.use_cloud and not getattr(args, "no_cloud", False)
+
+    if args.urls:
+        try:
+            urls = read_url_list(args.urls)
+        except Exception as exc:
+            return 1 if not print(f"Error reading URL list: {exc}") else 1
+    else:
+        urls = [args.url]
+
+    # WAF auto-detect from first URL if not provided manually
+    waf = resolved_waf
+    if not waf and urls:
+        step(f"Probing for WAF on {urls[0]}...")
+        detected = _try_detect_waf(urls[0], getattr(args, "verbose", False))
+        if detected:
+            waf = detected
+            success(f"WAF detected: {waf_label(detected)}")
+        else:
+            info("No WAF fingerprint detected.")
+
+    scan_config = ActiveScanConfig(
+        rate=args.rate,
+        workers=getattr(args, "workers", 1),
+        model=args.model or config.default_model,
+        cloud_model=config.cloud_model,
+        use_cloud=use_cloud,
+        waf=waf,
+        timeout_seconds=getattr(args, "timeout", 300),
+        output_path=getattr(args, "json_out", None),
+    )
+
+    results = run_active_scan(urls, scan_config)
+
+    config_summary = (
+        f"rate={args.rate:g} req/s | workers={scan_config.workers} | "
+        f"model={scan_config.model} | waf={waf or 'none'}"
+    )
+    report_path = write_report(results, config_summary=config_summary)
+    success(f"Report written to: {report_path}")
+
+    confirmed = sum(1 for r in results if r.status == "confirmed")
+    return 0 if confirmed >= 0 else 1
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -535,6 +627,12 @@ def main(argv: list[str] | None = None) -> int:
     cloud_model = config.cloud_model
     registry = PluginRegistry()
     registry.load_from(Path(__file__).resolve().parent.parent)
+
+    # --- Active scan mode (--active) ---
+    if getattr(args, "active", False):
+        if not (args.url or args.urls):
+            parser.error("--active requires -u/--url or --urls")
+        return _run_active_scan(args, config, resolved_waf)
 
     # --- Batch URLs mode ---
     if args.urls:
