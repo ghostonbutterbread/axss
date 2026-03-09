@@ -580,6 +580,108 @@ def _persist_cloud_findings(
 
 
 # ---------------------------------------------------------------------------
+# Key validation
+# ---------------------------------------------------------------------------
+
+def check_api_keys() -> list[dict[str, str]]:
+    """Probe each configured service and return a list of status dicts.
+
+    Each dict has keys: service, source, status, detail.
+      status: "ok" | "invalid" | "missing" | "error" | "unreachable"
+      source: where the key was found ("env", "keys file", "not set", or a URL)
+
+    Checks (in order):
+      1. Ollama — GET /api/tags on the configured host
+      2. OpenRouter — GET /api/v1/auth/key (returns credit/tier info)
+      3. OpenAI — GET /v1/models (list endpoint; validates key without cost)
+    """
+    from ai_xss_generator.config import load_api_key
+
+    results: list[dict[str, str]] = []
+
+    # ── 1. Ollama ─────────────────────────────────────────────────────────────
+    try:
+        resp = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=5)
+        if resp.status_code == 200:
+            models = [m.get("name", "") for m in resp.json().get("models", [])]
+            model_preview = ", ".join(models[:4]) + (" …" if len(models) > 4 else "")
+            detail = f"{len(models)} model(s) loaded" + (f": {model_preview}" if models else "")
+            results.append({"service": "Ollama", "source": OLLAMA_BASE_URL, "status": "ok", "detail": detail})
+        else:
+            results.append({"service": "Ollama", "source": OLLAMA_BASE_URL, "status": "error", "detail": f"HTTP {resp.status_code}"})
+    except Exception as exc:
+        results.append({"service": "Ollama", "source": OLLAMA_BASE_URL, "status": "unreachable", "detail": str(exc)})
+
+    # ── 2. OpenRouter ─────────────────────────────────────────────────────────
+    or_env = os.environ.get("OPENROUTER_API_KEY", "")
+    or_file = load_api_key("openrouter_api_key")
+    or_key = or_env or or_file
+    or_source = "env" if or_env else ("keys file" if or_file else "not set")
+
+    if or_key:
+        try:
+            resp = requests.get(
+                f"{OPENROUTER_BASE_URL}/auth/key",
+                headers={"Authorization": f"Bearer {or_key}"},
+                timeout=8,
+            )
+            if resp.status_code == 200:
+                data = resp.json().get("data", {})
+                usage = data.get("usage", 0)
+                limit = data.get("limit")
+                is_free = data.get("is_free_tier", False)
+                tier = "free tier" if is_free else (
+                    f"${usage:.4f} used" + (f" / ${limit:.2f} limit" if limit else "")
+                )
+                results.append({"service": "OpenRouter", "source": or_source, "status": "ok", "detail": tier})
+            elif resp.status_code == 401:
+                results.append({"service": "OpenRouter", "source": or_source, "status": "invalid", "detail": "key rejected (401 Unauthorized)"})
+            else:
+                results.append({"service": "OpenRouter", "source": or_source, "status": "error", "detail": f"HTTP {resp.status_code}"})
+        except Exception as exc:
+            results.append({"service": "OpenRouter", "source": or_source, "status": "error", "detail": str(exc)})
+    else:
+        results.append({
+            "service": "OpenRouter",
+            "source": "not set",
+            "status": "missing",
+            "detail": "add openrouter_api_key = sk-or-... to ~/.axss/keys",
+        })
+
+    # ── 3. OpenAI ─────────────────────────────────────────────────────────────
+    oa_env = os.environ.get("OPENAI_API_KEY", "")
+    oa_file = load_api_key("openai_api_key")
+    oa_key = oa_env or oa_file
+    oa_source = "env" if oa_env else ("keys file" if oa_file else "not set")
+
+    if oa_key:
+        try:
+            resp = requests.get(
+                f"{OPENAI_BASE_URL}/models",
+                headers={"Authorization": f"Bearer {oa_key}"},
+                timeout=8,
+            )
+            if resp.status_code == 200:
+                count = len(resp.json().get("data", []))
+                results.append({"service": "OpenAI", "source": oa_source, "status": "ok", "detail": f"{count} model(s) accessible"})
+            elif resp.status_code == 401:
+                results.append({"service": "OpenAI", "source": oa_source, "status": "invalid", "detail": "key rejected (401 Unauthorized)"})
+            else:
+                results.append({"service": "OpenAI", "source": oa_source, "status": "error", "detail": f"HTTP {resp.status_code}"})
+        except Exception as exc:
+            results.append({"service": "OpenAI", "source": oa_source, "status": "error", "detail": str(exc)})
+    else:
+        results.append({
+            "service": "OpenAI",
+            "source": "not set",
+            "status": "missing",
+            "detail": "add openai_api_key = sk-... to ~/.axss/keys or set OPENAI_API_KEY",
+        })
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Public cloud escalation — used by the active scanner worker
 # ---------------------------------------------------------------------------
 

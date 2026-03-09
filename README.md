@@ -10,7 +10,7 @@
 ## How it works
 
 ```
-fetch target HTML
+fetch target HTML  (authenticated if --header / --cookies supplied)
     ↓
 passive analysis
   • DOM sink detection (innerHTML, eval, location.href, jQuery, dangerouslySetInnerHTML, …)
@@ -34,9 +34,11 @@ ranking + threshold filter
   default threshold: 60 — always shows at least 5 payloads
 ```
 
+Optionally: **active scanner** (`--active`) fires payloads through a real Playwright browser and confirms execution via alert dialogs, console output, or OOB network beacons.
+
 ## Self-learning findings store
 
-Every time a cloud model generates payloads, `axss` saves them to `~/.axss/findings.jsonl` keyed by sink type, reflection context, and surviving characters. On the next scan of a similar target, those findings are injected as few-shot examples into the local model prompt — so the local model reasons from real bypass patterns discovered by the stronger cloud model, without ever needing to call the cloud again.
+Every time a cloud model generates payloads, `axss` saves them to `~/.axss/findings/` keyed by sink type, reflection context, and surviving characters. On the next scan of a similar target, those findings are injected as few-shot examples into the local model prompt — so the local model reasons from real bypass patterns discovered by the stronger cloud model, without ever needing to call the cloud again.
 
 The store grows silently in the background, capped at 500 entries (oldest roll off). Nothing is sent anywhere; it stays entirely local.
 
@@ -51,14 +53,77 @@ Probe results flow directly into payload generation: the LLM prompt leads with s
 
 Live probe output streams as results arrive. Use `--no-live` to suppress streaming, `--no-probe` to skip probing entirely.
 
+## Active scanner (`--active`)
+
+The active scanner fires payloads into a real Playwright browser and detects confirmed JavaScript execution. Each URL gets an isolated worker process.
+
+**Detection methods:**
+- `dialog` — `alert()` / `confirm()` / `prompt()` event triggered
+- `console` — `console.log()` / `console.error()` fired
+- `network` — outbound request to the internal beacon hostname
+
+**Execution pipeline per URL:**
+1. Probe all query parameters for reflection and character survival
+2. **Phase 1** — mechanical transform variants (encoding, template tricks, namespace escapes, etc.)
+3. **Local model** — AI-generated payloads for unconfirmed params
+4. **Cloud escalation** — if still unconfirmed and a cloud key is configured
+
+Confirmed findings are written to `~/.axss/reports/<domain>_<timestamp>.md`.
+
+```bash
+# Active scan, single URL
+axss -u "https://example.com/search?q=test" --active
+
+# Active scan, batch URLs, 3 workers
+axss --urls urls.txt --active --workers 3 --timeout 120
+
+# Active scan, authenticated target
+axss -u "https://app.example.com/profile?bio=test" --active --cookies cookies.txt
+```
+
+## Authenticated scanning (`--header` / `--cookies`)
+
+Pass session credentials so every request — fetch, probe, and payload firing — carries the same auth context. The LLM prompt is also told the session is authenticated so it can suggest payloads targeting privileged endpoints.
+
+```bash
+# Bearer token
+axss -u "https://api.example.com/v1/search?q=x" \
+     --header "Authorization: Bearer eyJ..."
+
+# API key header
+axss -u "https://app.example.com/search?q=x" \
+     --header "X-API-Key: abc123"
+
+# Browser session cookies (export with a browser extension, e.g. "Export Cookies")
+axss -u "https://app.example.com/dashboard?tab=x" \
+     --cookies cookies.txt
+
+# Combined: token + cookies
+axss -u "https://app.example.com/admin?q=x" \
+     --header "Authorization: Bearer TOKEN" \
+     --cookies cookies.txt
+
+# Active scanner + auth
+axss -u "https://app.example.com/profile?bio=x" --active \
+     --header "Authorization: Bearer TOKEN"
+```
+
+**cookies.txt format** — standard Netscape HTTP Cookie File (tab-separated):
+```
+# Netscape HTTP Cookie File
+.example.com	TRUE	/	FALSE	0	session_id	abc123
+.example.com	TRUE	/	TRUE	0	csrf_token	xyz789
+```
+Most browser cookie export extensions produce this format directly.
+
 ## Model escalation chain
 
 ```
 Local Ollama  (qwen3.5:9b default, findings-enriched prompt)
     ↓  if output is weak (< 3 payloads or all generic)
-OpenRouter    (preferred cloud — set OPENROUTER_API_KEY)
+OpenRouter    (preferred cloud — set OPENROUTER_API_KEY or add to ~/.axss/keys)
     ↓  if OpenRouter unavailable or fails
-OpenAI        (gpt-4o-mini — set OPENAI_API_KEY)
+OpenAI        (gpt-4o-mini — set OPENAI_API_KEY or add to ~/.axss/keys)
     ↓  if no API keys / both fail
 Heuristic-only  (always works, no network needed)
 ```
@@ -70,7 +135,7 @@ Cloud escalation only triggers when the local model's output fails a quality che
 `axss` combines three sources and ranks the union:
 
 - **Heuristic engine** — context-aware, deterministic. Generates payloads for every detected sink: encoded param delivery (base64/UU/etc.), href whitespace bypasses (`%09`/`%0a`/`%0d` in scheme), event handler injection, DOM source payloads, jQuery HTML sinks, probe-confirmed contexts, and more.
-- **LLM generation** — local Ollama (or cloud fallback) receives the full parsed context, probe results, and relevant past findings, then generates additional targeted payloads.
+- **LLM generation** — local Ollama (or cloud fallback) receives the full parsed context, probe results, auth context, and relevant past findings, then generates additional targeted payloads.
 - **Public payload database** — `--public` fetches community XSS payloads and injects a diverse sample as reference examples into the LLM prompt.
 
 ## Setup
@@ -111,6 +176,7 @@ EOF
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
+playwright install chromium --with-deps
 ```
 
 ### Model sizing
@@ -124,12 +190,35 @@ pip install -r requirements.txt
 
 ### Cloud configuration (optional)
 
+API keys can be set as environment variables **or** stored in `~/.axss/keys` (preferred — no need to export them in every shell session):
+
+```
+# ~/.axss/keys
+openrouter_api_key = sk-or-v1-...
+openai_api_key     = sk-...
+```
+
 ```bash
-export OPENROUTER_API_KEY="sk-or-..."   # preferred
-export OPENAI_API_KEY="sk-..."          # fallback
+# Or via environment variables
+export OPENROUTER_API_KEY="sk-or-..."   # preferred cloud
+export OPENAI_API_KEY="sk-..."          # fallback cloud
 
 # Set preferred OpenRouter model in ~/.axss/config.json:
 # "cloud_model": "google/gemini-2.0-flash-001"
+```
+
+Verify all keys are valid:
+
+```bash
+axss --check-keys
+```
+
+```
+Checking API keys (keys file: /home/user/.axss/keys)
+
+  [+]  Ollama      http://127.0.0.1:11434  3 model(s) loaded: qwen3.5:9b, qwen3.5:4b …
+  [+]  OpenRouter  keys file               free tier
+  [-]  OpenAI      not set                 add openai_api_key = sk-... to ~/.axss/keys or set OPENAI_API_KEY
 ```
 
 ## Usage
@@ -173,11 +262,26 @@ axss -u "https://example.com?q=test" -o json -j result.json
 # Dump public payloads for a WAF (no target needed)
 axss --public --waf modsecurity -o list
 
+# Validate all configured API keys
+axss --check-keys
+
 # List local Ollama models
 axss -l
 
 # Search available models
 axss -s qwen3.5
+
+# Authenticated scan — bearer token
+axss -u "https://app.example.com/search?q=x" --header "Authorization: Bearer TOKEN"
+
+# Authenticated scan — cookies.txt from browser export
+axss -u "https://app.example.com/dashboard?tab=x" --cookies cookies.txt
+
+# Active scanner — confirm execution in browser
+axss -u "https://example.com/search?q=test" --active
+
+# Active scanner — authenticated, batch URLs
+axss --urls urls.txt --active --workers 3 --cookies cookies.txt
 ```
 
 ### All flags
@@ -198,6 +302,12 @@ axss -s qwen3.5
 | `--no-probe` | off | Skip active parameter probing |
 | `--no-live` | off | Suppress streaming probe output |
 | `--no-cloud` | off | Never escalate to cloud LLM |
+| `--header 'Name: Value'` | — | Add a custom request header (repeatable) |
+| `--cookies FILE` | — | Load session cookies from a Netscape cookies.txt file |
+| `-a, --active` | off | Fire payloads in Playwright and confirm execution |
+| `--workers N` | 1 | Max parallel active-scan worker processes |
+| `--timeout N` | 300 | Per-URL timeout in seconds for active scan workers |
+| `--check-keys` | — | Validate all configured API keys and report status |
 | `-v, --verbose` | off | Show detailed sub-step progress |
 | `--merge-batch` | off | Combine batch contexts into one payload set |
 | `-l, --list-models` | — | List local Ollama models |
@@ -261,6 +371,16 @@ $ axss -u "https://target.example/page?url=test" -v --threshold 70
 | `AXSS_USER_AGENTS` | File path or comma-separated User-Agent strings to rotate |
 | `AXSS_PROXIES` | File path or comma-separated proxy list |
 
+## Keys file (`~/.axss/keys`)
+
+```
+# ~/.axss/keys  — simple KEY=value, one per line, # for comments
+openrouter_api_key = sk-or-v1-...
+openai_api_key     = sk-...
+```
+
+Values are read at runtime; no shell export needed. Use `axss --check-keys` to verify them at any time.
+
 ## Config file (`~/.axss/config.json`)
 
 ```json
@@ -277,9 +397,9 @@ $ axss -u "https://target.example/page?url=test" -v --threshold 70
 | `use_cloud` | `true` | Allow cloud escalation when local output is weak |
 | `cloud_model` | `anthropic/claude-3-5-sonnet` | Preferred OpenRouter model |
 
-## Findings store (`~/.axss/findings.jsonl`)
+## Findings store (`~/.axss/findings/`)
 
-Each line is a JSON object capturing:
+Each finding is a JSON object capturing:
 
 - `sink_type` — e.g. `reflected_in_href`, `js_string_via_base64`
 - `context_type` — e.g. `html_attr_url`, `js_string_dq`
@@ -287,13 +407,16 @@ Each line is a JSON object capturing:
 - `bypass_family` — one of 16 named families (whitespace-in-scheme, js-string-breakout, constructor-chain, …)
 - `payload` / `test_vector` — the exact payload and delivery vector
 - `model` — which model generated it
-- `verified` — manually confirmed to execute in browser
+- `verified` — `true` when confirmed to execute in browser (via `--active`)
 
 Future local runs retrieve findings by scoring sink type match (+4), context type match (+3), surviving char overlap (+1–3), and verified status (+2), then inject the top matches as few-shot examples into the prompt.
+
+Active scan confirmed findings are additionally written to `~/.axss/reports/<domain>_<timestamp>.md`.
 
 ## Notes
 
 - The heuristic engine runs regardless of LLM availability — `axss` is always useful offline.
-- Live crawling uses Scrapling with stealth headers.
+- Live crawling uses Scrapling with stealth headers and a curl_cffi → HTTP/1.1 → Playwright fallback chain for WAF-protected targets.
 - `axss -l` wraps `ollama list`; `axss -s <query>` prefers `ollama search` and falls back to Ollama web search.
 - The default model comes from `~/.axss/config.json`; falls back to `qwen3.5:9b` if missing.
+- Active scanner is limited to reflected XSS; stored and DOM-only XSS are not yet confirmed automatically.

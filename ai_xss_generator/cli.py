@@ -9,7 +9,7 @@ from typing import Callable
 from ai_xss_generator import __version__
 from ai_xss_generator.config import APP_NAME, CONFIG_PATH, DEFAULT_MODEL, load_config
 from ai_xss_generator.console import header, info, step, success, warn, waf_label
-from ai_xss_generator.models import generate_payloads, list_ollama_models, search_ollama_models
+from ai_xss_generator.models import check_api_keys, generate_payloads, list_ollama_models, search_ollama_models
 from ai_xss_generator.output import render_batch_json, render_heat, render_json, render_list, render_summary
 from ai_xss_generator.parser import BatchParseError, parse_target, parse_targets, read_url_list
 from ai_xss_generator.plugin_system import PluginRegistry
@@ -85,6 +85,15 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
         "--search-models",
         metavar="QUERY",
         help="--search-models QUERY (search Ollama model names), e.g. -s qwen3.5",
+    )
+    action_group.add_argument(
+        "--check-keys",
+        action="store_true",
+        help=(
+            "--check-keys  Validate all configured API keys (Ollama, OpenRouter, OpenAI). "
+            "Reads from ~/.axss/keys and environment variables, makes a lightweight "
+            "probe request to each service, and reports status."
+        ),
     )
 
     # Payload sourcing flags
@@ -586,14 +595,29 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     has_target = bool(args.url or args.urls or args.input)
-    is_utility = args.list_models or args.search_models
+    is_utility = args.list_models or args.search_models or args.check_keys
 
     # Validate: need at least one of: target, --public, or a utility action
     if not has_target and not args.public and not is_utility:
         parser.error(
             "one of the arguments -u/--url --urls -i/--input -l/--list-models "
-            "-s/--search-models --public is required"
+            "-s/--search-models --check-keys --public is required"
         )
+
+    # --- Utility: check API keys ---
+    if args.check_keys:
+        from ai_xss_generator.config import KEYS_PATH
+        print(f"Checking API keys (keys file: {KEYS_PATH})\n")
+        results = check_api_keys()
+        _STATUS_ICON = {"ok": "[+]", "invalid": "[!]", "missing": "[-]", "error": "[!]", "unreachable": "[!]"}
+        col_w = max(len(r["service"]) for r in results)
+        src_w = max(len(r["source"]) for r in results)
+        for r in results:
+            icon = _STATUS_ICON.get(r["status"], "[?]")
+            print(f"  {icon}  {r['service']:<{col_w}}  {r['source']:<{src_w}}  {r['detail']}")
+        print()
+        any_invalid = any(r["status"] in {"invalid", "error"} for r in results)
+        return 1 if any_invalid else 0
 
     # --- Utility: list / search models ---
     if args.list_models:
