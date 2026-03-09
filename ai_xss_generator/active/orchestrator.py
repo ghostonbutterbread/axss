@@ -89,11 +89,17 @@ def run_active_scan(
     completed = 0
 
     def _drain_queue() -> None:
-        while not result_queue.empty():
+        # Use a short timeout rather than get_nowait() so results aren't lost
+        # when a worker puts an item into the queue at the exact moment empty()
+        # returns True.
+        import queue as _queue
+        while True:
             try:
-                r = result_queue.get_nowait()
+                r = result_queue.get(timeout=0.05)
                 results.append(r)
                 _log_result(r)
+            except _queue.Empty:
+                break
             except Exception:
                 break
 

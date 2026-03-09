@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from html.parser import HTMLParser
+import logging
 import re
 from pathlib import Path
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 from ai_xss_generator.encodings import decode_candidates, uudecode_line
 from ai_xss_generator.types import DomSink, FormContext, FormField, ParsedContext, ScriptVariable
@@ -151,7 +154,11 @@ class _MiniHTMLParser(HTMLParser):
         if self.in_title:
             self.title += data.strip()
         if self._in_script:
-            self._script_chunks.append(data)
+            # Accumulate up to 100 KB per script block to avoid OOM on minified pages
+            already = sum(len(c) for c in self._script_chunks)
+            remaining = max(0, 102_400 - already)
+            if remaining > 0:
+                self._script_chunks.append(data[:remaining])
 
 
 def _field_from_attrs(tag: str, attr_map: dict[str, str]) -> FormField:
@@ -245,10 +252,15 @@ def _extract_frameworks(html: str, scripts: list[str]) -> list[str]:
 def _walk_esprima_node(node: Any) -> list[Any]:
     stack = [node]
     visited: list[Any] = []
+    seen_ids: set[int] = set()  # cycle guard: track object identity
     while stack:
         current = stack.pop()
         if current is None:
             continue
+        nid = id(current)
+        if nid in seen_ids:
+            continue
+        seen_ids.add(nid)
         visited.append(current)
         if isinstance(current, list):
             stack.extend(reversed(current))
@@ -340,12 +352,17 @@ def _extract_with_esprima(scripts: list[str]) -> tuple[list[DomSink], list[Scrip
     return sinks, variables, sorted(set(objects)), list(dict.fromkeys(notes))
 
 
+_SINK_CAP = 200  # max sinks to extract — prevents huge LLM payloads on minified pages
+
+
 def _extract_sinks(scripts: list[str]) -> list[DomSink]:
     sinks: list[DomSink] = []
     for index, script in enumerate(scripts, start=1):
         location = f"script[{index}]"
         for sink_name, pattern in SINK_PATTERNS.items():
             for match in pattern.finditer(script):
+                if len(sinks) >= _SINK_CAP:
+                    return sinks
                 snippet_start = max(0, match.start() - 40)
                 snippet_end = min(len(script), match.end() + 80)
                 sinks.append(
@@ -604,11 +621,13 @@ def _detect_encoded_param_reflections(
 
 def _run_parser_plugins(html: str, context: ParsedContext, parser_plugins: list[Any]) -> None:
     for plugin in parser_plugins:
+        plugin_name = getattr(plugin, "name", plugin.__class__.__name__)
         try:
             plugin.parse(html, context)
-        except Exception:
+        except Exception as exc:
+            log.debug("Parser plugin %r raised an error: %s", plugin_name, exc)
             continue
-        context.parser_plugins.append(getattr(plugin, "name", plugin.__class__.__name__))
+        context.parser_plugins.append(plugin_name)
 
 
 def read_html_input(value: str) -> tuple[str, str]:

@@ -77,8 +77,13 @@ def _escalation_key(
     waf: str | None,
     surviving_chars: frozenset[str],
     context_type: str,
-    failed_transform_names: list[str],
 ) -> str:
+    """Stable key for cloud-escalation dedup.
+
+    Intentionally excludes which transforms failed — two workers hitting the
+    same endpoint+param+waf+char-profile should share the same cloud result
+    regardless of which Phase 1 transforms each attempted.
+    """
     parsed = urllib.parse.urlparse(url)
     endpoint = f"{parsed.netloc}{parsed.path}"
     fingerprint = {
@@ -87,7 +92,6 @@ def _escalation_key(
         "waf": waf or "none",
         "chars": sorted(surviving_chars),
         "context": context_type,
-        "failed": sorted(failed_transform_names),
     }
     return hashlib.sha256(
         json.dumps(fingerprint, sort_keys=True).encode()
@@ -200,6 +204,14 @@ def _run(
         ))
         return
 
+    # ── Step 2b: Parse target HTML once — reused by local/cloud model helpers ─
+    from ai_xss_generator.parser import parse_target as _parse_target
+    _cached_context: Any = None
+    try:
+        _cached_context = _parse_target(url=url, html_value=None, waf=waf_hint)
+    except Exception as exc:
+        log.debug("Pre-parse of %s failed (will retry per-param): %s", url, exc)
+
     # ── Step 3: Start Playwright executor (shared for all payload attempts) ──
     from ai_xss_generator.active.executor import ActiveExecutor
     executor = ActiveExecutor()
@@ -266,6 +278,7 @@ def _run(
                         probe_result=probe_result,
                         model=model,
                         waf=waf_hint,
+                        base_context=_cached_context,
                     )
 
                     for lp in local_payloads:
@@ -308,7 +321,6 @@ def _run(
                         waf=waf_hint,
                         surviving_chars=surviving_chars,
                         context_type=context_type,
-                        failed_transform_names=failed_transform_names,
                     )
 
                     cloud_payloads = _get_cloud_payloads(
@@ -319,6 +331,7 @@ def _run(
                         ekey=ekey,
                         dedup_registry=dedup_registry,
                         dedup_lock=dedup_lock,
+                        base_context=_cached_context,
                     )
 
                     if cloud_payloads:
@@ -403,15 +416,23 @@ def _get_local_payloads(
     probe_result: Any,
     model: str,
     waf: str | None,
+    base_context: Any = None,
 ) -> list[str]:
-    """Ask the local model for payloads. Returns raw payload strings."""
+    """Ask the local model for payloads. Returns raw payload strings.
+
+    *base_context* is a pre-parsed ParsedContext for *url*. When provided it
+    avoids a redundant HTTP fetch — enrich_context adds the probe-specific
+    reflection data on top without mutating the original.
+    """
     try:
         from ai_xss_generator.probe import enrich_context
-        from ai_xss_generator.parser import parse_target
         from ai_xss_generator.models import generate_payloads
 
-        context = parse_target(url=url, html_value=None, waf=waf)
-        context = enrich_context(context, [probe_result])
+        if base_context is None:
+            from ai_xss_generator.parser import parse_target
+            base_context = parse_target(url=url, html_value=None, waf=waf)
+
+        context = enrich_context(base_context, [probe_result])
         payloads, *_ = generate_payloads(
             context=context,
             model=model,
@@ -432,8 +453,13 @@ def _get_cloud_payloads(
     ekey: str,
     dedup_registry: DictProxy,
     dedup_lock: Any,
+    base_context: Any = None,
 ) -> list[str]:
-    """Check dedup registry; call cloud model if this is a novel fingerprint."""
+    """Check dedup registry; call cloud model if this is a novel fingerprint.
+
+    *base_context* is a pre-parsed ParsedContext for *url*. When provided it
+    avoids a redundant HTTP fetch.
+    """
     with dedup_lock:
         if ekey in dedup_registry:
             log.debug("Dedup hit — reusing cloud result for key %s", ekey[:12])
@@ -441,11 +467,13 @@ def _get_cloud_payloads(
 
     try:
         from ai_xss_generator.probe import enrich_context
-        from ai_xss_generator.parser import parse_target
         from ai_xss_generator.models import generate_cloud_payloads
 
-        context = parse_target(url=url, html_value=None, waf=waf)
-        context = enrich_context(context, [probe_result])
+        if base_context is None:
+            from ai_xss_generator.parser import parse_target
+            base_context = parse_target(url=url, html_value=None, waf=waf)
+
+        context = enrich_context(base_context, [probe_result])
         payloads, _ = generate_cloud_payloads(
             context=context,
             cloud_model=cloud_model,
@@ -463,26 +491,34 @@ def _get_cloud_payloads(
 
 
 def _save_finding_safe(finding: ConfirmedFinding, findings_lock: Any) -> None:
-    """Write to findings store with process-safe lock."""
+    """Write to findings store with process-safe lock.
+
+    Finding construction (including infer_bypass_family) is done *outside* the
+    lock so the critical section only covers the file write.
+    """
+    try:
+        from ai_xss_generator.findings import Finding, save_finding, infer_bypass_family
+        f = Finding(
+            sink_type=f"probe:{finding.context_type}",
+            context_type=finding.context_type,
+            surviving_chars=finding.surviving_chars,
+            bypass_family=infer_bypass_family(finding.payload, []),
+            payload=finding.payload,
+            test_vector=f"?{finding.param_name}={finding.payload}",
+            model=finding.source,
+            explanation=(
+                f"Active scan confirmed via {finding.execution_method}. "
+                f"Transform: {finding.transform_name}. WAF: {finding.waf or 'none'}."
+            ),
+            target_host=urllib.parse.urlparse(finding.url).netloc,
+            tags=[finding.source, finding.execution_method, finding.transform_name],
+            verified=True,
+        )
+    except Exception as exc:
+        log.debug("Failed to build Finding object: %s", exc)
+        return
     try:
         with findings_lock:
-            from ai_xss_generator.findings import Finding, save_finding, infer_bypass_family
-            f = Finding(
-                sink_type=f"probe:{finding.context_type}",
-                context_type=finding.context_type,
-                surviving_chars=finding.surviving_chars,
-                bypass_family=infer_bypass_family(finding.payload, []),
-                payload=finding.payload,
-                test_vector=f"?{finding.param_name}={finding.payload}",
-                model=finding.source,
-                explanation=(
-                    f"Active scan confirmed via {finding.execution_method}. "
-                    f"Transform: {finding.transform_name}. WAF: {finding.waf or 'none'}."
-                ),
-                target_host=urllib.parse.urlparse(finding.url).netloc,
-                tags=[finding.source, finding.execution_method, finding.transform_name],
-                verified=True,
-            )
             save_finding(f)
     except Exception as exc:
         log.debug("Failed to save finding: %s", exc)

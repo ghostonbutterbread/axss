@@ -507,7 +507,8 @@ def _run_active_scan(args: Any, config: Any, resolved_waf: str | None) -> int:
         try:
             urls = read_url_list(args.urls)
         except Exception as exc:
-            return 1 if not print(f"Error reading URL list: {exc}") else 1
+            print(f"Error reading URL list: {exc}")
+            return 1
     else:
         urls = [args.url]
 

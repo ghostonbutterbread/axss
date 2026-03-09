@@ -88,13 +88,13 @@ class ActiveExecutor:
         if self._browser:
             try:
                 self._browser.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                log.debug("Browser close error (possible resource leak): %s", exc)
         if self._pw:
             try:
                 self._pw.stop()
-            except Exception:
-                pass
+            except Exception as exc:
+                log.debug("Playwright stop error (possible resource leak): %s", exc)
         self._started = False
         log.debug("ActiveExecutor: Playwright browser stopped.")
 
