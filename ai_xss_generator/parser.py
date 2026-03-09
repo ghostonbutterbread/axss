@@ -706,11 +706,11 @@ def fetch_targets(
     urls: list[str],
     rate: float = 25.0,
     waf: str | None = None,
-    auth_headers: dict[str, Any] | None = None,
+    auth_headers: dict[str, str] | None = None,
 ) -> tuple[list[dict[str, Any]], list[BatchParseError]]:
     from ai_xss_generator.spiders import crawl_urls
 
-    crawled = crawl_urls(urls, rate=rate, waf=waf, auth_headers=auth_headers or {})
+    crawled = crawl_urls(urls, rate=rate, waf=waf, auth_headers=auth_headers)
     items: list[dict[str, Any]] = []
     errors: list[BatchParseError] = []
 
@@ -733,7 +733,7 @@ def parse_target(
     parser_plugins: list[Any] | None = None,
     rate: float = 25.0,
     waf: str | None = None,
-    auth_headers: dict[str, Any] | None = None,
+    auth_headers: dict[str, str] | None = None,
 ) -> ParsedContext:
     if bool(url) == bool(html_value):
         raise ValueError("Choose exactly one of --url or --input")
@@ -766,7 +766,7 @@ def parse_targets(
     parser_plugins: list[Any] | None = None,
     rate: float = 25.0,
     waf: str | None = None,
-    auth_headers: dict[str, Any] | None = None,
+    auth_headers: dict[str, str] | None = None,
 ) -> tuple[list[ParsedContext], list[BatchParseError]]:
     from ai_xss_generator.auth import describe_auth
 

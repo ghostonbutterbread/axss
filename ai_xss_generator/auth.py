@@ -127,8 +127,9 @@ def describe_auth(auth_headers: dict[str, str]) -> list[str]:
             scheme = value.split()[0] if value.strip() else "unknown"
             notes.append(f"Authorization header present ({scheme} scheme)")
         elif name_lower == "cookie":
-            count = value.count("=")
-            notes.append(f"Session cookies provided ({count} cookie value(s))")
+            # Count semicolons + 1 — accurate even when values contain '=' (e.g. base64)
+            count = value.count(";") + 1 if value.strip() else 0
+            notes.append(f"Session cookies provided ({count} cookie(s))")
         elif name_lower in {"x-api-key", "api-key", "x-auth-token", "x-access-token"}:
             notes.append(f"API key header present ({name})")
         else:
