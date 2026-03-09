@@ -681,10 +681,10 @@ def _build_context(
     return context
 
 
-def fetch_targets(urls: list[str], rate: float = 25.0) -> tuple[list[dict[str, Any]], list[BatchParseError]]:
+def fetch_targets(urls: list[str], rate: float = 25.0, waf: str | None = None) -> tuple[list[dict[str, Any]], list[BatchParseError]]:
     from ai_xss_generator.spiders import crawl_urls
 
-    crawled = crawl_urls(urls, rate=rate)
+    crawled = crawl_urls(urls, rate=rate, waf=waf)
     items: list[dict[str, Any]] = []
     errors: list[BatchParseError] = []
 
@@ -706,13 +706,14 @@ def parse_target(
     html_value: str | None,
     parser_plugins: list[Any] | None = None,
     rate: float = 25.0,
+    waf: str | None = None,
 ) -> ParsedContext:
     if bool(url) == bool(html_value):
         raise ValueError("Choose exactly one of --url or --input")
 
     parser_plugins = parser_plugins or []
     if url:
-        contexts, errors = parse_targets(urls=[url], parser_plugins=parser_plugins, rate=rate)
+        contexts, errors = parse_targets(urls=[url], parser_plugins=parser_plugins, rate=rate, waf=waf)
         if errors:
             raise ValueError(errors[0].error)
         return contexts[0]
@@ -731,9 +732,10 @@ def parse_targets(
     urls: list[str],
     parser_plugins: list[Any] | None = None,
     rate: float = 25.0,
+    waf: str | None = None,
 ) -> tuple[list[ParsedContext], list[BatchParseError]]:
     parser_plugins = parser_plugins or []
-    items, errors = fetch_targets(urls, rate=rate)
+    items, errors = fetch_targets(urls, rate=rate, waf=waf)
     contexts = [
         _build_context(
             html=str(item.get("html", "")),

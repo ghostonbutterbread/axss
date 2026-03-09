@@ -1,6 +1,9 @@
-scrapling
-curl_cffi
-browserforge
-playwright
+scrapling>=0.4.1
+curl_cffi>=0.14.0
+browserforge>=1.2.4
+playwright>=1.56.0
 requests>=2.31.0
 esprima>=4.0.1
+# scrapling uses msgspec in its browser/DynamicSession engine but does not declare
+# it as a package dependency, so we pin it explicitly here.
+msgspec>=0.18.0

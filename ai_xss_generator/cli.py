@@ -564,7 +564,7 @@ def main(argv: list[str] | None = None) -> int:
 
         step(f"Fetching and parsing {len(urls)} URL(s)...")
         try:
-            contexts, errors = parse_targets(urls=urls, parser_plugins=registry.parsers, rate=args.rate)
+            contexts, errors = parse_targets(urls=urls, parser_plugins=registry.parsers, rate=args.rate, waf=resolved_waf)
         except Exception as exc:
             parser.error(str(exc))
 
@@ -661,7 +661,7 @@ def main(argv: list[str] | None = None) -> int:
 
     step(f"Fetching/parsing target: {target}")
     try:
-        context = parse_target(url=args.url, html_value=args.input, parser_plugins=registry.parsers, rate=args.rate)
+        context = parse_target(url=args.url, html_value=args.input, parser_plugins=registry.parsers, rate=args.rate, waf=resolved_waf)
     except Exception as exc:
         parser.error(str(exc))
 
