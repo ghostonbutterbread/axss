@@ -114,6 +114,7 @@ def run_worker(
     dedup_registry: DictProxy,
     dedup_lock: Any,
     findings_lock: Any,
+    auth_headers: dict[str, str] | None = None,
 ) -> None:
     """Target function for multiprocessing.Process.
 
@@ -142,6 +143,7 @@ def run_worker(
             findings_lock=findings_lock,
             start_time=start_time,
             put_result=_put_result,
+            auth_headers=auth_headers,
         )
     except Exception as exc:
         log.exception("Worker crashed for %s", url)
@@ -163,6 +165,7 @@ def _run(
     findings_lock: Any,
     start_time: float,
     put_result: Any,
+    auth_headers: dict[str, str] | None = None,
 ) -> None:
     deadline = start_time + timeout_seconds
 
@@ -180,7 +183,7 @@ def _run(
 
     # ── Step 2: Probe all params for reflection + char survival ──────────────
     from ai_xss_generator.probe import probe_url
-    probe_results = probe_url(url, rate=rate)
+    probe_results = probe_url(url, rate=rate, auth_headers=auth_headers)
 
     injectable = [r for r in probe_results if r.is_injectable]
     reflected  = [r for r in probe_results if r.is_reflected]
@@ -208,13 +211,13 @@ def _run(
     from ai_xss_generator.parser import parse_target as _parse_target
     _cached_context: Any = None
     try:
-        _cached_context = _parse_target(url=url, html_value=None, waf=waf_hint)
+        _cached_context = _parse_target(url=url, html_value=None, waf=waf_hint, auth_headers=auth_headers)
     except Exception as exc:
         log.debug("Pre-parse of %s failed (will retry per-param): %s", url, exc)
 
     # ── Step 3: Start Playwright executor (shared for all payload attempts) ──
     from ai_xss_generator.active.executor import ActiveExecutor
-    executor = ActiveExecutor()
+    executor = ActiveExecutor(auth_headers=auth_headers)
     try:
         executor.start()
     except Exception as exc:
@@ -279,6 +282,7 @@ def _run(
                         model=model,
                         waf=waf_hint,
                         base_context=_cached_context,
+                        auth_headers=auth_headers,
                     )
 
                     for lp in local_payloads:
@@ -332,6 +336,7 @@ def _run(
                         dedup_registry=dedup_registry,
                         dedup_lock=dedup_lock,
                         base_context=_cached_context,
+                        auth_headers=auth_headers,
                     )
 
                     if cloud_payloads:
@@ -417,6 +422,7 @@ def _get_local_payloads(
     model: str,
     waf: str | None,
     base_context: Any = None,
+    auth_headers: dict[str, str] | None = None,
 ) -> list[str]:
     """Ask the local model for payloads. Returns raw payload strings.
 
@@ -430,7 +436,7 @@ def _get_local_payloads(
 
         if base_context is None:
             from ai_xss_generator.parser import parse_target
-            base_context = parse_target(url=url, html_value=None, waf=waf)
+            base_context = parse_target(url=url, html_value=None, waf=waf, auth_headers=auth_headers)
 
         context = enrich_context(base_context, [probe_result])
         payloads, *_ = generate_payloads(
@@ -454,6 +460,7 @@ def _get_cloud_payloads(
     dedup_registry: DictProxy,
     dedup_lock: Any,
     base_context: Any = None,
+    auth_headers: dict[str, str] | None = None,
 ) -> list[str]:
     """Check dedup registry; call cloud model if this is a novel fingerprint.
 
@@ -471,7 +478,7 @@ def _get_cloud_payloads(
 
         if base_context is None:
             from ai_xss_generator.parser import parse_target
-            base_context = parse_target(url=url, html_value=None, waf=waf)
+            base_context = parse_target(url=url, html_value=None, waf=waf, auth_headers=auth_headers)
 
         context = enrich_context(base_context, [probe_result])
         payloads, _ = generate_cloud_payloads(

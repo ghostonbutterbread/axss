@@ -398,9 +398,12 @@ def _probe_param(
     delay: float,
     ua_cycle: Any,
     proxy_cycle: Any | None,
+    auth_headers: dict[str, str] | None = None,
 ) -> ProbeResult:
     """Send two probe requests for one parameter and return a ProbeResult."""
-    req_kwargs: dict[str, Any] = {"headers": {"User-Agent": next(ua_cycle)}}
+    # Auth headers first; User-Agent from rotation always wins
+    merged_headers: dict[str, str] = {**(auth_headers or {}), "User-Agent": next(ua_cycle)}
+    req_kwargs: dict[str, Any] = {"headers": merged_headers}
     if proxy_cycle:
         req_kwargs["proxy"] = next(proxy_cycle)
 
@@ -448,6 +451,7 @@ def probe_url(
     *,
     rate: float = 25.0,
     on_result: Callable[[ProbeResult], None] | None = None,
+    auth_headers: dict[str, str] | None = None,
 ) -> list[ProbeResult]:
     """Probe all query parameters of *url* for XSS reflection contexts.
 
@@ -456,9 +460,11 @@ def probe_url(
     2. Character survival probe → determines which XSS chars survive filters.
 
     Args:
-        url:       Target URL with query parameters to test.
-        rate:      Max requests per second (0 = uncapped). Shared with ``--rate``.
-        on_result: Callback fired after each parameter finishes probing.
+        url:          Target URL with query parameters to test.
+        rate:         Max requests per second (0 = uncapped). Shared with ``--rate``.
+        on_result:    Callback fired after each parameter finishes probing.
+        auth_headers: Extra headers (e.g. Authorization, Cookie) merged into
+                      every probe request for authenticated scanning.
     """
     import urllib.parse
 
@@ -490,6 +496,7 @@ def probe_url(
             result = _probe_param(
                 session, url, param_name, original_value, flat_params,
                 canary=canary, delay=delay, ua_cycle=ua_cycle, proxy_cycle=proxy_cycle,
+                auth_headers=auth_headers,
             )
             results.append(result)
             if on_result:

@@ -200,6 +200,29 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
     )
     parser.add_argument("-V", "--version", action="version", version=f"%(prog)s {__version__}")
 
+    # ── Authentication ────────────────────────────────────────────────────────
+    parser.add_argument(
+        "--header",
+        metavar="'Name: Value'",
+        dest="headers",
+        action="append",
+        default=[],
+        help=(
+            "--header 'Name: Value'  Add a custom request header (repeatable). "
+            "Use for Authorization tokens, API keys, or any session header. "
+            "e.g. --header 'Authorization: Bearer TOKEN' --header 'X-API-Key: secret'"
+        ),
+    )
+    parser.add_argument(
+        "--cookies",
+        metavar="FILE",
+        help=(
+            "--cookies FILE  Load session cookies from a Netscape-format cookies.txt file. "
+            "Combine with browser export tools (e.g. 'Export Cookies' extension) to scan "
+            "authenticated pages. e.g. --cookies cookies.txt"
+        ),
+    )
+
     # ── Active scanner ────────────────────────────────────────────────────────
     parser.add_argument(
         "-a",
@@ -495,7 +518,12 @@ def _handle_public_payloads(
 # Active scan entry point
 # ---------------------------------------------------------------------------
 
-def _run_active_scan(args: Any, config: Any, resolved_waf: str | None) -> int:
+def _run_active_scan(
+    args: Any,
+    config: Any,
+    resolved_waf: str | None,
+    auth_headers: dict[str, str] | None = None,
+) -> int:
     """Route --active scans through the orchestrator."""
     from ai_xss_generator.active.orchestrator import ActiveScanConfig, run_active_scan
     from ai_xss_generator.active.reporter import write_report
@@ -532,6 +560,7 @@ def _run_active_scan(args: Any, config: Any, resolved_waf: str | None) -> int:
         waf=waf,
         timeout_seconds=getattr(args, "timeout", 300),
         output_path=getattr(args, "json_out", None),
+        auth_headers=auth_headers or {},
     )
 
     results = run_active_scan(urls, scan_config)
@@ -593,6 +622,21 @@ def main(argv: list[str] | None = None) -> int:
         rate_label = "uncapped" if args.rate == 0 else f"{args.rate:g} req/sec"
         info(f"Rate limit: {rate_label}")
 
+    # --- Build auth headers from --header / --cookies ---
+    auth_headers: dict[str, str] = {}
+    if args.headers or args.cookies:
+        from ai_xss_generator.auth import build_auth_headers, describe_auth
+        try:
+            auth_headers = build_auth_headers(
+                headers=args.headers or [],
+                cookies_path=args.cookies,
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+        if auth_headers:
+            _auth_desc = describe_auth(auth_headers)
+            info("Auth: " + "; ".join(_auth_desc))
+
     # --- Resolve WAF (auto-detect or manual) ---
     resolved_waf: str | None = args.waf  # may be None; will be filled by auto-detect below
     _waf_manual = args.waf is not None    # True when user explicitly passed --waf
@@ -633,7 +677,7 @@ def main(argv: list[str] | None = None) -> int:
     if getattr(args, "active", False):
         if not (args.url or args.urls):
             parser.error("--active requires -u/--url or --urls")
-        return _run_active_scan(args, config, resolved_waf)
+        return _run_active_scan(args, config, resolved_waf, auth_headers=auth_headers)
 
     # --- Batch URLs mode ---
     if args.urls:
@@ -663,7 +707,7 @@ def main(argv: list[str] | None = None) -> int:
 
         step(f"Fetching and parsing {len(urls)} URL(s)...")
         try:
-            contexts, errors = parse_targets(urls=urls, parser_plugins=registry.parsers, rate=args.rate, waf=resolved_waf)
+            contexts, errors = parse_targets(urls=urls, parser_plugins=registry.parsers, rate=args.rate, waf=resolved_waf, auth_headers=auth_headers or None)
         except Exception as exc:
             parser.error(str(exc))
 
@@ -760,7 +804,7 @@ def main(argv: list[str] | None = None) -> int:
 
     step(f"Fetching/parsing target: {target}")
     try:
-        context = parse_target(url=args.url, html_value=args.input, parser_plugins=registry.parsers, rate=args.rate, waf=resolved_waf)
+        context = parse_target(url=args.url, html_value=args.input, parser_plugins=registry.parsers, rate=args.rate, waf=resolved_waf, auth_headers=auth_headers or None)
     except Exception as exc:
         parser.error(str(exc))
 
@@ -778,7 +822,7 @@ def main(argv: list[str] | None = None) -> int:
 
         from ai_xss_generator.probe import enrich_context, probe_url
 
-        probe_results = probe_url(args.url, rate=args.rate, on_result=live_cb)
+        probe_results = probe_url(args.url, rate=args.rate, on_result=live_cb, auth_headers=auth_headers or None)
         injectable = sum(1 for r in probe_results if r.is_injectable)
         reflected = sum(1 for r in probe_results if r.is_reflected)
 

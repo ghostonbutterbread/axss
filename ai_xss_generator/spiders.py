@@ -37,7 +37,11 @@ def _is_blocking_curl_error(exc: Exception) -> bool:
     return f"({_CURL_HTTP2_STREAM_ERROR})" in msg or f"({_CURL_TIMEOUT_ERROR})" in msg
 
 
-def _fetch_with_playwright(url: str, proxy: str | None = None) -> dict[str, Any]:
+def _fetch_with_playwright(
+    url: str,
+    proxy: str | None = None,
+    auth_headers: dict[str, str] | None = None,
+) -> dict[str, Any]:
     """Fetch a single URL using a real Playwright browser (slow but WAF-resistant)."""
     from scrapling.fetchers import DynamicSession
 
@@ -48,6 +52,8 @@ def _fetch_with_playwright(url: str, proxy: str | None = None) -> dict[str, Any]
     }
     if proxy:
         kwargs["proxy"] = proxy
+    if auth_headers:
+        kwargs["extra_headers"] = auth_headers
 
     with DynamicSession(headless=True, timeout=45_000) as session:
         response = session.fetch(url, **kwargs)
@@ -55,14 +61,21 @@ def _fetch_with_playwright(url: str, proxy: str | None = None) -> dict[str, Any]
     return response
 
 
-def crawl_urls(urls: Iterable[str], rate: float = 25.0, waf: str | None = None) -> dict[str, dict[str, Any]]:
+def crawl_urls(
+    urls: Iterable[str],
+    rate: float = 25.0,
+    waf: str | None = None,
+    auth_headers: dict[str, str] | None = None,
+) -> dict[str, dict[str, Any]]:
     """Fetch a list of URLs and return parsed results keyed by URL.
 
     Parameters
     ----------
-    urls:  URLs to fetch.
-    rate:  Max requests per second. 0 disables throttling entirely.
-    waf:   Detected/known WAF name. Used to decide fetch strategy.
+    urls:         URLs to fetch.
+    rate:         Max requests per second. 0 disables throttling entirely.
+    waf:          Detected/known WAF name. Used to decide fetch strategy.
+    auth_headers: Extra headers (e.g. Authorization, Cookie) merged into every
+                  request so authenticated pages are fetched correctly.
     """
     url_list = [u.strip() for u in urls if u and u.strip()]
     results: dict[str, dict[str, Any]] = {}
@@ -91,7 +104,9 @@ def crawl_urls(urls: Iterable[str], rate: float = 25.0, waf: str | None = None) 
                 time.sleep(delay)
 
             proxy = next(proxy_cycle) if proxy_cycle else None
-            fetch_kwargs: dict[str, Any] = {"headers": {"User-Agent": next(ua_cycle)}}
+            # Auth headers first; User-Agent from rotation always wins
+            merged_headers: dict[str, str] = {**(auth_headers or {}), "User-Agent": next(ua_cycle)}
+            fetch_kwargs: dict[str, Any] = {"headers": merged_headers}
             if proxy:
                 fetch_kwargs["proxy"] = proxy
 
@@ -120,7 +135,7 @@ def crawl_urls(urls: Iterable[str], rate: float = 25.0, waf: str | None = None) 
                 # --- Slow path: Playwright real browser ---
                 log.info("Falling back to browser fetch for %s (WAF=%s)", url, waf or "unknown")
                 try:
-                    response = _fetch_with_playwright(url, proxy=proxy)
+                    response = _fetch_with_playwright(url, proxy=proxy, auth_headers=auth_headers or {})
                     results[url] = _build_result(url, response, note="Fetched with Playwright (WAF bypass).")
                     continue
                 except Exception as exc:

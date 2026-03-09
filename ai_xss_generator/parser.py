@@ -659,6 +659,7 @@ def _build_context(
     source_type: str,
     parser_plugins: list[Any],
     markup: MarkupExtraction | None = None,
+    auth_notes: list[str] | None = None,
 ) -> ParsedContext:
     markup = markup or _extract_html_context(html)
     frameworks = _extract_frameworks(html, markup.inline_scripts)
@@ -695,15 +696,21 @@ def _build_context(
         objects=objects,
         inline_scripts=markup.inline_scripts,
         notes=notes,
+        auth_notes=auth_notes or [],
     )
     _run_parser_plugins(html, context, parser_plugins)
     return context
 
 
-def fetch_targets(urls: list[str], rate: float = 25.0, waf: str | None = None) -> tuple[list[dict[str, Any]], list[BatchParseError]]:
+def fetch_targets(
+    urls: list[str],
+    rate: float = 25.0,
+    waf: str | None = None,
+    auth_headers: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], list[BatchParseError]]:
     from ai_xss_generator.spiders import crawl_urls
 
-    crawled = crawl_urls(urls, rate=rate, waf=waf)
+    crawled = crawl_urls(urls, rate=rate, waf=waf, auth_headers=auth_headers or {})
     items: list[dict[str, Any]] = []
     errors: list[BatchParseError] = []
 
@@ -726,13 +733,20 @@ def parse_target(
     parser_plugins: list[Any] | None = None,
     rate: float = 25.0,
     waf: str | None = None,
+    auth_headers: dict[str, Any] | None = None,
 ) -> ParsedContext:
     if bool(url) == bool(html_value):
         raise ValueError("Choose exactly one of --url or --input")
 
     parser_plugins = parser_plugins or []
     if url:
-        contexts, errors = parse_targets(urls=[url], parser_plugins=parser_plugins, rate=rate, waf=waf)
+        contexts, errors = parse_targets(
+            urls=[url],
+            parser_plugins=parser_plugins,
+            rate=rate,
+            waf=waf,
+            auth_headers=auth_headers,
+        )
         if errors:
             raise ValueError(errors[0].error)
         return contexts[0]
@@ -752,9 +766,13 @@ def parse_targets(
     parser_plugins: list[Any] | None = None,
     rate: float = 25.0,
     waf: str | None = None,
+    auth_headers: dict[str, Any] | None = None,
 ) -> tuple[list[ParsedContext], list[BatchParseError]]:
+    from ai_xss_generator.auth import describe_auth
+
     parser_plugins = parser_plugins or []
-    items, errors = fetch_targets(urls, rate=rate, waf=waf)
+    _auth_notes = describe_auth(auth_headers) if auth_headers else []
+    items, errors = fetch_targets(urls, rate=rate, waf=waf, auth_headers=auth_headers)
     contexts = [
         _build_context(
             html=str(item.get("html", "")),
@@ -769,6 +787,7 @@ def parse_targets(
                 inline_scripts=item.get("inline_scripts", []),
                 notes=item.get("notes", []),
             ),
+            auth_notes=_auth_notes,
         )
         for item in items
     ]

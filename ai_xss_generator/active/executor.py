@@ -65,10 +65,11 @@ class ActiveExecutor:
             executor.stop()
     """
 
-    def __init__(self) -> None:
+    def __init__(self, auth_headers: dict[str, str] | None = None) -> None:
         self._pw = None
         self._browser = None
         self._started = False
+        self._auth_headers: dict[str, str] = auth_headers or {}
 
     def start(self) -> None:
         from playwright.sync_api import sync_playwright
@@ -131,10 +132,12 @@ class ActiveExecutor:
         method = ""
         detail = ""
 
+        # Merge auth headers; Accept is always set; auth headers must not override it
+        extra_headers = {**self._auth_headers, "Accept": "text/html,application/xhtml+xml"}
         context = self._browser.new_context(
             ignore_https_errors=True,
             # Block fonts/images/media for speed — we only care about JS execution
-            extra_http_headers={"Accept": "text/html,application/xhtml+xml"},
+            extra_http_headers=extra_headers,
         )
         try:
             page = context.new_page()

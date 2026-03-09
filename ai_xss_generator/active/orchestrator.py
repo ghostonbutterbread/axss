@@ -22,7 +22,7 @@ import math
 import multiprocessing
 import time
 import urllib.parse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Sequence
 
 from ai_xss_generator.active.worker import WorkerResult, run_worker
@@ -41,6 +41,7 @@ class ActiveScanConfig:
     waf: str | None = None
     timeout_seconds: int = 300     # 5 minutes per URL
     output_path: str | None = None  # markdown report output; None = auto
+    auth_headers: dict[str, str] = field(default_factory=dict)
 
 
 def _auto_workers(rate: float, explicit_workers: int) -> int:
@@ -142,6 +143,7 @@ def run_active_scan(
                         "dedup_registry": dedup_registry,
                         "dedup_lock": dedup_lock,
                         "findings_lock": findings_lock,
+                        "auth_headers": config.auth_headers,
                     },
                     daemon=True,
                 )

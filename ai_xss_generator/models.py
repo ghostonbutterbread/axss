@@ -124,6 +124,17 @@ def _prompt_for_context(
     if past_findings:
         findings_section = findings_prompt_section(past_findings) + "\n"
 
+    # ── Section 2b: Auth context ──────────────────────────────────────────────
+    auth_section = ""
+    if context.auth_notes:
+        auth_section = (
+            "SESSION CONTEXT (authenticated scan — all requests carry credentials):\n"
+            + "\n".join(f"  - {note}" for note in context.auth_notes)
+            + "\n"
+            "Consider payloads that leverage privileged state: authenticated endpoints, "
+            "stored/persistent XSS in user-controlled fields, CSRF-chained vectors.\n"
+        )
+
     # ── Section 3: WAF ───────────────────────────────────────────────────────
     waf_section = ""
     if waf:
@@ -181,7 +192,7 @@ Requirements:
 - Include payloads from multiple bypass families that are plausible for this context.
 - Prefer compact, self-contained payloads with no external dependencies.
 
-{probe_section}{findings_section}{waf_section}{reference_section}Full parsed context:
+{probe_section}{findings_section}{auth_section}{waf_section}{reference_section}Full parsed context:
 {context_blob}""".strip()
 
 

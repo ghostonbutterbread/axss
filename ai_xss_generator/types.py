@@ -50,6 +50,9 @@ class ParsedContext:
     inline_scripts: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     parser_plugins: list[str] = field(default_factory=list)
+    auth_notes: list[str] = field(default_factory=list)
+    """Redacted notes about active authentication (e.g. 'Authorization header present').
+    Never contains credential values — informational for the LLM prompt only."""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
