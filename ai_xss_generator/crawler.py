@@ -286,25 +286,28 @@ def crawl(
                 log.debug("Crawl: fetch failed for %s — skipping link extraction", url)
                 continue
 
+            html = str(result.get("html", ""))
+            final_url = url
+            for note in result.get("notes", []):
+                if note.startswith("Final URL:"):
+                    extracted = note.split("Final URL:", 1)[1].strip()
+                    if extracted:
+                        final_url = extracted
+                    break
+
+            raw_links, raw_post_forms = _extract_links(html, final_url)
+
+            # Follow links to the next BFS level only if depth limit not reached.
+            # POST form extraction always happens regardless of depth so forms on
+            # pages at the maximum depth are still discovered.
             if current_depth < depth:
-                html = str(result.get("html", ""))
-                final_url = url
-                for note in result.get("notes", []):
-                    if note.startswith("Final URL:"):
-                        extracted = note.split("Final URL:", 1)[1].strip()
-                        if extracted:
-                            final_url = extracted
-                        break
-
-                raw_links, raw_post_forms = _extract_links(html, final_url)
-
                 for href in raw_links:
                     resolved = _resolve(href, final_url)
                     if resolved and _same_origin(resolved, origin):
                         next_level.append(resolved)
 
-                # Convert raw POST form dicts to PostFormTarget objects
-                for raw_form in raw_post_forms:
+            # Convert raw POST form dicts to PostFormTarget objects (all depths)
+            for raw_form in raw_post_forms:
                     action = raw_form["action"]
                     fields: list[tuple[str, str, str]] = raw_form["fields"]
 

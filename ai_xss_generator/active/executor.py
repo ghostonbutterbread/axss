@@ -252,6 +252,11 @@ class ActiveExecutor:
         confirmed = False
         method = ""
         detail = ""
+        # Guard: only count execution events that happen AFTER the payload is
+        # submitted.  Without this, console.log() calls on the form page itself
+        # (e.g. analytics scripts) would fire _on_console and give a false positive
+        # before we have even injected anything.
+        payload_submitted = False
 
         extra_headers = {**self._auth_headers, "Accept": "text/html,application/xhtml+xml"}
         context = self._browser.new_context(
@@ -270,9 +275,10 @@ class ActiveExecutor:
 
             def _on_dialog(dialog):
                 nonlocal confirmed, method, detail
-                confirmed = True
-                method = "dialog"
-                detail = f"alert() dialog triggered — message: {dialog.message!r}"
+                if payload_submitted:
+                    confirmed = True
+                    method = "dialog"
+                    detail = f"alert() dialog triggered — message: {dialog.message!r}"
                 try:
                     dialog.dismiss()
                 except Exception:
@@ -282,7 +288,7 @@ class ActiveExecutor:
 
             def _on_console(msg):
                 nonlocal confirmed, method, detail
-                if not confirmed:
+                if payload_submitted and not confirmed:
                     confirmed = True
                     method = "console"
                     detail = f"console.{msg.type}() fired — text: {msg.text!r}"
@@ -291,7 +297,7 @@ class ActiveExecutor:
 
             def _on_request(req):
                 nonlocal confirmed, method, detail
-                if not confirmed and _BEACON_HOST in req.url:
+                if payload_submitted and not confirmed and _BEACON_HOST in req.url:
                     confirmed = True
                     method = "network"
                     detail = f"OOB network request detected: {req.url!r}"
@@ -304,37 +310,38 @@ class ActiveExecutor:
             except Exception as nav_exc:
                 log.debug("fire_post: source page load error for %s: %s", source_page_url, nav_exc)
 
-            if not confirmed:
-                # Step 2: Fill the target param with the payload
-                try:
-                    page.fill(f'[name="{param_name}"]', payload, timeout=3000)
-                except Exception as fill_exc:
-                    log.debug("fire_post: fill failed for %s: %s", param_name, fill_exc)
-                    return ExecutionResult(
-                        confirmed=False,
-                        method="",
-                        detail="",
-                        transform_name=transform_name,
-                        payload=payload,
-                        param_name=param_name,
-                        fired_url=source_page_url,
-                        error=f"fill failed: {fill_exc}",
-                    )
+            # Step 2: Fill the target param with the payload
+            try:
+                page.fill(f'[name="{param_name}"]', payload, timeout=3000)
+            except Exception as fill_exc:
+                log.debug("fire_post: fill failed for %s: %s", param_name, fill_exc)
+                return ExecutionResult(
+                    confirmed=False,
+                    method="",
+                    detail="",
+                    transform_name=transform_name,
+                    payload=payload,
+                    param_name=param_name,
+                    fired_url=source_page_url,
+                    error=f"fill failed: {fill_exc}",
+                )
 
-                # Step 3: Submit the form — try submit button first, fall back to JS submit
+            # Step 3: Submit the form — try submit button first, fall back to JS submit
+            # Mark payload_submitted=True before submit so post-submit events are captured.
+            payload_submitted = True
+            try:
+                submit_btn = page.locator('[type="submit"]').first
+                if submit_btn.count() > 0:
+                    submit_btn.click(timeout=3000)
+                else:
+                    page.evaluate("document.forms[0] && document.forms[0].submit()")
+                # Wait briefly for post-submit navigation / JS execution
                 try:
-                    submit_btn = page.locator('[type="submit"]').first
-                    if submit_btn.count() > 0:
-                        submit_btn.click(timeout=3000)
-                    else:
-                        page.evaluate("document.forms[0] && document.forms[0].submit()")
-                    # Wait briefly for post-submit navigation / JS execution
-                    try:
-                        page.wait_for_load_state("domcontentloaded", timeout=_NAV_TIMEOUT_MS)
-                    except Exception:
-                        pass
-                except Exception as submit_exc:
-                    log.debug("fire_post: submit error: %s", submit_exc)
+                    page.wait_for_load_state("domcontentloaded", timeout=_NAV_TIMEOUT_MS)
+                except Exception:
+                    pass
+            except Exception as submit_exc:
+                log.debug("fire_post: submit error: %s", submit_exc)
 
         except Exception as exc:
             return ExecutionResult(

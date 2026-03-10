@@ -117,7 +117,7 @@ def run_active_scan(
         sp = spin_char(tick)
         return (
             f"\033[2m[~] {sp} Scanning | "
-            f"{completed}/{total_count} URLs done | "
+            f"{completed}/{total_count} targets done | "
             f"{len(active_procs)} active | "
             f"{fmt_duration(elapsed)} elapsed | "
             f"{eta_str}\033[0m"

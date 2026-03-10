@@ -695,15 +695,6 @@ def probe_url(
 # POST form probing
 # ---------------------------------------------------------------------------
 
-# Hidden input names that indicate CSRF tokens — we preserve their values
-# rather than injecting canaries into them.
-_CSRF_FIELD_NAMES_PROBE: frozenset[str] = frozenset({
-    "csrf", "_csrf", "csrftoken", "csrf_token", "csrf-token",
-    "__requestverificationtoken", "authenticity_token", "_token",
-    "xsrf", "xsrf_token", "x_csrf_token", "__vt", "nonce",
-})
-
-
 def _extract_field_value(html: str, field_name: str) -> str | None:
     """Extract the current value of a named input field from an HTML page.
 
@@ -763,8 +754,6 @@ def probe_post_form(
         on_result:       Optional callback fired after each param is probed.
         auth_headers:    Extra headers (e.g. Authorization, Cookie).
     """
-    import urllib.parse
-
     delay = (1.0 / rate) if rate > 0 else 0
     canary = _make_canary()
 
@@ -861,8 +850,6 @@ def probe_post_form(
                 current_csrf = csrf_value
                 if csrf_field:
                     try:
-                        if delay > 0:
-                            time.sleep(delay)
                         src2 = _session_get(session, source_page_url, req_kwargs)
                         fresh = _extract_field_value(_resp_html(src2), csrf_field)
                         if fresh is not None:
