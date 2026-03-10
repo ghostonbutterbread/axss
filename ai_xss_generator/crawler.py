@@ -18,12 +18,43 @@ from __future__ import annotations
 import logging
 import urllib.parse
 from collections import deque
+from dataclasses import dataclass
 from html.parser import HTMLParser
 from typing import Callable
 
 from ai_xss_generator.probe import _TRACKING_PARAM_BLOCKLIST
+from ai_xss_generator.types import PostFormTarget
 
 log = logging.getLogger(__name__)
+
+# Hidden input names that are almost certainly CSRF tokens — not injectable.
+_CSRF_FIELD_NAMES: frozenset[str] = frozenset({
+    "csrf", "_csrf", "csrftoken", "csrf_token", "csrf-token",
+    "__requestverificationtoken", "authenticity_token", "_token",
+    "xsrf", "xsrf_token", "x_csrf_token", "__vt", "nonce",
+})
+
+
+def _is_csrf_field(name: str, input_type: str) -> bool:
+    """Return True if this field is likely a CSRF token (hidden + name pattern)."""
+    if input_type != "hidden":
+        return False
+    lower = name.lower()
+    return (
+        lower in _CSRF_FIELD_NAMES
+        or "csrf" in lower
+        or "xsrf" in lower
+        or "token" in lower
+        or "nonce" in lower
+    )
+
+
+@dataclass
+class CrawlResult:
+    """Return type of crawl() — GET testable URLs and discovered POST form targets."""
+    get_urls: list[str]
+    post_forms: list[PostFormTarget]
+
 
 MAX_PAGES = 300  # hard cap on pages visited per crawl session
 
@@ -33,20 +64,17 @@ MAX_PAGES = 300  # hard cap on pages visited per crawl session
 # ---------------------------------------------------------------------------
 
 class _LinkExtractor(HTMLParser):
-    """HTMLParser that collects hrefs and synthesizes GET form submission URLs.
+    """HTMLParser that collects hrefs, synthesizes GET form submission URLs,
+    and records raw POST form data for later conversion to PostFormTarget.
 
-    For GET forms, it tracks every named input/textarea/select field and
-    constructs a synthetic URL on form close: ``action?field1=test&field2=test``.
-    This is what the browser would actually send on submission, which is the
-    real XSS attack surface — the bare action URL (no params) would be filtered
-    out by the crawler's testable-params check and never scanned.
+    GET forms: uses actual ``value`` attribute for hidden inputs (preserves
+    real CSRF token values so synthesized URLs survive server-side validation),
+    and ``"test"`` for user-editable fields.
 
-    Hidden inputs are included (they appear in submitted URLs and can be
-    injectable). Submit/button/image/reset/file inputs are excluded (they don't
-    produce injectable query params).
+    POST forms: records all field triples (name, type, value) and the action
+    URL so the caller can construct PostFormTarget objects with absolute URLs.
     """
 
-    # Input types that never produce injectable query params
     _SKIP_TYPES: frozenset[str] = frozenset(
         {"submit", "button", "image", "reset", "file"}
     )
@@ -54,8 +82,8 @@ class _LinkExtractor(HTMLParser):
     def __init__(self) -> None:
         super().__init__()
         self.links: list[str] = []
-        # Tracks the active GET form: None when no form is open or form is POST
-        self._form: dict[str, object] | None = None
+        self.post_form_raws: list[dict] = []
+        self._form: dict | None = None
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attr = {k.lower(): (v or "") for k, v in attrs}
@@ -67,55 +95,62 @@ class _LinkExtractor(HTMLParser):
 
         elif tag == "form":
             method = attr.get("method", "get").strip().upper()
-            if method in ("", "GET"):
-                self._form = {
-                    "action": attr.get("action", "").strip(),
-                    "fields": [],   # list[str] — ordered, deduplicated param names
-                }
-            else:
-                # POST/PUT/DELETE etc — not injectable via URL params
-                self._form = None
+            self._form = {
+                "action": attr.get("action", "").strip(),
+                "method": method if method else "GET",
+                "fields": [],  # list of (name, input_type, value)
+            }
 
         elif tag in ("input", "textarea", "select") and self._form is not None:
             name = attr.get("name", "").strip()
             input_type = attr.get("type", "text").strip().lower()
-            fields: list[str] = self._form["fields"]  # type: ignore[assignment]
-            if name and input_type not in self._SKIP_TYPES and name not in fields:
-                fields.append(name)
+            value = attr.get("value", "").strip()
+            existing_names = [f[0] for f in self._form["fields"]]
+            if name and input_type not in self._SKIP_TYPES and name not in existing_names:
+                self._form["fields"].append((name, input_type, value))
 
     def handle_endtag(self, tag: str) -> None:
         if tag != "form" or self._form is None:
             return
 
-        action: str = self._form["action"]  # type: ignore[assignment]
-        fields: list[str] = self._form["fields"]  # type: ignore[assignment]
+        form = self._form
         self._form = None
+        method: str = form["method"]
+        action: str = form["action"]
+        fields: list[tuple[str, str, str]] = form["fields"]
 
-        if fields:
-            # Build a realistic submission URL with placeholder values.
-            # The probe will replace these with canaries; we just need the
-            # param names present so the URL passes the testable-params filter.
-            qs = urllib.parse.urlencode({f: "test" for f in fields})
-            # action="" means "submit to the current page" — use "?" as a
-            # relative reference so _resolve() maps it to the correct URL.
-            self.links.append(f"{action}?{qs}" if action else f"?{qs}")
-        elif action:
-            # Form with no named inputs — add as a plain link for crawl traversal
-            self.links.append(action)
+        if method == "GET":
+            if fields:
+                # Use actual value for hidden inputs (preserves CSRF tokens),
+                # "test" placeholder for all other field types.
+                params = {
+                    name: (value if ftype == "hidden" else "test")
+                    for name, ftype, value in fields
+                }
+                qs = urllib.parse.urlencode(params)
+                self.links.append(f"{action}?{qs}" if action else f"?{qs}")
+            elif action:
+                self.links.append(action)
+        else:
+            # POST/PUT/DELETE — record for PostFormTarget construction
+            if fields:
+                self.post_form_raws.append({
+                    "action": action,
+                    "fields": fields,
+                })
 
 
-def _extract_links(html: str, base_url: str) -> list[str]:
-    """Return raw hrefs and synthetic form-submission URLs extracted from *html*.
+def _extract_links(html: str, base_url: str) -> tuple[list[str], list[dict]]:
+    """Return (hrefs/synthetic-GET-URLs, raw-POST-form-dicts) extracted from *html*.
 
-    Does not resolve or filter — callers are responsible for running results
-    through ``_resolve()`` and ``_same_origin()``.
+    Does not resolve or filter — callers handle _resolve() and _same_origin().
     """
     extractor = _LinkExtractor()
     try:
         extractor.feed(html)
     except Exception:
         pass
-    return extractor.links
+    return extractor.links, extractor.post_form_raws
 
 
 # ---------------------------------------------------------------------------
@@ -187,8 +222,10 @@ def crawl(
     waf: str | None = None,
     auth_headers: dict[str, str] | None = None,
     on_progress: Callable[[int, int, int], None] | None = None,
-) -> list[str]:
-    """BFS-crawl from *start_url* and return discovered URLs with testable params.
+) -> CrawlResult:
+    """BFS-crawl from *start_url* and return a CrawlResult with:
+      - get_urls:   deduplicated URLs that have at least one non-tracking GET param.
+      - post_forms: PostFormTarget objects for POST forms discovered during crawl.
 
     Args:
         start_url:   Seed URL. The origin (scheme://netloc) is the crawl boundary.
@@ -198,26 +235,22 @@ def crawl(
         auth_headers: Extra headers for authenticated crawling.
         on_progress: Optional callback(visited, targets_found, current_depth) for
                      live progress updates.
-
-    Returns:
-        Deduplicated list of URLs that have at least one non-tracking query
-        parameter. Ordered by discovery order (BFS).
     """
     from ai_xss_generator.spiders import crawl_urls
 
     origin = _origin(start_url)
-    visited_pages: set[str] = set()       # page-level dedup (path, no params)
-    seen_targets: dict[str, str] = {}     # dedup_key -> canonical URL
-    ordered_targets: list[str] = []       # insertion-order for stable output
+    visited_pages: set[str] = set()
+    seen_targets: dict[str, str] = {}
+    ordered_targets: list[str] = []
+    seen_post_keys: set[str] = set()   # dedup POST forms by action+param signature
+    post_forms: list[PostFormTarget] = []
 
-    # BFS queue: list of (url, depth) pairs for the current and next levels
     current_level: list[str] = [start_url]
 
     for current_depth in range(depth + 1):
         if not current_level:
             break
 
-        # Deduplicate within this level before fetching
         to_fetch: list[str] = []
         for url in current_level:
             pk = _page_key(url)
@@ -233,7 +266,6 @@ def crawl(
             current_depth, len(to_fetch), len(visited_pages), len(seen_targets),
         )
 
-        # Batch-fetch this level using the WAF-aware spider
         crawled = crawl_urls(to_fetch, rate=rate, waf=waf, auth_headers=auth_headers)
 
         next_level: list[str] = []
@@ -241,7 +273,6 @@ def crawl(
         for url in to_fetch:
             result = crawled.get(url)
 
-            # Collect this URL as a scan target if it has testable params
             if _testable_params(url):
                 key = _dedup_key(url)
                 if key not in seen_targets:
@@ -255,10 +286,8 @@ def crawl(
                 log.debug("Crawl: fetch failed for %s — skipping link extraction", url)
                 continue
 
-            # Only extract links if we haven't hit the depth limit yet
             if current_depth < depth:
                 html = str(result.get("html", ""))
-                # Use the final URL (after redirects) as the base for resolving links
                 final_url = url
                 for note in result.get("notes", []):
                     if note.startswith("Final URL:"):
@@ -267,16 +296,61 @@ def crawl(
                             final_url = extracted
                         break
 
-                raw_links = _extract_links(html, final_url)
+                raw_links, raw_post_forms = _extract_links(html, final_url)
+
                 for href in raw_links:
                     resolved = _resolve(href, final_url)
                     if resolved and _same_origin(resolved, origin):
                         next_level.append(resolved)
 
+                # Convert raw POST form dicts to PostFormTarget objects
+                for raw_form in raw_post_forms:
+                    action = raw_form["action"]
+                    fields: list[tuple[str, str, str]] = raw_form["fields"]
+
+                    # Resolve the action URL to absolute
+                    abs_action = _resolve(action, final_url) if action else final_url
+                    if not abs_action:
+                        continue
+
+                    # Detect CSRF field and build defaults dict
+                    csrf_field: str | None = None
+                    hidden_defaults: dict[str, str] = {}
+                    param_names: list[str] = []
+
+                    for name, ftype, value in fields:
+                        if ftype == "hidden":
+                            hidden_defaults[name] = value
+                        if csrf_field is None and _is_csrf_field(name, ftype):
+                            csrf_field = name
+                        else:
+                            param_names.append(name)
+
+                    if not param_names:
+                        continue
+
+                    # Dedup by action URL + sorted param names
+                    post_key = f"{abs_action}[{','.join(sorted(param_names))}]"
+                    if post_key in seen_post_keys:
+                        continue
+                    seen_post_keys.add(post_key)
+
+                    post_forms.append(PostFormTarget(
+                        action_url=abs_action,
+                        source_page_url=final_url,
+                        param_names=param_names,
+                        csrf_field=csrf_field,
+                        hidden_defaults=hidden_defaults,
+                    ))
+                    log.debug(
+                        "POST form found: action=%s params=%s csrf=%s",
+                        abs_action, param_names, csrf_field,
+                    )
+
         current_level = next_level
 
     log.info(
-        "Crawl complete: %d page(s) visited | %d target(s) with testable params",
-        len(visited_pages), len(ordered_targets),
+        "Crawl complete: %d page(s) visited | %d GET target(s) | %d POST form(s)",
+        len(visited_pages), len(ordered_targets), len(post_forms),
     )
-    return ordered_targets
+    return CrawlResult(get_urls=ordered_targets, post_forms=post_forms)

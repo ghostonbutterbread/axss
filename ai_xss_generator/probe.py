@@ -691,6 +691,223 @@ def probe_url(
     return results
 
 
+# ---------------------------------------------------------------------------
+# POST form probing
+# ---------------------------------------------------------------------------
+
+# Hidden input names that indicate CSRF tokens — we preserve their values
+# rather than injecting canaries into them.
+_CSRF_FIELD_NAMES_PROBE: frozenset[str] = frozenset({
+    "csrf", "_csrf", "csrftoken", "csrf_token", "csrf-token",
+    "__requestverificationtoken", "authenticity_token", "_token",
+    "xsrf", "xsrf_token", "x_csrf_token", "__vt", "nonce",
+})
+
+
+def _extract_field_value(html: str, field_name: str) -> str | None:
+    """Extract the current value of a named input field from an HTML page.
+
+    Handles both attribute orderings:
+      <input name="X" value="TOKEN"> and <input value="TOKEN" name="X">
+    """
+    esc = re.escape(field_name)
+    # name before value
+    m = re.search(
+        rf'''name\s*=\s*["']{esc}["'][^>]*?value\s*=\s*["']([^"']*)["']''',
+        html, re.IGNORECASE,
+    )
+    if m:
+        return m.group(1)
+    # value before name
+    m = re.search(
+        rf'''value\s*=\s*["']([^"']*)["'][^>]*?name\s*=\s*["']{esc}["']''',
+        html, re.IGNORECASE,
+    )
+    if m:
+        return m.group(1)
+    return None
+
+
+def probe_post_form(
+    action_url: str,
+    source_page_url: str,
+    param_names: list[str],
+    csrf_field: str | None,
+    hidden_defaults: dict[str, str],
+    *,
+    rate: float = 25.0,
+    waf: str | None = None,
+    on_result: Callable[[ProbeResult], None] | None = None,
+    auth_headers: dict[str, str] | None = None,
+) -> list[ProbeResult]:
+    """Probe POST form parameters for XSS reflection.
+
+    For each parameter in *param_names*:
+      1. GETs *source_page_url* to fetch a fresh CSRF token value.
+      2. POSTs *action_url* with the canary in the target param + real CSRF token.
+      3. Classifies any reflections in the response.
+      4. POSTs a second time with the char probe to measure surviving chars.
+
+    When *waf* requires a real browser (akamai, cloudflare, etc.), the function
+    falls back to using requests for the POST since DynamicSession is GET-only.
+    Playwright-based POST probing happens later in the active scan executor.
+
+    Args:
+        action_url:      Absolute URL to POST the form to.
+        source_page_url: Page that renders the form (GET to obtain fresh CSRF token).
+        param_names:     Injectable parameter names (CSRF field already excluded).
+        csrf_field:      Name of the CSRF token field, or None.
+        hidden_defaults: Fallback hidden field values from crawl time.
+        rate:            Max requests per second.
+        waf:             Detected WAF name.
+        on_result:       Optional callback fired after each param is probed.
+        auth_headers:    Extra headers (e.g. Authorization, Cookie).
+    """
+    import urllib.parse
+
+    delay = (1.0 / rate) if rate > 0 else 0
+    canary = _make_canary()
+
+    ua_list = _load_rotation_values(os.environ.get("AXSS_USER_AGENTS")) or [
+        "axss/0.1 (+authorized security testing; scrapling)"
+    ]
+    ua_cycle = cycle(ua_list)
+
+    results: list[ProbeResult] = []
+
+    # We always use FetcherSession for the source-page GET and the POST itself.
+    # WAF-requiring sites that need a browser for the POST will be handled by
+    # the Playwright-based fire_post() in the active scan executor.
+    with FetcherSession(
+        impersonate="chrome",
+        stealthy_headers=True,
+        timeout=20,
+        follow_redirects=True,
+        retries=1,
+    ) as session:
+        for param_name in param_names:
+            merged_headers: dict[str, str] = {
+                **(auth_headers or {}),
+                "User-Agent": next(ua_cycle),
+            }
+            req_kwargs: dict[str, Any] = {"headers": merged_headers}
+
+            # --- Step 1: GET source page to extract fresh CSRF token ---
+            csrf_value: str | None = None
+            if csrf_field:
+                if delay > 0:
+                    time.sleep(delay)
+                try:
+                    source_resp = _session_get(session, source_page_url, req_kwargs)
+                    source_html = _resp_html(source_resp)
+                    csrf_value = _extract_field_value(source_html, csrf_field)
+                    if csrf_value is None:
+                        # Fall back to value from crawl time
+                        csrf_value = hidden_defaults.get(csrf_field)
+                except Exception as exc:
+                    log.debug(
+                        "POST probe: failed to fetch source page %s: %s",
+                        source_page_url, exc,
+                    )
+                    csrf_value = hidden_defaults.get(csrf_field)
+
+            def _build_post_body(inject_value: str) -> dict[str, str]:
+                """Build the POST body with *inject_value* in *param_name*."""
+                body: dict[str, str] = {}
+                # Include all other non-target params with placeholder values
+                for other in param_names:
+                    if other != param_name:
+                        body[other] = "test"
+                # Include hidden defaults for other hidden fields
+                for hname, hval in hidden_defaults.items():
+                    if hname != param_name and hname not in body:
+                        body[hname] = hval
+                # CSRF token with freshly fetched value
+                if csrf_field and csrf_value is not None:
+                    body[csrf_field] = csrf_value
+                body[param_name] = inject_value
+                return body
+
+            # --- Step 2: Reflection probe ---
+            if delay > 0:
+                time.sleep(delay)
+            try:
+                resp1 = session.post(action_url, data=_build_post_body(canary), **req_kwargs)
+                html1 = _resp_html(resp1)
+            except Exception as exc:
+                result = ProbeResult(
+                    param_name=param_name, original_value="", error=str(exc)
+                )
+                results.append(result)
+                if on_result:
+                    on_result(result)
+                continue
+
+            reflections = _find_reflections(html1, canary)
+            if not reflections:
+                result = ProbeResult(param_name=param_name, original_value="")
+                results.append(result)
+                if on_result:
+                    on_result(result)
+                continue
+
+            # --- Step 3: Char survival probe ---
+            char_probe_val = canary + _PROBE_OPEN + PROBE_CHARS + _PROBE_CLOSE
+            if delay > 0:
+                time.sleep(delay)
+            surviving = frozenset()
+            try:
+                # Refresh CSRF token for the second POST if needed
+                current_csrf = csrf_value
+                if csrf_field:
+                    try:
+                        if delay > 0:
+                            time.sleep(delay)
+                        src2 = _session_get(session, source_page_url, req_kwargs)
+                        fresh = _extract_field_value(_resp_html(src2), csrf_field)
+                        if fresh is not None:
+                            current_csrf = fresh
+                    except Exception:
+                        pass
+
+                # Build body with fresh CSRF and char probe value
+                char_body: dict[str, str] = {}
+                for other in param_names:
+                    if other != param_name:
+                        char_body[other] = "test"
+                for hname, hval in hidden_defaults.items():
+                    if hname != param_name and hname not in char_body:
+                        char_body[hname] = hval
+                if csrf_field and current_csrf is not None:
+                    char_body[csrf_field] = current_csrf
+                char_body[param_name] = char_probe_val
+
+                resp2 = session.post(action_url, data=char_body, **req_kwargs)
+                surviving = _analyze_char_survival(_resp_html(resp2), canary)
+            except Exception:
+                pass
+
+            result = ProbeResult(
+                param_name=param_name,
+                original_value="",
+                reflections=[
+                    ReflectionContext(
+                        context_type=ctx.context_type,
+                        attr_name=ctx.attr_name,
+                        surviving_chars=surviving,
+                        snippet=ctx.snippet,
+                        context_before=ctx.context_before,
+                    )
+                    for ctx in reflections
+                ],
+            )
+            results.append(result)
+            if on_result:
+                on_result(result)
+
+    return results
+
+
 def enrich_context(context: ParsedContext, probe_results: list[ProbeResult]) -> ParsedContext:
     """Merge active probe results into *context*, prepending confirmed sinks and notes."""
     from dataclasses import replace as dc_replace

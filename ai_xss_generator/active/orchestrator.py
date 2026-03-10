@@ -23,7 +23,10 @@ import multiprocessing
 import time
 import urllib.parse
 from dataclasses import dataclass, field
-from typing import Sequence
+from typing import Any, Sequence, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ai_xss_generator.types import PostFormTarget
 
 from ai_xss_generator.active.worker import WorkerResult, run_worker
 from ai_xss_generator.console import (
@@ -60,6 +63,7 @@ def _domain(url: str) -> str:
 def run_active_scan(
     urls: Sequence[str],
     config: ActiveScanConfig,
+    post_forms: "Sequence[PostFormTarget]" = (),
 ) -> list[WorkerResult]:
     """Spawn isolated worker processes for each URL and collect results.
 
@@ -68,13 +72,15 @@ def run_active_scan(
       - dedup_lock:     Lock  — guards dedup_registry
       - findings_lock:  Lock  — serialises findings store writes
     """
+    from ai_xss_generator.active.worker import run_post_worker
     url_list = [u.strip() for u in urls if u and u.strip()]
-    if not url_list:
+    post_form_list = list(post_forms)
+    if not url_list and not post_form_list:
         return []
 
     n_workers = _auto_workers(config.rate, config.workers)
     step(
-        f"Active scan: {len(url_list)} URL(s) | "
+        f"Active scan: {len(url_list)} GET URL(s) + {len(post_form_list)} POST form(s) | "
         f"{n_workers} worker(s) | "
         f"{config.rate:g} req/s rate | "
         f"{config.timeout_seconds}s timeout"
@@ -87,16 +93,22 @@ def run_active_scan(
     result_queue: multiprocessing.Queue = manager.Queue()
 
     results: list[WorkerResult] = []
-    active_procs: list[tuple[multiprocessing.Process, str]] = []  # (proc, url)
+    active_procs: list[tuple[multiprocessing.Process, str]] = []  # (proc, label)
 
-    url_iter = iter(url_list)
+    # Unified work queue: ('get', url_str) or ('post', PostFormTarget)
+    work_items: list[tuple[str, Any]] = (
+        [("get", u) for u in url_list]
+        + [("post", pf) for pf in post_form_list]
+    )
+    work_iter = iter(work_items)
+    total_count = len(work_items)
     completed = 0
     scan_start = time.monotonic()
     tick = 0  # spinner frame counter
 
     def _fmt_status() -> str:
         elapsed = time.monotonic() - scan_start
-        remaining = len(url_list) - completed
+        remaining = total_count - completed
         if completed > 0:
             avg = elapsed / completed
             eta_str = f"ETA ~{fmt_duration(avg * remaining)}"
@@ -105,7 +117,7 @@ def run_active_scan(
         sp = spin_char(tick)
         return (
             f"\033[2m[~] {sp} Scanning | "
-            f"{completed}/{len(url_list)} URLs done | "
+            f"{completed}/{total_count} URLs done | "
             f"{len(active_procs)} active | "
             f"{fmt_duration(elapsed)} elapsed | "
             f"{eta_str}\033[0m"
@@ -129,49 +141,73 @@ def run_active_scan(
     def _reap_finished() -> None:
         nonlocal active_procs, completed
         still_running = []
-        for proc, purl in active_procs:
+        for proc, plabel in active_procs:
             if not proc.is_alive():
                 proc.join(timeout=1)
                 completed += 1
-                log.debug("Worker done for %s (%d/%d)", purl, completed, len(url_list))
+                log.debug("Worker done for %s (%d/%d)", plabel, completed, total_count)
             else:
-                still_running.append((proc, purl))
+                still_running.append((proc, plabel))
         active_procs = still_running
 
     set_status_bar(_fmt_status())
     try:
-        while completed < len(url_list):
+        while completed < total_count:
             _drain_queue()
             _reap_finished()
 
             # Fill up to n_workers slots
             while len(active_procs) < n_workers:
                 try:
-                    next_url = next(url_iter)
+                    kind, item = next(work_iter)
                 except StopIteration:
                     break
 
-                proc = multiprocessing.Process(
-                    target=run_worker,
-                    kwargs={
-                        "url": next_url,
-                        "rate": config.rate,
-                        "waf_hint": config.waf,
-                        "model": config.model,
-                        "cloud_model": config.cloud_model,
-                        "use_cloud": config.use_cloud,
-                        "timeout_seconds": config.timeout_seconds,
-                        "result_queue": result_queue,
-                        "dedup_registry": dedup_registry,
-                        "dedup_lock": dedup_lock,
-                        "findings_lock": findings_lock,
-                        "auth_headers": config.auth_headers,
-                    },
-                    daemon=True,
-                )
+                if kind == "get":
+                    next_url = item
+                    proc = multiprocessing.Process(
+                        target=run_worker,
+                        kwargs={
+                            "url": next_url,
+                            "rate": config.rate,
+                            "waf_hint": config.waf,
+                            "model": config.model,
+                            "cloud_model": config.cloud_model,
+                            "use_cloud": config.use_cloud,
+                            "timeout_seconds": config.timeout_seconds,
+                            "result_queue": result_queue,
+                            "dedup_registry": dedup_registry,
+                            "dedup_lock": dedup_lock,
+                            "findings_lock": findings_lock,
+                            "auth_headers": config.auth_headers,
+                        },
+                        daemon=True,
+                    )
+                    log_label = next_url
+                else:
+                    pf = item
+                    proc = multiprocessing.Process(
+                        target=run_post_worker,
+                        kwargs={
+                            "post_form": pf,
+                            "rate": config.rate,
+                            "waf_hint": config.waf,
+                            "model": config.model,
+                            "cloud_model": config.cloud_model,
+                            "use_cloud": config.use_cloud,
+                            "timeout_seconds": config.timeout_seconds,
+                            "result_queue": result_queue,
+                            "dedup_registry": dedup_registry,
+                            "dedup_lock": dedup_lock,
+                            "findings_lock": findings_lock,
+                            "auth_headers": config.auth_headers,
+                        },
+                        daemon=True,
+                    )
+                    log_label = f"[POST] {pf.action_url}"
                 proc.start()
-                active_procs.append((proc, next_url))
-                info(f"[worker] started → {next_url}")
+                active_procs.append((proc, log_label))
+                info(f"[worker] started → {log_label}")
 
             tick += 1
             update_status_bar(_fmt_status())

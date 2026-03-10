@@ -586,12 +586,13 @@ def _run_active_scan(
     # When --urls is given the user already knows what they want to test.
     no_crawl = getattr(args, "no_crawl", False)
     crawl_depth = getattr(args, "depth", 2)
+    post_forms: list = []
     if args.url and not no_crawl:
         from ai_xss_generator.console import (
             clear_status_bar, fmt_duration, set_status_bar,
             spin_char, update_status_bar,
         )
-        from ai_xss_generator.crawler import crawl as crawl_site
+        from ai_xss_generator.crawler import crawl as crawl_site, CrawlResult
         import time as _time
 
         crawl_start = _time.monotonic()
@@ -613,7 +614,7 @@ def _run_active_scan(
             f"0 pages visited | 0 target(s) found\033[0m"
         )
         try:
-            crawled_urls = crawl_site(
+            crawl_result = crawl_site(
                 urls[0],
                 depth=crawl_depth,
                 rate=args.rate,
@@ -624,13 +625,19 @@ def _run_active_scan(
         finally:
             clear_status_bar()
 
-        if crawled_urls:
-            success(
-                f"Crawl complete: {len(crawled_urls)} URL(s) with testable params discovered"
-            )
-            urls = crawled_urls
+        post_forms = crawl_result.post_forms
+        if crawl_result.get_urls:
+            msg = f"Crawl complete: {len(crawl_result.get_urls)} GET URL(s) with testable params"
+            if post_forms:
+                msg += f" + {len(post_forms)} POST form(s) discovered"
+            success(msg)
+            urls = crawl_result.get_urls
+        elif post_forms:
+            success(f"Crawl complete: {len(post_forms)} POST form(s) discovered (no GET params)")
+            # urls stays as [args.url] — original URL is still needed for report labeling
         else:
             info("Crawl found no URLs with testable params — testing provided URL directly")
+            post_forms = []
 
     scan_config = ActiveScanConfig(
         rate=args.rate,
@@ -644,7 +651,7 @@ def _run_active_scan(
         auth_headers=auth_headers or {},
     )
 
-    results = run_active_scan(urls, scan_config)
+    results = run_active_scan(urls, scan_config, post_forms=post_forms)
 
     config_summary = (
         f"rate={args.rate:g} req/s | workers={scan_config.workers} | "

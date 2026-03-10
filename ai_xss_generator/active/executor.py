@@ -220,6 +220,150 @@ class ActiveExecutor:
         )
 
 
+    def fire_post(
+        self,
+        source_page_url: str,
+        action_url: str,
+        param_name: str,
+        payload: str,
+        all_param_names: list[str],
+        csrf_field: str | None,
+        transform_name: str,
+    ) -> "ExecutionResult":
+        """Navigate to *source_page_url*, fill *param_name* with *payload*, submit the form.
+
+        Relies on the browser rendering the form page (including any dynamic CSRF token).
+        The CSRF token is left untouched — it's already filled by the server-rendered form.
+
+        Returns an ExecutionResult regardless of whether execution was confirmed.
+        """
+        if not self._started or self._browser is None:
+            return ExecutionResult(
+                confirmed=False,
+                method="",
+                detail="",
+                transform_name=transform_name,
+                payload=payload,
+                param_name=param_name,
+                fired_url=source_page_url,
+                error="Executor not started",
+            )
+
+        confirmed = False
+        method = ""
+        detail = ""
+
+        extra_headers = {**self._auth_headers, "Accept": "text/html,application/xhtml+xml"}
+        context = self._browser.new_context(
+            ignore_https_errors=True,
+            extra_http_headers=extra_headers,
+        )
+        try:
+            page = context.new_page()
+
+            page.route(
+                "**/*",
+                lambda route: route.abort()
+                if route.request.resource_type in {"image", "media", "font", "stylesheet"}
+                else route.continue_(),
+            )
+
+            def _on_dialog(dialog):
+                nonlocal confirmed, method, detail
+                confirmed = True
+                method = "dialog"
+                detail = f"alert() dialog triggered — message: {dialog.message!r}"
+                try:
+                    dialog.dismiss()
+                except Exception:
+                    pass
+
+            page.on("dialog", _on_dialog)
+
+            def _on_console(msg):
+                nonlocal confirmed, method, detail
+                if not confirmed:
+                    confirmed = True
+                    method = "console"
+                    detail = f"console.{msg.type}() fired — text: {msg.text!r}"
+
+            page.on("console", _on_console)
+
+            def _on_request(req):
+                nonlocal confirmed, method, detail
+                if not confirmed and _BEACON_HOST in req.url:
+                    confirmed = True
+                    method = "network"
+                    detail = f"OOB network request detected: {req.url!r}"
+
+            page.on("request", _on_request)
+
+            # Step 1: Load the form page (server fills in CSRF token automatically)
+            try:
+                page.goto(source_page_url, timeout=_NAV_TIMEOUT_MS, wait_until="domcontentloaded")
+            except Exception as nav_exc:
+                log.debug("fire_post: source page load error for %s: %s", source_page_url, nav_exc)
+
+            if not confirmed:
+                # Step 2: Fill the target param with the payload
+                try:
+                    page.fill(f'[name="{param_name}"]', payload, timeout=3000)
+                except Exception as fill_exc:
+                    log.debug("fire_post: fill failed for %s: %s", param_name, fill_exc)
+                    return ExecutionResult(
+                        confirmed=False,
+                        method="",
+                        detail="",
+                        transform_name=transform_name,
+                        payload=payload,
+                        param_name=param_name,
+                        fired_url=source_page_url,
+                        error=f"fill failed: {fill_exc}",
+                    )
+
+                # Step 3: Submit the form — try submit button first, fall back to JS submit
+                try:
+                    submit_btn = page.locator('[type="submit"]').first
+                    if submit_btn.count() > 0:
+                        submit_btn.click(timeout=3000)
+                    else:
+                        page.evaluate("document.forms[0] && document.forms[0].submit()")
+                    # Wait briefly for post-submit navigation / JS execution
+                    try:
+                        page.wait_for_load_state("domcontentloaded", timeout=_NAV_TIMEOUT_MS)
+                    except Exception:
+                        pass
+                except Exception as submit_exc:
+                    log.debug("fire_post: submit error: %s", submit_exc)
+
+        except Exception as exc:
+            return ExecutionResult(
+                confirmed=False,
+                method="",
+                detail="",
+                transform_name=transform_name,
+                payload=payload,
+                param_name=param_name,
+                fired_url=source_page_url,
+                error=str(exc),
+            )
+        finally:
+            try:
+                context.close()
+            except Exception:
+                pass
+
+        return ExecutionResult(
+            confirmed=confirmed,
+            method=method,
+            detail=detail,
+            transform_name=transform_name,
+            payload=payload,
+            param_name=param_name,
+            fired_url=source_page_url,
+        )
+
+
 def _build_url(url: str, param_name: str, payload: str, all_params: dict[str, str]) -> str:
     """Return *url* with *param_name* replaced by *payload*, others preserved."""
     parsed = urllib.parse.urlparse(url)

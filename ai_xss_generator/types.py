@@ -75,6 +75,27 @@ class PayloadCandidate:
 
 
 @dataclass(slots=True)
+class PostFormTarget:
+    """A POST form discovered during crawling that has testable parameters."""
+
+    action_url: str
+    """Absolute URL to POST the form to."""
+
+    source_page_url: str
+    """Page where the form was found — GET this to get a fresh CSRF token."""
+
+    param_names: list[str]
+    """Injectable parameter names (CSRF fields excluded)."""
+
+    csrf_field: str | None
+    """Name of the detected CSRF token hidden field, or None."""
+
+    hidden_defaults: dict[str, str]
+    """All hidden field name→value pairs from the form as discovered.
+    Used as fallback when a fresh CSRF fetch fails."""
+
+
+@dataclass(slots=True)
 class GenerationResult:
     engine: str
     model: str

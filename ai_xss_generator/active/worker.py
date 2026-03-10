@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     import multiprocessing
+    from ai_xss_generator.types import PostFormTarget
 
 log = logging.getLogger(__name__)
 
@@ -508,6 +509,248 @@ def _get_cloud_payloads(
         dedup_registry[ekey] = result_strings
 
     return result_strings
+
+
+# ---------------------------------------------------------------------------
+# POST form worker entry point
+# ---------------------------------------------------------------------------
+
+def run_post_worker(
+    post_form: "PostFormTarget",
+    rate: float,
+    waf_hint: str | None,
+    model: str,
+    cloud_model: str,
+    use_cloud: bool,
+    timeout_seconds: int,
+    result_queue: "multiprocessing.Queue",
+    dedup_registry: "DictProxy",
+    dedup_lock: Any,
+    findings_lock: Any,
+    auth_headers: dict[str, str] | None = None,
+) -> None:
+    """Worker entry point for POST form targets. Mirrors run_worker() for GET URLs."""
+    start_time = time.monotonic()
+
+    def _put_result(result: WorkerResult) -> None:
+        result.duration_seconds = time.monotonic() - start_time
+        result_queue.put(result)
+
+    try:
+        _run_post(
+            post_form=post_form,
+            rate=rate,
+            waf_hint=waf_hint,
+            model=model,
+            cloud_model=cloud_model,
+            use_cloud=use_cloud,
+            timeout_seconds=timeout_seconds,
+            dedup_registry=dedup_registry,
+            dedup_lock=dedup_lock,
+            findings_lock=findings_lock,
+            start_time=start_time,
+            put_result=_put_result,
+            auth_headers=auth_headers,
+        )
+    except Exception as exc:
+        log.exception("POST worker crashed for %s", post_form.action_url)
+        _put_result(WorkerResult(
+            url=post_form.action_url, status="error", error=str(exc)
+        ))
+
+
+def _run_post(
+    *,
+    post_form: "PostFormTarget",
+    rate: float,
+    waf_hint: str | None,
+    model: str,
+    cloud_model: str,
+    use_cloud: bool,
+    timeout_seconds: int,
+    dedup_registry: "DictProxy",
+    dedup_lock: Any,
+    findings_lock: Any,
+    start_time: float,
+    put_result: Any,
+    auth_headers: dict[str, str] | None = None,
+) -> None:
+    from ai_xss_generator.probe import probe_post_form
+    from ai_xss_generator.active.executor import ActiveExecutor
+    from ai_xss_generator.active.transforms import all_variants_for_probe
+
+    deadline = start_time + timeout_seconds
+
+    def _timed_out() -> bool:
+        return time.monotonic() > deadline
+
+    if not post_form.param_names:
+        put_result(WorkerResult(url=post_form.action_url, status="no_params", waf=waf_hint))
+        return
+
+    # Probe all params for reflection
+    probe_results = probe_post_form(
+        action_url=post_form.action_url,
+        source_page_url=post_form.source_page_url,
+        param_names=post_form.param_names,
+        csrf_field=post_form.csrf_field,
+        hidden_defaults=post_form.hidden_defaults,
+        rate=rate,
+        waf=waf_hint,
+        auth_headers=auth_headers,
+    )
+
+    injectable = [r for r in probe_results if r.is_injectable]
+    reflected  = [r for r in probe_results if r.is_reflected]
+
+    if not reflected:
+        put_result(WorkerResult(
+            url=post_form.action_url,
+            status="no_reflection",
+            waf=waf_hint,
+            params_tested=len(post_form.param_names),
+        ))
+        return
+
+    if not injectable:
+        put_result(WorkerResult(
+            url=post_form.action_url,
+            status="no_reflection",
+            waf=waf_hint,
+            params_tested=len(post_form.param_names),
+            params_reflected=len(reflected),
+        ))
+        return
+
+    # Start Playwright executor
+    executor = ActiveExecutor(auth_headers=auth_headers)
+    try:
+        executor.start()
+    except Exception as exc:
+        put_result(WorkerResult(
+            url=post_form.action_url, status="error",
+            error=f"Playwright start failed: {exc}", waf=waf_hint,
+        ))
+        return
+
+    confirmed_findings: list[ConfirmedFinding] = []
+    total_transforms_tried = 0
+    cloud_escalated = False
+
+    try:
+        for probe_result in injectable:
+            if _timed_out():
+                break
+
+            param_name = probe_result.param_name
+            param_variants = all_variants_for_probe(probe_result)
+
+            for _pname, context_type, variants in param_variants:
+                if _timed_out():
+                    break
+
+                context_confirmed = False
+                failed_transform_names: list[str] = []
+
+                for variant in variants:
+                    if _timed_out():
+                        break
+
+                    total_transforms_tried += 1
+                    result = executor.fire_post(
+                        source_page_url=post_form.source_page_url,
+                        action_url=post_form.action_url,
+                        param_name=param_name,
+                        payload=variant.payload,
+                        all_param_names=post_form.param_names,
+                        csrf_field=post_form.csrf_field,
+                        transform_name=variant.transform_name,
+                    )
+
+                    if result.confirmed:
+                        finding = _make_finding(
+                            url=post_form.action_url,
+                            probe_result=probe_result,
+                            context_type=context_type,
+                            result=result,
+                            waf=waf_hint,
+                            source="phase1_transform",
+                            cloud_escalated=False,
+                        )
+                        confirmed_findings.append(finding)
+                        _save_finding_safe(finding, findings_lock)
+                        context_confirmed = True
+                        break
+                    else:
+                        failed_transform_names.append(variant.transform_name)
+
+                # Local model fallback (reuse existing helper — it needs a URL context
+                # so we skip it for POST forms where URL has no params; cloud still usable)
+                if not context_confirmed and use_cloud and not _timed_out():
+                    surviving_chars = frozenset().union(
+                        *(ctx.surviving_chars for ctx in probe_result.reflections)
+                    )
+                    ekey = _escalation_key(
+                        url=post_form.action_url,
+                        param_name=param_name,
+                        waf=waf_hint,
+                        surviving_chars=surviving_chars,
+                        context_type=context_type,
+                    )
+                    cloud_payloads = _get_cloud_payloads(
+                        url=post_form.action_url,
+                        probe_result=probe_result,
+                        cloud_model=cloud_model,
+                        waf=waf_hint,
+                        ekey=ekey,
+                        dedup_registry=dedup_registry,
+                        dedup_lock=dedup_lock,
+                        auth_headers=auth_headers,
+                    )
+                    if cloud_payloads:
+                        cloud_escalated = True
+
+                    for cp in cloud_payloads:
+                        if _timed_out():
+                            break
+                        total_transforms_tried += 1
+                        result = executor.fire_post(
+                            source_page_url=post_form.source_page_url,
+                            action_url=post_form.action_url,
+                            param_name=param_name,
+                            payload=cp,
+                            all_param_names=post_form.param_names,
+                            csrf_field=post_form.csrf_field,
+                            transform_name="cloud_model",
+                        )
+                        if result.confirmed:
+                            finding = _make_finding(
+                                url=post_form.action_url,
+                                probe_result=probe_result,
+                                context_type=context_type,
+                                result=result,
+                                waf=waf_hint,
+                                source="cloud_model",
+                                cloud_escalated=True,
+                            )
+                            confirmed_findings.append(finding)
+                            _save_finding_safe(finding, findings_lock)
+                            break
+
+    finally:
+        executor.stop()
+
+    status = "confirmed" if confirmed_findings else "no_execution"
+    put_result(WorkerResult(
+        url=post_form.action_url,
+        status=status,
+        confirmed_findings=confirmed_findings,
+        transforms_tried=total_transforms_tried,
+        cloud_escalated=cloud_escalated,
+        waf=waf_hint,
+        params_tested=len(post_form.param_names),
+        params_reflected=len(reflected),
+    ))
 
 
 def _save_finding_safe(finding: ConfirmedFinding, findings_lock: Any) -> None:
