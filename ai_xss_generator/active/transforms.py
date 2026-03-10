@@ -261,10 +261,22 @@ def all_variants_for_probe(probe_result: "ProbeResult") -> list[tuple[str, str, 
     """Return (param_name, context_type, variants) for every injectable reflection
     found in *probe_result*.
 
-    Imports probe.payloads_for_probe_result() to get context-appropriate base
-    payloads, then expands each with apply_for_context().
+    Strategy:
+    - Generator payloads (tag="gen_gen") are already char-filtered, context-targeted,
+      and carry per-call random casing.  They are used directly as TransformVariants
+      with transform_name="gen_gen" — no further transform layer is applied on top,
+      because doing so would be redundant casing variation on already-varied payloads.
+    - All other (non-gen_gen) payloads go through the existing transform layer
+      (url_encode, double_url, mixed_case_tags, etc.) with a small base cap to keep
+      the total request count sane.
+
+    The combined list is sorted by risk_score descending so highest-confidence
+    payloads fire first.
     """
     from ai_xss_generator.probe import payloads_for_probe_result
+
+    # How many non-gen_gen base payloads to expand through the transform layer.
+    _TRANSFORM_BASE_CAP = 5
 
     out: list[tuple[str, str, list[TransformVariant]]] = []
     base_payloads = payloads_for_probe_result(probe_result)
@@ -273,16 +285,33 @@ def all_variants_for_probe(probe_result: "ProbeResult") -> list[tuple[str, str, 
         if not ctx.is_exploitable:
             continue
         context_type = ctx.context_type
-        # Gather base payloads for this context only
-        ctx_bases = [p.payload for p in base_payloads if ctx.context_type in (p.target_sink or "")]
-        # Fallback: use all base payloads if none matched by target_sink
-        if not ctx_bases:
-            ctx_bases = [p.payload for p in base_payloads]
+
+        # Split payloads into gen_gen (fire directly) vs others (expand via transforms)
+        ctx_payloads = [
+            p for p in base_payloads
+            if ctx.context_type in (p.target_sink or "")
+        ]
+        if not ctx_payloads:
+            ctx_payloads = list(base_payloads)
+
+        gen_payloads = [p for p in ctx_payloads if "gen_gen" in p.tags]
+        other_payloads = [p for p in ctx_payloads if "gen_gen" not in p.tags]
 
         all_variants: list[TransformVariant] = []
         seen_payloads: set[str] = set()
-        for base in ctx_bases[:5]:  # cap base payloads per context to avoid explosion
-            for variant in apply_for_context(base, context_type):
+
+        # --- gen_gen payloads: fire directly, sorted by risk_score desc ---
+        for p in sorted(gen_payloads, key=lambda x: -x.risk_score):
+            if p.payload not in seen_payloads:
+                seen_payloads.add(p.payload)
+                all_variants.append(TransformVariant(
+                    transform_name="gen_gen",
+                    payload=p.payload,
+                ))
+
+        # --- other payloads: expand through the evasion transform layer ---
+        for base_p in other_payloads[:_TRANSFORM_BASE_CAP]:
+            for variant in apply_for_context(base_p.payload, context_type):
                 if variant.payload not in seen_payloads:
                     seen_payloads.add(variant.payload)
                     all_variants.append(variant)
