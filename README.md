@@ -10,6 +10,13 @@
 ## How it works
 
 ```
+[--active mode]
+crawl target site  (BFS, same-origin, WAF-aware — disable with --no-crawl)
+  • discovers all endpoints with non-tracking query parameters
+  • deduplicates by path + param names (not values)
+  • strips known tracking params (utm_*, gclid, fbclid, ranMID, …) before queuing
+    ↓
+[passive + probe mode]
 fetch target HTML  (authenticated if --header / --cookies supplied)
     ↓
 passive analysis
@@ -19,6 +26,8 @@ passive analysis
   • Encoding chain detection (base64, base32, URL, gzip+base64, rot13, …)
     ↓
 active probing  (default on live URLs, disable with --no-probe)
+  tracking/analytics params skipped automatically (utm_*, gclid, fbclid, ranMID, …)
+  WAF-aware fetch: curl_cffi → HTTP/1.1 retry → Playwright (for akamai/cloudflare/datadome/…)
   phase 1: canary per parameter → finds reflection points and classifies context
            (js_string_dq/sq/bt, html_attr_url/value/event, html_body, html_comment, json_value)
   phase 2: char survival probe → confirms which XSS-critical chars survive the filter
@@ -34,7 +43,7 @@ ranking + threshold filter
   default threshold: 60 — always shows at least 5 payloads
 ```
 
-Optionally: **active scanner** (`--active`) fires payloads through a real Playwright browser and confirms execution via alert dialogs, console output, or OOB network beacons.
+Optionally: **active scanner** (`--active`) crawls the site, fires payloads through a real Playwright browser, and confirms execution via alert dialogs, console output, or OOB network beacons. A persistent status bar shows scan progress, elapsed time, and ETA.
 
 ## Self-learning findings store
 
@@ -49,13 +58,23 @@ When scanning a live URL with query parameters, `axss` runs two probe requests p
 1. **Canary request** — injects a unique token to find every reflection point and classify the HTML/JS context at each one.
 2. **Char survival request** — wraps XSS-critical characters (`< > " ' ( ) ; / \ ` { }`) in sentinel markers to confirm which ones survive the server's filter.
 
+**Tracking param filter:** Known analytics and affiliate parameters (`utm_*`, `gclid`, `fbclid`, `msclkid`, `ranMID`, `ranEAID`, Mailchimp, Klaviyo, etc.) are silently skipped before probing — they are never reflected in page content and would only waste requests.
+
+**WAF-aware probe fetch:** When a browser-required WAF (akamai, cloudflare, datadome, kasada, perimeterx) is detected, probe requests are routed through a shared Playwright browser session instead of curl_cffi. For other targets, HTTP/2 stream errors (curl error 92) automatically retry as HTTP/1.1 before failing.
+
 Probe results flow directly into payload generation: the LLM prompt leads with surviving chars and confirmed sink context; the heuristic engine generates bypass payloads tailored to what was observed (e.g. `java%09script:` tab bypass when `(` and `)` survive but `javascript:` is filtered in an href sink).
 
 Live probe output streams as results arrive. Use `--no-live` to suppress streaming, `--no-probe` to skip probing entirely.
 
 ## Active scanner (`--active`)
 
-The active scanner fires payloads into a real Playwright browser and detects confirmed JavaScript execution. Each URL gets an isolated worker process.
+The active scanner crawls the site to discover the full XSS attack surface, then fires payloads into a real Playwright browser and detects confirmed JavaScript execution. Each URL gets an isolated worker process. A persistent status bar tracks progress, elapsed time, and ETA throughout the scan.
+
+**Surface discovery (crawl, on by default):**
+- BFS-crawls from the seed URL, same-origin only, depth 2 by default
+- Deduplicates endpoints by `path + sorted param names` — `?q=shoes` and `?q=boots` test the same surface, scanned once
+- Strips tracking params from discovered URLs before queuing
+- Uses the same WAF-aware fetch path as probing
 
 **Detection methods:**
 - `dialog` — `alert()` / `confirm()` / `prompt()` event triggered
@@ -63,22 +82,29 @@ The active scanner fires payloads into a real Playwright browser and detects con
 - `network` — outbound request to the internal beacon hostname
 
 **Execution pipeline per URL:**
-1. Probe all query parameters for reflection and character survival
-2. **Phase 1** — mechanical transform variants (encoding, template tricks, namespace escapes, etc.)
-3. **Local model** — AI-generated payloads for unconfirmed params
-4. **Cloud escalation** — if still unconfirmed and a cloud key is configured
+1. Crawl site to discover endpoints (unless `--no-crawl`)
+2. Probe all non-tracking query parameters for reflection and character survival
+3. **Phase 1** — mechanical transform variants (encoding, template tricks, namespace escapes, etc.)
+4. **Local model** — AI-generated payloads for unconfirmed params
+5. **Cloud escalation** — if still unconfirmed and a cloud key is configured
 
 Confirmed findings are written to `~/.axss/reports/<domain>_<timestamp>.md`.
 
 ```bash
-# Active scan, single URL
-axss -u "https://example.com/search?q=test" --active
+# Active scan — crawls site first (default), then scans discovered endpoints
+axss -u "https://example.com" --active
 
-# Active scan, batch URLs, 3 workers
+# Active scan — skip crawl, test only the provided URL
+axss -u "https://example.com/search?q=test" --active --no-crawl
+
+# Active scan — crawl deeper (default depth is 2)
+axss -u "https://example.com" --active --depth 3
+
+# Active scan, batch URLs (no crawl — list is already explicit)
 axss --urls urls.txt --active --workers 3 --timeout 120
 
 # Active scan, authenticated target
-axss -u "https://app.example.com/profile?bio=test" --active --cookies cookies.txt
+axss -u "https://app.example.com" --active --cookies cookies.txt
 ```
 
 ## Authenticated scanning (`--header` / `--cookies`)
@@ -103,8 +129,8 @@ axss -u "https://app.example.com/admin?q=x" \
      --header "Authorization: Bearer TOKEN" \
      --cookies cookies.txt
 
-# Active scanner + auth
-axss -u "https://app.example.com/profile?bio=x" --active \
+# Active scanner + auth (crawls the site with auth headers)
+axss -u "https://app.example.com" --active \
      --header "Authorization: Bearer TOKEN"
 ```
 
@@ -277,10 +303,16 @@ axss -u "https://app.example.com/search?q=x" --header "Authorization: Bearer TOK
 # Authenticated scan — cookies.txt from browser export
 axss -u "https://app.example.com/dashboard?tab=x" --cookies cookies.txt
 
-# Active scanner — confirm execution in browser
-axss -u "https://example.com/search?q=test" --active
+# Active scanner — crawls site then confirms execution in browser
+axss -u "https://example.com" --active
 
-# Active scanner — authenticated, batch URLs
+# Active scanner — skip crawl, test this URL only
+axss -u "https://example.com/search?q=test" --active --no-crawl
+
+# Active scanner — crawl deeper, more workers
+axss -u "https://example.com" --active --depth 3 --workers 3
+
+# Active scanner — authenticated, batch URLs (no crawl needed)
 axss --urls urls.txt --active --workers 3 --cookies cookies.txt
 ```
 
@@ -307,6 +339,8 @@ axss --urls urls.txt --active --workers 3 --cookies cookies.txt
 | `-a, --active` | off | Fire payloads in Playwright and confirm execution |
 | `--workers N` | 1 | Max parallel active-scan worker processes |
 | `--timeout N` | 300 | Per-URL timeout in seconds for active scan workers |
+| `--no-crawl` | off | Skip crawling — test only the provided URL directly |
+| `--depth N` | 2 | BFS crawl depth (1 = seed page links only) |
 | `--check-keys` | — | Validate all configured API keys and report status |
 | `-v, --verbose` | off | Show detailed sub-step progress |
 | `--merge-batch` | off | Combine batch contexts into one payload set |
@@ -334,7 +368,7 @@ $ axss -u "https://target.example/page?url=test" -v --threshold 70
 [*] Probing for WAF on https://target.example/page?url=test...
 [~] No WAF fingerprint detected — use --waf to set manually.
 [*] Fetching/parsing target: https://target.example/page?url=test
-[*] Active probing: 1 parameter(s) × 2 requests each...
+[*] Active probing query parameters...
 [+] [probe] 'url' → html_attr_url(href) | chars='()/;`{}' | INJECTABLE
 
  1. [96] JavaScript URI injection [url]
