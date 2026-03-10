@@ -668,6 +668,44 @@ def probe_url(
                     canary=canary, delay=delay, ua_cycle=ua_cycle, proxy_cycle=proxy_cycle,
                     auth_headers=auth_headers,
                 )
+                # --sink-url: DynamicSession maintains cookies across fetch() calls
+                # within the same session, so the stored canary is visible on sink_url.
+                if sink_url and not result.reflections and not result.error:
+                    try:
+                        if delay > 0:
+                            time.sleep(delay)
+                        _sink_resp = dyn.fetch(sink_url)
+                        _sink_refs = _find_reflections(_resp_html(_sink_resp), canary)
+                        if _sink_refs:
+                            _char_probe = canary + _PROBE_OPEN + PROBE_CHARS + _PROBE_CLOSE
+                            _char_url = _rebuild_url(url, {**flat_params, param_name: _char_probe})
+                            if delay > 0:
+                                time.sleep(delay)
+                            dyn.fetch(_char_url)
+                            if delay > 0:
+                                time.sleep(delay)
+                            _sink_resp2 = dyn.fetch(sink_url)
+                            _surviving = _analyze_char_survival(_resp_html(_sink_resp2), canary)
+                            result = ProbeResult(
+                                param_name=param_name,
+                                original_value=original_value,
+                                reflections=[
+                                    ReflectionContext(
+                                        context_type=ctx.context_type,
+                                        attr_name=ctx.attr_name,
+                                        surviving_chars=_surviving,
+                                        snippet=ctx.snippet,
+                                        context_before=ctx.context_before,
+                                    )
+                                    for ctx in _sink_refs
+                                ],
+                            )
+                            log.debug(
+                                "probe_url (browser): canary found in sink_url %s for param %s",
+                                sink_url, param_name,
+                            )
+                    except Exception as _exc:
+                        log.debug("probe_url (browser): sink_url check failed: %s", _exc)
                 results.append(result)
                 if on_result:
                     on_result(result)

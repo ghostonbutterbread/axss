@@ -273,7 +273,7 @@ def _print_summary(results: list[WorkerResult]) -> None:
             success(f"  Payload:   {f.payload}")
             success(f"  URL:       {_up.unquote(f.fired_url)}")
             if i < len(all_findings):
-                info("")
+                info(f"  {'─'*56}")
     else:
         info("  ➖ No confirmed XSS execution detected")
     if errors:

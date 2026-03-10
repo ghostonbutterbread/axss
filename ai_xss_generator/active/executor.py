@@ -352,6 +352,9 @@ class ActiveExecutor:
                     pass
             except Exception as submit_exc:
                 log.debug("fire_post: submit error: %s", submit_exc)
+                # Submit failed — roll back the flag so follow-up page events
+                # (e.g. analytics console.log) are not mistaken for execution.
+                payload_submitted = False
 
             # Step 4: Navigate to follow-up pages to catch session-stored XSS.
             # After the form POST, the payload may be stored server-side and
