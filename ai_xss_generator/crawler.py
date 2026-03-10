@@ -33,28 +33,83 @@ MAX_PAGES = 300  # hard cap on pages visited per crawl session
 # ---------------------------------------------------------------------------
 
 class _LinkExtractor(HTMLParser):
-    """Minimal HTMLParser that collects href and GET form action values."""
+    """HTMLParser that collects hrefs and synthesizes GET form submission URLs.
+
+    For GET forms, it tracks every named input/textarea/select field and
+    constructs a synthetic URL on form close: ``action?field1=test&field2=test``.
+    This is what the browser would actually send on submission, which is the
+    real XSS attack surface — the bare action URL (no params) would be filtered
+    out by the crawler's testable-params check and never scanned.
+
+    Hidden inputs are included (they appear in submitted URLs and can be
+    injectable). Submit/button/image/reset/file inputs are excluded (they don't
+    produce injectable query params).
+    """
+
+    # Input types that never produce injectable query params
+    _SKIP_TYPES: frozenset[str] = frozenset(
+        {"submit", "button", "image", "reset", "file"}
+    )
 
     def __init__(self) -> None:
         super().__init__()
         self.links: list[str] = []
+        # Tracks the active GET form: None when no form is open or form is POST
+        self._form: dict[str, object] | None = None
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attr = {k.lower(): (v or "") for k, v in attrs}
+
         if tag == "a":
             href = attr.get("href", "").strip()
             if href:
                 self.links.append(href)
+
         elif tag == "form":
-            action = attr.get("action", "").strip()
             method = attr.get("method", "get").strip().upper()
-            # Only GET forms: params end up in the URL, which we can probe
-            if action and method in ("", "GET"):
-                self.links.append(action)
+            if method in ("", "GET"):
+                self._form = {
+                    "action": attr.get("action", "").strip(),
+                    "fields": [],   # list[str] — ordered, deduplicated param names
+                }
+            else:
+                # POST/PUT/DELETE etc — not injectable via URL params
+                self._form = None
+
+        elif tag in ("input", "textarea", "select") and self._form is not None:
+            name = attr.get("name", "").strip()
+            input_type = attr.get("type", "text").strip().lower()
+            fields: list[str] = self._form["fields"]  # type: ignore[assignment]
+            if name and input_type not in self._SKIP_TYPES and name not in fields:
+                fields.append(name)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag != "form" or self._form is None:
+            return
+
+        action: str = self._form["action"]  # type: ignore[assignment]
+        fields: list[str] = self._form["fields"]  # type: ignore[assignment]
+        self._form = None
+
+        if fields:
+            # Build a realistic submission URL with placeholder values.
+            # The probe will replace these with canaries; we just need the
+            # param names present so the URL passes the testable-params filter.
+            qs = urllib.parse.urlencode({f: "test" for f in fields})
+            # action="" means "submit to the current page" — use "?" as a
+            # relative reference so _resolve() maps it to the correct URL.
+            self.links.append(f"{action}?{qs}" if action else f"?{qs}")
+        elif action:
+            # Form with no named inputs — add as a plain link for crawl traversal
+            self.links.append(action)
 
 
 def _extract_links(html: str, base_url: str) -> list[str]:
-    """Return resolved, deduplicated same-scheme-or-relative links from *html*."""
+    """Return raw hrefs and synthetic form-submission URLs extracted from *html*.
+
+    Does not resolve or filter — callers are responsible for running results
+    through ``_resolve()`` and ``_same_origin()``.
+    """
     extractor = _LinkExtractor()
     try:
         extractor.feed(html)
