@@ -13,7 +13,9 @@ import logging
 import os
 import re
 import secrets
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from itertools import cycle
 from pathlib import Path
@@ -87,6 +89,46 @@ PROBE_CHARS = '<>"\';\\/`(){}'
 # Sentinel strings that bracket the probe chars in the request value
 _PROBE_OPEN = "AXSSOP"
 _PROBE_CLOSE = "AXSSCL"
+
+# Max concurrently-active probe threads per URL
+_PROBE_MAX_WORKERS = 6
+
+# Max crawled pages to sweep for session-stored XSS (caps follow-up sweep cost)
+_FOLLOW_UP_CRAWLED_LIMIT = 30
+
+
+class _RateLimiter:
+    """Thread-safe token-bucket rate limiter.
+
+    Smooths burst requests across threads so the global request rate never
+    exceeds *rate* req/s even when multiple probe threads are active.
+    """
+
+    def __init__(self, rate: float) -> None:
+        self._rate = rate
+        # Bucket capacity is at least 1.0 so acquire() can always grant a token.
+        # For rate < 1.0 (very slow scans), capping at self._rate would prevent
+        # tokens from ever reaching the 1.0 threshold.
+        self._bucket_cap: float = max(rate, 1.0)
+        self._lock = threading.Lock()
+        self._tokens: float = 1.0  # start with exactly one token: first request fires immediately
+        self._last: float = time.monotonic()
+
+    def acquire(self) -> None:
+        """Block until one token is available, then consume it."""
+        if self._rate <= 0:
+            return
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                elapsed = now - self._last
+                self._last = now
+                self._tokens = min(self._bucket_cap, self._tokens + elapsed * self._rate)
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+                wait = (1.0 - self._tokens) / self._rate
+            time.sleep(wait)
 
 
 # ---------------------------------------------------------------------------
@@ -481,6 +523,8 @@ def _probe_param(
     ua_cycle: Any,
     proxy_cycle: Any | None,
     auth_headers: dict[str, str] | None = None,
+    rate_limiter: "_RateLimiter | None" = None,
+    sink_url: str | None = None,
 ) -> ProbeResult:
     """Send two probe requests for one parameter and return a ProbeResult."""
     # Auth headers first; User-Agent from rotation always wins
@@ -489,9 +533,14 @@ def _probe_param(
     if proxy_cycle:
         req_kwargs["proxy"] = next(proxy_cycle)
 
+    def _wait() -> None:
+        if rate_limiter is not None:
+            rate_limiter.acquire()
+        elif delay > 0:
+            time.sleep(delay)
+
     # Phase 1 — reflection mapping
-    if delay > 0:
-        time.sleep(delay)
+    _wait()
     try:
         resp1 = _session_get(session, _rebuild_url(url, {**all_params, param_name: canary}), req_kwargs)
     except Exception as exc:
@@ -499,12 +548,46 @@ def _probe_param(
 
     reflections = _find_reflections(_resp_html(resp1), canary)
     if not reflections:
+        # --sink-url: check user-specified sink page for GET-based stored XSS.
+        # Session cookies carry the injected canary across requests.
+        if sink_url:
+            try:
+                _wait()
+                _sink_resp = _session_get(session, sink_url, {"headers": {"User-Agent": next(ua_cycle)}})
+                _sink_refs = _find_reflections(_resp_html(_sink_resp), canary)
+                if _sink_refs:
+                    _char_probe = canary + _PROBE_OPEN + PROBE_CHARS + _PROBE_CLOSE
+                    _char_url = _rebuild_url(url, {**all_params, param_name: _char_probe})
+                    _wait()
+                    _session_get(session, _char_url, {"headers": {"User-Agent": next(ua_cycle)}})
+                    _wait()
+                    _sink_resp2 = _session_get(session, sink_url, {"headers": {"User-Agent": next(ua_cycle)}})
+                    _surviving = _analyze_char_survival(_resp_html(_sink_resp2), canary)
+                    log.debug(
+                        "probe_url: canary found in sink_url %s for param %s",
+                        sink_url, param_name,
+                    )
+                    return ProbeResult(
+                        param_name=param_name,
+                        original_value=original_value,
+                        reflections=[
+                            ReflectionContext(
+                                context_type=ctx.context_type,
+                                attr_name=ctx.attr_name,
+                                surviving_chars=_surviving,
+                                snippet=ctx.snippet,
+                                context_before=ctx.context_before,
+                            )
+                            for ctx in _sink_refs
+                        ],
+                    )
+            except Exception as _exc:
+                log.debug("probe_url: sink_url check failed for %s: %s", sink_url, _exc)
         return ProbeResult(param_name=param_name, original_value=original_value)
 
     # Phase 2 — character survival
     char_probe = canary + _PROBE_OPEN + PROBE_CHARS + _PROBE_CLOSE
-    if delay > 0:
-        time.sleep(delay)
+    _wait()
     try:
         resp2 = _session_get(session, _rebuild_url(url, {**all_params, param_name: char_probe}), req_kwargs)
         surviving = _analyze_char_survival(_resp_html(resp2), canary)
@@ -710,56 +793,46 @@ def probe_url(
                 if on_result:
                     on_result(result)
     else:
-        with FetcherSession(
-            impersonate="chrome",
-            stealthy_headers=True,
-            timeout=20,
-            follow_redirects=True,
-            retries=1,
-        ) as session:
-            for param_name, original_value in flat_params.items():
-                result = _probe_param(
-                    session, url, param_name, original_value, flat_params,
-                    canary=canary, delay=delay, ua_cycle=ua_cycle, proxy_cycle=proxy_cycle,
+        # Parallel probe: each thread gets its own FetcherSession; the shared
+        # token-bucket rate limiter ensures the global req/s cap is respected.
+        rl = _RateLimiter(rate)
+        _cycle_lock = threading.Lock()
+
+        def _next_ua_proxy() -> tuple[str, str | None]:
+            with _cycle_lock:
+                return next(ua_cycle), (next(proxy_cycle) if proxy_cycle else None)
+
+        def _probe_one(param_name: str, original_value: str) -> ProbeResult:
+            ua, proxy = _next_ua_proxy()
+            with FetcherSession(
+                impersonate="chrome",
+                stealthy_headers=True,
+                timeout=20,
+                follow_redirects=True,
+                retries=1,
+            ) as _session:
+                return _probe_param(
+                    _session, url, param_name, original_value, flat_params,
+                    canary=canary, delay=0,
+                    ua_cycle=cycle([ua]),
+                    proxy_cycle=cycle([proxy]) if proxy else None,
                     auth_headers=auth_headers,
+                    rate_limiter=rl,
+                    sink_url=sink_url,
                 )
-                # --sink-url: if the immediate GET response had no reflection,
-                # check the user-specified sink page (session cookies carry the
-                # injected canary for session-stored GET XSS).
-                if sink_url and not result.reflections and not result.error:
-                    try:
-                        if delay > 0:
-                            time.sleep(delay)
-                        _sink_resp = _session_get(session, sink_url, {"headers": {"User-Agent": next(ua_cycle)}})
-                        _sink_refs = _find_reflections(_resp_html(_sink_resp), canary)
-                        if _sink_refs:
-                            # Char survival: re-inject with char probe, then re-check sink_url
-                            _char_probe = canary + _PROBE_OPEN + PROBE_CHARS + _PROBE_CLOSE
-                            _char_url = _rebuild_url(url, {**flat_params, param_name: _char_probe})
-                            if delay > 0:
-                                time.sleep(delay)
-                            _session_get(session, _char_url, {"headers": {"User-Agent": next(ua_cycle)}})
-                            if delay > 0:
-                                time.sleep(delay)
-                            _sink_resp2 = _session_get(session, sink_url, {"headers": {"User-Agent": next(ua_cycle)}})
-                            _surviving = _analyze_char_survival(_resp_html(_sink_resp2), canary)
-                            result = ProbeResult(
-                                param_name=param_name,
-                                original_value=original_value,
-                                reflections=[
-                                    ReflectionContext(
-                                        context_type=ctx.context_type,
-                                        attr_name=ctx.attr_name,
-                                        surviving_chars=_surviving,
-                                        snippet=ctx.snippet,
-                                        context_before=ctx.context_before,
-                                    )
-                                    for ctx in _sink_refs
-                                ],
-                            )
-                            log.debug("probe_url: canary found in sink_url %s for param %s", sink_url, param_name)
-                    except Exception as _exc:
-                        log.debug("probe_url: sink_url check failed for %s: %s", sink_url, _exc)
+
+        n_workers = min(len(flat_params), _PROBE_MAX_WORKERS)
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            future_map = {
+                pool.submit(_probe_one, pn, ov): (pn, ov)
+                for pn, ov in flat_params.items()
+            }
+            for fut in as_completed(future_map):
+                pn, ov = future_map[fut]
+                try:
+                    result = fut.result()
+                except Exception as exc:
+                    result = ProbeResult(param_name=pn, original_value=ov, error=str(exc))
                 results.append(result)
                 if on_result:
                     on_result(result)
@@ -932,7 +1005,7 @@ def probe_post_form(
                 _follow_up_candidates = list(dict.fromkeys(
                     ([sink_url] if sink_url else [])
                     + [source_page_url, _origin_root]
-                    + list(crawled_pages or [])
+                    + list(crawled_pages or [])[:_FOLLOW_UP_CRAWLED_LIMIT]
                 ))
                 for _fu in _follow_up_candidates:
                     try:

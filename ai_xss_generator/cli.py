@@ -234,15 +234,54 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
 
     # ── Active scanner ────────────────────────────────────────────────────────
     parser.add_argument(
+        "--generate",
+        action="store_true",
+        help=(
+            "--generate  Generate AI-ranked XSS payloads without active browser testing. "
+            "Parses the target, identifies XSS surface, and returns a ranked payload list. "
+            "Works with -u, --urls, and -i/--input. "
+            "Pass this flag when you want payloads only, not active confirmation."
+        ),
+    )
+    parser.add_argument(
+        "--reflected",
+        action="store_true",
+        help=(
+            "--reflected  Test for reflected XSS. Injects payloads into GET query "
+            "parameters and confirms JS execution in a real Playwright browser. "
+            "Implies active scanning. Combine with --stored/--dom to test multiple types."
+        ),
+    )
+    parser.add_argument(
+        "--stored",
+        action="store_true",
+        help=(
+            "--stored  Test for stored/POST XSS. Injects payloads into POST form fields "
+            "and checks follow-up pages for confirmed execution. "
+            "Requires a crawlable target. Implies active scanning."
+        ),
+    )
+    parser.add_argument(
+        "--dom",
+        action="store_true",
+        help=(
+            "--dom  Test for DOM-based XSS (coming soon). Will analyze client-side JS "
+            "for source→sink flows and inject payloads via URL fragments and DOM sources. "
+            "Implies active scanning."
+        ),
+    )
+    parser.add_argument(
         "-a",
         "--active",
         action="store_true",
         help=(
-            "--active  Enable active scanning mode. Fires payloads into a real "
-            "Playwright browser and detects confirmed XSS execution (alert() dialogs, "
-            "console output, network beacons). Requires -u or --urls. "
+            "--active  Enable active scanning of all XSS types (reflected + stored + DOM). "
+            "Equivalent to passing --reflected --stored --dom together. "
+            "Fires payloads into a real Playwright browser and detects confirmed execution "
+            "(alert() dialogs, console output, network beacons). Requires -u or --urls. "
             "Writes a markdown report to ~/.axss/reports/. "
-            "Limited to reflected XSS; stored/DOM XSS deferred."
+            "Legacy flag — prefer using --reflected/--stored/--dom directly, "
+            "or omit all flags to default to testing all types."
         ),
     )
     parser.add_argument(
@@ -565,8 +604,11 @@ def _run_active_scan(
     config: Any,
     resolved_waf: str | None,
     auth_headers: dict[str, str] | None = None,
+    scan_reflected: bool = True,
+    scan_stored: bool = True,
+    scan_dom: bool = True,
 ) -> int:
-    """Route --active scans through the orchestrator."""
+    """Route active scans through the orchestrator."""
     from ai_xss_generator.active.orchestrator import ActiveScanConfig, run_active_scan
     from ai_xss_generator.active.reporter import write_report
     from ai_xss_generator.parser import read_url_list
@@ -582,9 +624,11 @@ def _run_active_scan(
     else:
         urls = [args.url]
 
-    # WAF auto-detect from first URL if not provided manually
+    # WAF auto-detect from first URL — only when not crawling (the crawl will
+    # detect WAF from its seed fetch, saving a redundant round-trip).
     waf = resolved_waf
-    if not waf and urls:
+    no_crawl = getattr(args, "no_crawl", False)
+    if not waf and urls and (no_crawl or not args.url):
         step(f"Probing for WAF on {urls[0]}...")
         detected = _try_detect_waf(urls[0], getattr(args, "verbose", False))
         if detected:
@@ -595,7 +639,6 @@ def _run_active_scan(
 
     # Crawl to discover testable endpoints — only for single-URL mode.
     # When --urls is given the user already knows what they want to test.
-    no_crawl = getattr(args, "no_crawl", False)
     crawl_depth = getattr(args, "depth", 2)
     post_forms: list = []
     crawled_pages: list = []
@@ -652,6 +695,11 @@ def _run_active_scan(
             info("Crawl found no URLs with testable params — testing provided URL directly")
             post_forms = []
 
+        # Use WAF detected from crawl seed if auto-detect hasn't found one yet
+        if not waf and crawl_result.detected_waf:
+            waf = crawl_result.detected_waf
+            success(f"WAF detected: {waf_label(waf)}")
+
     sink_url = getattr(args, "sink_url", None)
     if sink_url:
         info(f"Sink URL: {sink_url} (checking this page after each injection)")
@@ -667,6 +715,9 @@ def _run_active_scan(
         output_path=getattr(args, "json_out", None),
         auth_headers=auth_headers or {},
         sink_url=sink_url,
+        scan_reflected=scan_reflected,
+        scan_stored=scan_stored,
+        scan_dom=scan_dom,
     )
 
     results = run_active_scan(urls, scan_config, post_forms=post_forms, crawled_pages=crawled_pages)
@@ -793,11 +844,48 @@ def main(argv: list[str] | None = None) -> int:
     registry = PluginRegistry()
     registry.load_from(Path(__file__).resolve().parent.parent)
 
-    # --- Active scan mode (--active) ---
-    if getattr(args, "active", False):
+    # --- Determine effective scan mode ---
+    _want_generate  = getattr(args, "generate",  False)
+    _want_reflected = getattr(args, "reflected", False)
+    _want_stored    = getattr(args, "stored",    False)
+    _want_dom       = getattr(args, "dom",       False)
+    _want_active    = getattr(args, "active",    False)  # legacy flag
+
+    _any_xss_type = _want_reflected or _want_stored or _want_dom
+    _is_active_mode = _want_active or _any_xss_type
+
+    # --active alone (legacy): enable all types
+    if _want_active and not _any_xss_type:
+        _want_reflected = True
+        _want_stored    = True
+        _want_dom       = True
+
+    # Default: no explicit flag → active scan all types
+    # --generate takes explicit precedence; XSS type flags also activate the scanner.
+    if not _want_generate and not _is_active_mode:
+        _want_reflected = True
+        _want_stored    = True
+        _want_dom       = True
+        _is_active_mode = True
+
+    # --- Active scan mode ---
+    # --generate always wins: if explicitly requested, route to payload generation
+    # even when XSS type flags are also present.
+    if _is_active_mode and not _want_generate:
         if not (args.url or args.urls):
-            parser.error("--active requires -u/--url or --urls")
-        return _run_active_scan(args, config, resolved_waf, auth_headers=auth_headers)
+            parser.error(
+                "active scanning requires -u/--url or --urls — "
+                "use -i/--input with --generate for local file payload generation"
+            )
+        return _run_active_scan(
+            args, config, resolved_waf,
+            auth_headers=auth_headers,
+            scan_reflected=_want_reflected,
+            scan_stored=_want_stored,
+            scan_dom=_want_dom,
+        )
+
+    # --- Payload generation mode (--generate or fallback) ---
 
     # --- Batch URLs mode ---
     if args.urls:
