@@ -181,8 +181,16 @@ def _run(
 
     flat_params = {k: v[0] for k, v in raw_params.items()}
 
+    # Early exit if every param is a known tracking/analytics param — probe_url
+    # would filter them all and return [], leading to a misleading "no_reflection"
+    # status. Catch it here so the status and log message are accurate.
+    from ai_xss_generator.probe import _TRACKING_PARAM_BLOCKLIST, probe_url
+    testable_params = {k for k in flat_params if k.lower() not in _TRACKING_PARAM_BLOCKLIST}
+    if not testable_params:
+        put_result(WorkerResult(url=url, status="no_params", waf=waf_hint))
+        return
+
     # ── Step 2: Probe all params for reflection + char survival ──────────────
-    from ai_xss_generator.probe import probe_url
     probe_results = probe_url(url, rate=rate, waf=waf_hint, auth_headers=auth_headers)
 
     injectable = [r for r in probe_results if r.is_injectable]
@@ -244,6 +252,9 @@ def _run(
                     break
 
                 failed_transform_names: list[str] = []
+                # Track confirmation per context — a confirmed finding on one
+                # param must not suppress escalation on a different param.
+                context_confirmed = False
 
                 for variant in variants:
                     if _timed_out():
@@ -270,12 +281,13 @@ def _run(
                         )
                         confirmed_findings.append(finding)
                         _save_finding_safe(finding, findings_lock)
+                        context_confirmed = True
                         break  # confirmed for this context — move to next param
                     else:
                         failed_transform_names.append(variant.transform_name)
 
                 # ── Step 5: No Phase 1 confirmation — try local model ─────────
-                if not confirmed_findings and not _timed_out():
+                if not context_confirmed and not _timed_out():
                     local_payloads = _get_local_payloads(
                         url=url,
                         probe_result=probe_result,
@@ -308,12 +320,13 @@ def _run(
                             )
                             confirmed_findings.append(finding)
                             _save_finding_safe(finding, findings_lock)
+                            context_confirmed = True
                             break
                         else:
                             failed_transform_names.append("local_model")
 
                 # ── Step 6: Still nothing — escalate to cloud ─────────────────
-                if not confirmed_findings and use_cloud and not _timed_out():
+                if not context_confirmed and use_cloud and not _timed_out():
                     # Each unique (endpoint + param + waf + char profile + context)
                     # combination gets exactly one cloud call.
                     surviving_chars = frozenset().union(

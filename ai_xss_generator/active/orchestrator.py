@@ -202,7 +202,7 @@ def _log_result(r: WorkerResult) -> None:
     elif r.status == "no_reflection":
         info(f"[active] no reflection — {r.url}")
     elif r.status == "no_params":
-        info(f"[active] no query params — {r.url}")
+        info(f"[active] no testable params — {r.url}")
     elif r.status == "no_execution":
         info(
             f"[active] no execution confirmed — {r.url} "

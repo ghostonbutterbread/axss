@@ -653,8 +653,7 @@ def _run_active_scan(
     report_path = write_report(results, config_summary=config_summary)
     success(f"Report written to: {report_path}")
 
-    confirmed = sum(1 for r in results if r.status == "confirmed")
-    return 0 if confirmed >= 0 else 1
+    return 0
 
 
 # ---------------------------------------------------------------------------

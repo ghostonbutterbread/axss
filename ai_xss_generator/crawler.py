@@ -207,7 +207,9 @@ def crawl(
                 final_url = url
                 for note in result.get("notes", []):
                     if note.startswith("Final URL:"):
-                        final_url = note.split("Final URL:", 1)[1].strip()
+                        extracted = note.split("Final URL:", 1)[1].strip()
+                        if extracted:
+                            final_url = extracted
                         break
 
                 raw_links = _extract_links(html, final_url)
