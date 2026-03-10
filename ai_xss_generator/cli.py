@@ -267,6 +267,28 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
             "Workers that exceed this are marked inconclusive and terminated cleanly."
         ),
     )
+    parser.add_argument(
+        "--no-crawl",
+        action="store_true",
+        default=False,
+        help=(
+            "--no-crawl  Skip site crawling and only test the provided URL directly. "
+            "By default, --active crawls the site first to discover all endpoints "
+            "with testable query parameters before scanning."
+        ),
+    )
+    parser.add_argument(
+        "--depth",
+        metavar="N",
+        type=int,
+        default=2,
+        help=(
+            "--depth N  BFS crawl depth when crawling is enabled (default: 2). "
+            "depth=1 follows links from the seed page only; depth=2 follows "
+            "links from those pages too. Higher values discover more surface "
+            "but take longer."
+        ),
+    )
 
     return parser
 
@@ -559,6 +581,56 @@ def _run_active_scan(
             success(f"WAF detected: {waf_label(detected)}")
         else:
             info("No WAF fingerprint detected.")
+
+    # Crawl to discover testable endpoints — only for single-URL mode.
+    # When --urls is given the user already knows what they want to test.
+    no_crawl = getattr(args, "no_crawl", False)
+    crawl_depth = getattr(args, "depth", 2)
+    if args.url and not no_crawl:
+        from ai_xss_generator.console import (
+            clear_status_bar, fmt_duration, set_status_bar,
+            spin_char, update_status_bar,
+        )
+        from ai_xss_generator.crawler import crawl as crawl_site
+        import time as _time
+
+        crawl_start = _time.monotonic()
+        crawl_tick = [0]
+
+        def _crawl_progress(visited: int, targets: int, depth: int) -> None:
+            crawl_tick[0] += 1
+            elapsed = _time.monotonic() - crawl_start
+            sp = spin_char(crawl_tick[0])
+            update_status_bar(
+                f"\033[2m[~] {sp} Crawling | depth {depth}/{crawl_depth} | "
+                f"{visited} pages visited | {targets} target(s) found | "
+                f"{fmt_duration(elapsed)} elapsed\033[0m"
+            )
+
+        step(f"Crawling {urls[0]} (depth={crawl_depth})...")
+        set_status_bar(
+            f"\033[2m[~] ⠋ Crawling | depth 0/{crawl_depth} | "
+            f"0 pages visited | 0 target(s) found\033[0m"
+        )
+        try:
+            crawled_urls = crawl_site(
+                urls[0],
+                depth=crawl_depth,
+                rate=args.rate,
+                waf=waf,
+                auth_headers=auth_headers,
+                on_progress=_crawl_progress,
+            )
+        finally:
+            clear_status_bar()
+
+        if crawled_urls:
+            success(
+                f"Crawl complete: {len(crawled_urls)} URL(s) with testable params discovered"
+            )
+            urls = crawled_urls
+        else:
+            info("Crawl found no URLs with testable params — testing provided URL directly")
 
     scan_config = ActiveScanConfig(
         rate=args.rate,
