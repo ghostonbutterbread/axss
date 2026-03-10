@@ -730,6 +730,7 @@ def probe_post_form(
     waf: str | None = None,
     on_result: Callable[[ProbeResult], None] | None = None,
     auth_headers: dict[str, str] | None = None,
+    crawled_pages: list[str] | None = None,
 ) -> list[ProbeResult]:
     """Probe POST form parameters for XSS reflection.
 
@@ -737,7 +738,10 @@ def probe_post_form(
       1. GETs *source_page_url* to fetch a fresh CSRF token value.
       2. POSTs *action_url* with the canary in the target param + real CSRF token.
       3. Classifies any reflections in the response.
-      4. POSTs a second time with the char probe to measure surviving chars.
+      4. If not found in the POST response, sweeps source_page_url, origin root,
+         and all *crawled_pages* for the canary (catches session-stored XSS).
+      5. POSTs a second time with the char probe; reads survival from the same
+         page that contained the reflection.
 
     When *waf* requires a real browser (akamai, cloudflare, etc.), the function
     falls back to using requests for the POST since DynamicSession is GET-only.
@@ -753,6 +757,7 @@ def probe_post_form(
         waf:             Detected WAF name.
         on_result:       Optional callback fired after each param is probed.
         auth_headers:    Extra headers (e.g. Authorization, Cookie).
+        crawled_pages:   All pages visited during the crawl — swept for stored XSS.
     """
     delay = (1.0 / rate) if rate > 0 else 0
     canary = _make_canary()
@@ -844,8 +849,10 @@ def probe_post_form(
                 import urllib.parse as _up
                 _pp = _up.urlparse(source_page_url)
                 _origin_root = f"{_pp.scheme}://{_pp.netloc}/"
+                # Priority order: source page → origin root → every crawled page.
+                # dict.fromkeys preserves order and deduplicates.
                 _follow_up_candidates = list(dict.fromkeys(
-                    [source_page_url, _origin_root]
+                    [source_page_url, _origin_root] + list(crawled_pages or [])
                 ))
                 for _fu in _follow_up_candidates:
                     try:

@@ -528,6 +528,7 @@ def run_post_worker(
     dedup_lock: Any,
     findings_lock: Any,
     auth_headers: dict[str, str] | None = None,
+    crawled_pages: list[str] | None = None,
 ) -> None:
     """Worker entry point for POST form targets. Mirrors run_worker() for GET URLs."""
     start_time = time.monotonic()
@@ -551,6 +552,7 @@ def run_post_worker(
             start_time=start_time,
             put_result=_put_result,
             auth_headers=auth_headers,
+            crawled_pages=crawled_pages,
         )
     except Exception as exc:
         log.exception("POST worker crashed for %s", post_form.action_url)
@@ -574,6 +576,7 @@ def _run_post(
     start_time: float,
     put_result: Any,
     auth_headers: dict[str, str] | None = None,
+    crawled_pages: list[str] | None = None,
 ) -> None:
     from ai_xss_generator.probe import probe_post_form
     from ai_xss_generator.active.executor import ActiveExecutor
@@ -598,6 +601,7 @@ def _run_post(
         rate=rate,
         waf=waf_hint,
         auth_headers=auth_headers,
+        crawled_pages=crawled_pages,
     )
 
     injectable = [r for r in probe_results if r.is_injectable]

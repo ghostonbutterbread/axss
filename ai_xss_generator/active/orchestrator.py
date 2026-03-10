@@ -64,6 +64,7 @@ def run_active_scan(
     urls: Sequence[str],
     config: ActiveScanConfig,
     post_forms: "Sequence[PostFormTarget]" = (),
+    crawled_pages: Sequence[str] = (),
 ) -> list[WorkerResult]:
     """Spawn isolated worker processes for each URL and collect results.
 
@@ -75,6 +76,7 @@ def run_active_scan(
     from ai_xss_generator.active.worker import run_post_worker
     url_list = [u.strip() for u in urls if u and u.strip()]
     post_form_list = list(post_forms)
+    crawled_pages_list = list(crawled_pages)
     if not url_list and not post_form_list:
         return []
 
@@ -201,6 +203,7 @@ def run_active_scan(
                             "dedup_lock": dedup_lock,
                             "findings_lock": findings_lock,
                             "auth_headers": config.auth_headers,
+                            "crawled_pages": crawled_pages_list,
                         },
                         daemon=True,
                     )

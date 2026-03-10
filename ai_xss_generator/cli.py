@@ -587,6 +587,7 @@ def _run_active_scan(
     no_crawl = getattr(args, "no_crawl", False)
     crawl_depth = getattr(args, "depth", 2)
     post_forms: list = []
+    crawled_pages: list = []
     if args.url and not no_crawl:
         from ai_xss_generator.console import (
             clear_status_bar, fmt_duration, set_status_bar,
@@ -626,6 +627,7 @@ def _run_active_scan(
             clear_status_bar()
 
         post_forms = crawl_result.post_forms
+        crawled_pages = crawl_result.visited_urls
         if crawl_result.get_urls:
             msg = f"Crawl complete: {len(crawl_result.get_urls)} GET URL(s) with testable params"
             if post_forms:
@@ -651,7 +653,7 @@ def _run_active_scan(
         auth_headers=auth_headers or {},
     )
 
-    results = run_active_scan(urls, scan_config, post_forms=post_forms)
+    results = run_active_scan(urls, scan_config, post_forms=post_forms, crawled_pages=crawled_pages)
 
     config_summary = (
         f"rate={args.rate:g} req/s | workers={scan_config.workers} | "

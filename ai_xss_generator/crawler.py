@@ -54,6 +54,7 @@ class CrawlResult:
     """Return type of crawl() — GET testable URLs and discovered POST form targets."""
     get_urls: list[str]
     post_forms: list[PostFormTarget]
+    visited_urls: list[str]  # All pages actually fetched — used for post-injection sweep
 
 
 MAX_PAGES = 300  # hard cap on pages visited per crawl session
@@ -240,6 +241,7 @@ def crawl(
 
     origin = _origin(start_url)
     visited_pages: set[str] = set()
+    all_fetched_urls: list[str] = []   # ordered list of every URL actually fetched
     seen_targets: dict[str, str] = {}
     ordered_targets: list[str] = []
     seen_post_keys: set[str] = set()   # dedup POST forms by action+param signature
@@ -261,6 +263,7 @@ def crawl(
         if not to_fetch:
             break
 
+        all_fetched_urls.extend(to_fetch)
         log.debug(
             "Crawl depth=%d: fetching %d page(s) | %d visited | %d targets so far",
             current_depth, len(to_fetch), len(visited_pages), len(seen_targets),
@@ -356,4 +359,4 @@ def crawl(
         "Crawl complete: %d page(s) visited | %d GET target(s) | %d POST form(s)",
         len(visited_pages), len(ordered_targets), len(post_forms),
     )
-    return CrawlResult(get_urls=ordered_targets, post_forms=post_forms)
+    return CrawlResult(get_urls=ordered_targets, post_forms=post_forms, visited_urls=all_fetched_urls)
