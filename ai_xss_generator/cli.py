@@ -835,8 +835,7 @@ def main(argv: list[str] | None = None) -> int:
     # --- Active probing (default for live URLs with query params) ---
     probe_enabled = args.url and not args.no_probe and "?" in args.url
     if probe_enabled:
-        param_count = len(args.url.split("?", 1)[-1].split("&")) if "?" in args.url else 0
-        step(f"Active probing: {param_count} parameter(s) × 2 requests each...")
+        step("Active probing query parameters...")
 
         live_cb = (
             None
@@ -846,7 +845,8 @@ def main(argv: list[str] | None = None) -> int:
 
         from ai_xss_generator.probe import enrich_context, probe_url
 
-        probe_results = probe_url(args.url, rate=args.rate, on_result=live_cb, auth_headers=auth_headers or None)
+        probe_results = probe_url(args.url, rate=args.rate, waf=resolved_waf, on_result=live_cb, auth_headers=auth_headers or None)
+        param_count = len(probe_results)
         injectable = sum(1 for r in probe_results if r.is_injectable)
         reflected = sum(1 for r in probe_results if r.is_reflected)
 
@@ -857,8 +857,10 @@ def main(argv: list[str] | None = None) -> int:
             )
         elif reflected:
             info(f"Probing complete: {reflected}/{param_count} parameter(s) reflected (chars filtered).")
-        else:
+        elif param_count:
             info(f"Probing complete: no reflection found in {param_count} parameter(s).")
+        else:
+            info("Probing complete: all parameters were tracking/analytics noise — nothing to probe.")
 
         context = enrich_context(context, probe_results)
 

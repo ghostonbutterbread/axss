@@ -41,42 +41,56 @@ def _c(code: str, text: str) -> str:
 
 def step(message: str) -> None:
     """[*] Informational progress step — cyan."""
+    _before_print()
     prefix = _c(CYAN, "[*]") if _tty() else "[*]"
     print(f"{prefix} {message}", flush=True)
+    _after_print()
 
 
 def success(message: str) -> None:
     """[+] Success — green."""
+    _before_print()
     prefix = _c(GREEN, "[+]") if _tty() else "[+]"
     print(f"{prefix} {message}", flush=True)
+    _after_print()
 
 
 def warn(message: str) -> None:
     """[!] Warning — yellow."""
+    _before_print()
     prefix = _c(YELLOW, "[!]") if _tty() else "[!]"
     print(f"{prefix} {message}", flush=True)
+    _after_print()
 
 
 def error(message: str) -> None:
     """[-] Error — red."""
+    _before_print()
     prefix = _c(RED, "[-]") if _tty() else "[-]"
     print(f"{prefix} {message}", flush=True)
+    _after_print()
 
 
 def info(message: str) -> None:
     """[~] Secondary info — magenta."""
+    _before_print()
     prefix = _c(MAGENTA, "[~]") if _tty() else "[~]"
     print(f"{prefix} {message}", flush=True)
+    _after_print()
 
 
 def header(message: str) -> None:
     """Bold cyan header line."""
+    _before_print()
     print(_c(BOLD + BRIGHT_CYAN, message), flush=True)
+    _after_print()
 
 
 def dim_line(message: str) -> None:
     """Dimmed supporting text."""
+    _before_print()
     print(_c(DIM, message), flush=True)
+    _after_print()
 
 
 def risk_color(score: int) -> str:
@@ -101,3 +115,69 @@ def colorize_score(score: int) -> str:
 def waf_label(name: str) -> str:
     """Magenta WAF name."""
     return _c(MAGENTA + BOLD, name)
+
+
+# ---------------------------------------------------------------------------
+# Persistent status bar — a single line pinned to the current cursor position
+# that is erased before any log output and redrawn after.
+# ---------------------------------------------------------------------------
+
+_status_text: str = ""
+_status_active: bool = False
+
+_SPIN_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+def _before_print() -> None:
+    """Erase the status bar line so the upcoming print lands cleanly."""
+    if _status_active and _tty():
+        sys.stdout.write("\r\033[2K")
+        # No explicit flush — the print() call flushes immediately after.
+
+
+def _after_print() -> None:
+    """Redraw the status bar after a log line has been emitted."""
+    if _status_active and _status_text and _tty():
+        sys.stdout.write(_status_text)
+        sys.stdout.flush()
+
+
+def set_status_bar(text: str) -> None:
+    """Activate the status bar and render *text* on the current line."""
+    global _status_text, _status_active
+    _status_active = True
+    _status_text = text
+    if _tty():
+        sys.stdout.write("\r\033[2K" + text)
+        sys.stdout.flush()
+
+
+def update_status_bar(text: str) -> None:
+    """Overwrite the status bar text in-place."""
+    global _status_text
+    _status_text = text
+    if _status_active and _tty():
+        sys.stdout.write("\r\033[2K" + text)
+        sys.stdout.flush()
+
+
+def clear_status_bar() -> None:
+    """Erase the status bar line and deactivate it."""
+    global _status_active, _status_text
+    if _tty() and _status_active:
+        sys.stdout.write("\r\033[2K")
+        sys.stdout.flush()
+    _status_active = False
+    _status_text = ""
+
+
+def fmt_duration(seconds: float) -> str:
+    """Return MM:SS string for *seconds*."""
+    m = int(seconds) // 60
+    s = int(seconds) % 60
+    return f"{m:02d}:{s:02d}"
+
+
+def spin_char(tick: int) -> str:
+    """Return the spinner character for *tick*."""
+    return _SPIN_FRAMES[tick % len(_SPIN_FRAMES)]

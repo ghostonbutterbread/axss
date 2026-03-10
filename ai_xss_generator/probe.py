@@ -9,6 +9,7 @@ to the AI generator, so payloads are targeted to confirmed contexts.
 """
 from __future__ import annotations
 
+import logging
 import os
 import re
 import secrets
@@ -19,9 +20,65 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote as url_quote
 
+log = logging.getLogger(__name__)
+
 from scrapling.fetchers import FetcherSession
 
 from ai_xss_generator.types import DomSink, ParsedContext, PayloadCandidate
+
+# curl error code for HTTP/2 stream reset — server/WAF rejected the connection
+_CURL_HTTP2_STREAM_ERROR = 92
+
+# WAFs that require a real browser for TLS fingerprinting / JS challenge
+_BROWSER_REQUIRED_WAFS: frozenset[str] = frozenset({
+    "akamai", "cloudflare", "datadome", "kasada", "perimeterx",
+})
+
+# Known tracking/analytics params that are never reflected in meaningful page
+# content. Probing these wastes requests and produces false negatives.
+_TRACKING_PARAM_BLOCKLIST: frozenset[str] = frozenset({
+    # Google Analytics / UTM
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+    "utm_id", "utm_keyword", "utm_source_platform", "utm_creative_format", "utm_marketing_tactic",
+    # Google Ads click IDs
+    "gclid", "gclsrc", "dclid",
+    # Meta / Facebook
+    "fbclid", "fb_action_ids", "fb_action_types", "fb_source", "fb_ref",
+    # Microsoft / Bing
+    "msclkid",
+    # TikTok
+    "ttclid",
+    # Twitter / X
+    "twclid",
+    # LinkedIn
+    "li_fat_id",
+    # Pinterest
+    "epik",
+    # Snapchat
+    "sccid",
+    # Rakuten / LinkShare affiliate
+    "ranmid", "raneaid", "ransiteid",
+    # CJ Affiliate
+    "cjevent",
+    # Impact / Radius
+    "irclickid",
+    # ShareASale
+    "sscid",
+    # Generic affiliate click IDs
+    "clickid", "click_id", "affiliate_id",
+    # Mailchimp
+    "mc_eid", "mc_cid",
+    # Klaviyo
+    "_kx",
+    # Marketo
+    "mkt_tok",
+    # Drip
+    "__s",
+    # Google Analytics cross-domain linker
+    "_ga", "_gl",
+    # HubSpot
+    "hsctatracking",
+})
 
 
 # XSS-critical characters to test for survival after server processing
@@ -387,6 +444,20 @@ def _rebuild_url(url: str, params: dict[str, str]) -> str:
     )
 
 
+def _session_get(session: Any, url: str, req_kwargs: dict[str, Any]) -> Any:
+    """FetcherSession.get with automatic HTTP/1.1 retry on HTTP/2 stream reset."""
+    try:
+        return session.get(url, **req_kwargs)
+    except Exception as exc:
+        if f"({_CURL_HTTP2_STREAM_ERROR})" in str(exc):
+            try:
+                from scrapling.engines.static import CurlHttpVersion
+                return session.get(url, **req_kwargs, http_version=CurlHttpVersion.V1_1)
+            except Exception:
+                raise exc
+        raise
+
+
 def _probe_param(
     session: Any,
     url: str,
@@ -411,7 +482,7 @@ def _probe_param(
     if delay > 0:
         time.sleep(delay)
     try:
-        resp1 = session.get(_rebuild_url(url, {**all_params, param_name: canary}), **req_kwargs)
+        resp1 = _session_get(session, _rebuild_url(url, {**all_params, param_name: canary}), req_kwargs)
     except Exception as exc:
         return ProbeResult(param_name=param_name, original_value=original_value, error=str(exc))
 
@@ -424,8 +495,72 @@ def _probe_param(
     if delay > 0:
         time.sleep(delay)
     try:
-        resp2 = session.get(
-            _rebuild_url(url, {**all_params, param_name: char_probe}), **req_kwargs
+        resp2 = _session_get(session, _rebuild_url(url, {**all_params, param_name: char_probe}), req_kwargs)
+        surviving = _analyze_char_survival(_resp_html(resp2), canary)
+    except Exception:
+        surviving = frozenset()
+
+    return ProbeResult(
+        param_name=param_name,
+        original_value=original_value,
+        reflections=[
+            ReflectionContext(
+                context_type=ctx.context_type,
+                attr_name=ctx.attr_name,
+                surviving_chars=surviving,
+                snippet=ctx.snippet,
+            )
+            for ctx in reflections
+        ],
+    )
+
+
+def _probe_param_playwright(
+    dyn_session: Any,
+    url: str,
+    param_name: str,
+    original_value: str,
+    all_params: dict[str, str],
+    *,
+    canary: str,
+    delay: float,
+    ua_cycle: Any,
+    proxy_cycle: Any | None,
+    auth_headers: dict[str, str] | None = None,
+) -> ProbeResult:
+    """Probe a single parameter using a shared Playwright browser session.
+
+    Used when WAF detection indicates a real browser is required (akamai,
+    cloudflare, datadome, etc.). The caller holds the DynamicSession context
+    open across all parameter probes for the same URL so only one browser
+    launch is needed.
+    """
+    extra_headers: dict[str, str] = {**(auth_headers or {}), "User-Agent": next(ua_cycle)}
+    fetch_kwargs: dict[str, Any] = {"extra_headers": extra_headers}
+    if proxy_cycle:
+        fetch_kwargs["proxy"] = next(proxy_cycle)
+
+    # Phase 1 — reflection mapping
+    if delay > 0:
+        time.sleep(delay)
+    try:
+        resp1 = dyn_session.fetch(
+            _rebuild_url(url, {**all_params, param_name: canary}), **fetch_kwargs
+        )
+    except Exception as exc:
+        return ProbeResult(param_name=param_name, original_value=original_value, error=str(exc))
+
+    reflections = _find_reflections(_resp_html(resp1), canary)
+    if not reflections:
+        return ProbeResult(param_name=param_name, original_value=original_value)
+
+    # Phase 2 — character survival
+    char_probe = canary + _PROBE_OPEN + PROBE_CHARS + _PROBE_CLOSE
+    if delay > 0:
+        time.sleep(delay)
+    try:
+        resp2 = dyn_session.fetch(
+            _rebuild_url(url, {**all_params, param_name: char_probe}), **fetch_kwargs
         )
         surviving = _analyze_char_survival(_resp_html(resp2), canary)
     except Exception:
@@ -450,6 +585,7 @@ def probe_url(
     url: str,
     *,
     rate: float = 25.0,
+    waf: str | None = None,
     on_result: Callable[[ProbeResult], None] | None = None,
     auth_headers: dict[str, str] | None = None,
 ) -> list[ProbeResult]:
@@ -459,9 +595,17 @@ def probe_url(
     1. Canary reflection probe → maps where input lands in the response.
     2. Character survival probe → determines which XSS chars survive filters.
 
+    Tracking/analytics parameters (utm_*, gclid, fbclid, ranMID, etc.) are
+    silently skipped — they are never reflected in meaningful page content.
+
+    When *waf* indicates a browser-required WAF (akamai, cloudflare, etc.),
+    a single Playwright browser session handles all probe requests instead of
+    curl_cffi so TLS fingerprint and JS challenges are handled correctly.
+
     Args:
         url:          Target URL with query parameters to test.
         rate:         Max requests per second (0 = uncapped). Shared with ``--rate``.
+        waf:          Detected WAF name. Controls which fetch strategy is used.
         on_result:    Callback fired after each parameter finishes probing.
         auth_headers: Extra headers (e.g. Authorization, Cookie) merged into
                       every probe request for authenticated scanning.
@@ -473,7 +617,20 @@ def probe_url(
     if not raw_params:
         return []
 
-    flat_params = {k: v[0] for k, v in raw_params.items()}
+    flat_params_all = {k: v[0] for k, v in raw_params.items()}
+
+    # Drop known tracking/analytics params — they are never XSS-injectable
+    blocked = {k for k in flat_params_all if k.lower() in _TRACKING_PARAM_BLOCKLIST}
+    flat_params = {k: v for k, v in flat_params_all.items() if k not in blocked}
+    if blocked:
+        log.info(
+            "Skipping %d tracking/analytics param(s): %s",
+            len(blocked), ", ".join(sorted(blocked)),
+        )
+    if not flat_params:
+        log.debug("All params filtered by tracking blocklist — nothing to probe.")
+        return []
+
     delay = (1.0 / rate) if rate > 0 else 0
     canary = _make_canary()
 
@@ -485,22 +642,38 @@ def probe_url(
     proxy_cycle = cycle(proxies_list) if proxies_list else None
 
     results: list[ProbeResult] = []
-    with FetcherSession(
-        impersonate="chrome",
-        stealthy_headers=True,
-        timeout=20,
-        follow_redirects=True,
-        retries=1,
-    ) as session:
-        for param_name, original_value in flat_params.items():
-            result = _probe_param(
-                session, url, param_name, original_value, flat_params,
-                canary=canary, delay=delay, ua_cycle=ua_cycle, proxy_cycle=proxy_cycle,
-                auth_headers=auth_headers,
-            )
-            results.append(result)
-            if on_result:
-                on_result(result)
+    needs_browser = waf is not None and waf.lower() in _BROWSER_REQUIRED_WAFS
+
+    if needs_browser:
+        log.info("WAF=%s — using Playwright for probe requests", waf)
+        from scrapling.fetchers import DynamicSession
+        with DynamicSession(headless=True, timeout=45_000) as dyn:
+            for param_name, original_value in flat_params.items():
+                result = _probe_param_playwright(
+                    dyn, url, param_name, original_value, flat_params,
+                    canary=canary, delay=delay, ua_cycle=ua_cycle, proxy_cycle=proxy_cycle,
+                    auth_headers=auth_headers,
+                )
+                results.append(result)
+                if on_result:
+                    on_result(result)
+    else:
+        with FetcherSession(
+            impersonate="chrome",
+            stealthy_headers=True,
+            timeout=20,
+            follow_redirects=True,
+            retries=1,
+        ) as session:
+            for param_name, original_value in flat_params.items():
+                result = _probe_param(
+                    session, url, param_name, original_value, flat_params,
+                    canary=canary, delay=delay, ua_cycle=ua_cycle, proxy_cycle=proxy_cycle,
+                    auth_headers=auth_headers,
+                )
+                results.append(result)
+                if on_result:
+                    on_result(result)
 
     return results
 

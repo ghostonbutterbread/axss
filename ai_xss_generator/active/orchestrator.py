@@ -26,7 +26,10 @@ from dataclasses import dataclass, field
 from typing import Sequence
 
 from ai_xss_generator.active.worker import WorkerResult, run_worker
-from ai_xss_generator.console import info, step, success, warn
+from ai_xss_generator.console import (
+    clear_status_bar, fmt_duration, info, set_status_bar,
+    spin_char, step, success, update_status_bar, warn,
+)
 
 log = logging.getLogger(__name__)
 
@@ -88,6 +91,25 @@ def run_active_scan(
 
     url_iter = iter(url_list)
     completed = 0
+    scan_start = time.monotonic()
+    tick = 0  # spinner frame counter
+
+    def _fmt_status() -> str:
+        elapsed = time.monotonic() - scan_start
+        remaining = len(url_list) - completed
+        if completed > 0:
+            avg = elapsed / completed
+            eta_str = f"ETA ~{fmt_duration(avg * remaining)}"
+        else:
+            eta_str = "ETA ~?"
+        sp = spin_char(tick)
+        return (
+            f"\033[2m[~] {sp} Scanning | "
+            f"{completed}/{len(url_list)} URLs done | "
+            f"{len(active_procs)} active | "
+            f"{fmt_duration(elapsed)} elapsed | "
+            f"{eta_str}\033[0m"
+        )
 
     def _drain_queue() -> None:
         # Use a short timeout rather than get_nowait() so results aren't lost
@@ -111,12 +133,12 @@ def run_active_scan(
             if not proc.is_alive():
                 proc.join(timeout=1)
                 completed += 1
-                still_running_count = len(active_procs) - 1
                 log.debug("Worker done for %s (%d/%d)", purl, completed, len(url_list))
             else:
                 still_running.append((proc, purl))
         active_procs = still_running
 
+    set_status_bar(_fmt_status())
     try:
         while completed < len(url_list):
             _drain_queue()
@@ -151,6 +173,8 @@ def run_active_scan(
                 active_procs.append((proc, next_url))
                 info(f"[worker] started → {next_url}")
 
+            tick += 1
+            update_status_bar(_fmt_status())
             time.sleep(0.25)
 
     except KeyboardInterrupt:
@@ -158,6 +182,7 @@ def run_active_scan(
         for proc, _ in active_procs:
             proc.terminate()
     finally:
+        clear_status_bar()
         # Final drain after all processes finish
         for proc, _ in active_procs:
             proc.join(timeout=config.timeout_seconds + 5)

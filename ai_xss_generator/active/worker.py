@@ -183,7 +183,7 @@ def _run(
 
     # ── Step 2: Probe all params for reflection + char survival ──────────────
     from ai_xss_generator.probe import probe_url
-    probe_results = probe_url(url, rate=rate, auth_headers=auth_headers)
+    probe_results = probe_url(url, rate=rate, waf=waf_hint, auth_headers=auth_headers)
 
     injectable = [r for r in probe_results if r.is_injectable]
     reflected  = [r for r in probe_results if r.is_reflected]
