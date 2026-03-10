@@ -106,6 +106,7 @@ class ActiveExecutor:
         payload: str,
         all_params: dict[str, str],
         transform_name: str,
+        sink_url: str | None = None,
     ) -> ExecutionResult:
         """Navigate to *url* with *payload* injected into *param_name*.
 
@@ -192,6 +193,14 @@ class ActiveExecutor:
                 if not confirmed:
                     log.debug("Navigation error for %s: %s", fired_url, nav_exc)
 
+            # --sink-url: navigate to the user-specified render page to catch
+            # GET-based stored XSS where the payload shows up elsewhere.
+            if sink_url and not confirmed:
+                try:
+                    page.goto(sink_url, timeout=_NAV_TIMEOUT_MS, wait_until="domcontentloaded")
+                except Exception as _nav_exc:
+                    log.debug("fire: sink_url nav error for %s: %s", sink_url, _nav_exc)
+
         except Exception as exc:
             return ExecutionResult(
                 confirmed=False,
@@ -229,6 +238,7 @@ class ActiveExecutor:
         all_param_names: list[str],
         csrf_field: str | None,
         transform_name: str,
+        sink_url: str | None = None,
     ) -> "ExecutionResult":
         """Navigate to *source_page_url*, fill *param_name* with *payload*, submit the form.
 
@@ -352,7 +362,11 @@ class ActiveExecutor:
                 import urllib.parse as _up
                 _pp = _up.urlparse(source_page_url)
                 _origin_root = f"{_pp.scheme}://{_pp.netloc}/"
-                for _fu in dict.fromkeys([source_page_url, _origin_root]):
+                # sink_url (manually specified) is first — highest priority
+                _follow_ups = list(dict.fromkeys(
+                    ([sink_url] if sink_url else []) + [source_page_url, _origin_root]
+                ))
+                for _fu in _follow_ups:
                     if confirmed:
                         break
                     try:

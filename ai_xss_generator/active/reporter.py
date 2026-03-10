@@ -51,10 +51,8 @@ def write_report(
 def _build_report(results: Sequence[WorkerResult], config_summary: str) -> str:
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    confirmed_results  = [r for r in results if r.status == "confirmed"]
-    no_exec_results    = [r for r in results if r.status == "no_execution"]
-    no_reflect_results = [r for r in results if r.status in ("no_reflection", "no_params")]
-    error_results      = [r for r in results if r.status == "error"]
+    confirmed_results = [r for r in results if r.status == "confirmed"]
+    error_results     = [r for r in results if r.status == "error"]
 
     all_findings: list[ConfirmedFinding] = [
         f for r in confirmed_results for f in r.confirmed_findings
@@ -69,7 +67,7 @@ def _build_report(results: Sequence[WorkerResult], config_summary: str) -> str:
         "# axss Active Scan Report",
         "",
         f"**Generated:** {now}  ",
-        f"**Targets scanned:** {len(results)} URL(s) across {len(domains)} domain(s)  ",
+        f"**Targets scanned:** {len(results)} target(s) across {len(domains)} domain(s)  ",
         f"**Domains:** {', '.join(domains) if domains else 'n/a'}  ",
     ]
     if config_summary:
@@ -90,38 +88,9 @@ def _build_report(results: Sequence[WorkerResult], config_summary: str) -> str:
             "",
             "_No confirmed XSS execution was detected._",
             "",
-        ]
-
-    # ── Reflected but no execution ────────────────────────────────────────────
-    if no_exec_results:
-        lines += [
-            f"## ⚠️  Reflected but Not Confirmed ({len(no_exec_results)})",
+            "---",
             "",
-            "Input was reflected in the response but no payload achieved confirmed execution.",
-            "",
-            "| URL | Params Tested | Params Reflected | Payloads Tried | Cloud Escalated |",
-            "|-----|:---:|:---:|:---:|:---:|",
         ]
-        for r in no_exec_results:
-            cloud_flag = "✓" if r.cloud_escalated else "—"
-            lines.append(
-                f"| `{r.url}` | {r.params_tested} | {r.params_reflected} "
-                f"| {r.transforms_tried} | {cloud_flag} |"
-            )
-        lines.append("")
-
-    # ── No reflection ─────────────────────────────────────────────────────────
-    if no_reflect_results:
-        lines += [
-            f"## ➖ No Reflection Found ({len(no_reflect_results)})",
-            "",
-            "| URL | Reason |",
-            "|-----|--------|",
-        ]
-        for r in no_reflect_results:
-            reason = "No query parameters" if r.status == "no_params" else "Parameters not reflected in response"
-            lines.append(f"| `{r.url}` | {reason} |")
-        lines.append("")
 
     # ── Errors ────────────────────────────────────────────────────────────────
     if error_results:
@@ -142,16 +111,15 @@ def _build_report(results: Sequence[WorkerResult], config_summary: str) -> str:
         "",
         "## Known Limitations",
         "",
-        "The following XSS types were **not tested** in this scan and are deferred "
-        "to future versions:",
-        "",
-        "- **Stored XSS:** Input fields that persist to other pages were not followed. "
-          "Parameters are tested for immediate reflection only.",
+        "- **Stored XSS (partial):** Post-injection sweep checks all pages visited "
+          "during crawl. Payloads stored and rendered on pages outside the crawl "
+          "boundary (admin panels, other users' sessions) require `--sink-url` or "
+          "blind XSS to detect.",
         "- **DOM XSS (fragment/hash):** Client-side sinks driven by `location.hash` or "
           "`location.search` without a server round-trip are not covered.",
         "- **Cloud model web search:** Bypass reasoning is based on the cloud model's "
-          "training knowledge only. Novel WAF bypasses published after the training cutoff "
-          "may be missed. Web search integration is planned.",
+          "training knowledge only. Novel WAF bypasses published after the training "
+          "cutoff may be missed.",
         "",
     ]
 

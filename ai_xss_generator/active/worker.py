@@ -116,6 +116,7 @@ def run_worker(
     dedup_lock: Any,
     findings_lock: Any,
     auth_headers: dict[str, str] | None = None,
+    sink_url: str | None = None,
 ) -> None:
     """Target function for multiprocessing.Process.
 
@@ -145,6 +146,7 @@ def run_worker(
             start_time=start_time,
             put_result=_put_result,
             auth_headers=auth_headers,
+            sink_url=sink_url,
         )
     except Exception as exc:
         log.exception("Worker crashed for %s", url)
@@ -167,6 +169,7 @@ def _run(
     start_time: float,
     put_result: Any,
     auth_headers: dict[str, str] | None = None,
+    sink_url: str | None = None,
 ) -> None:
     deadline = start_time + timeout_seconds
 
@@ -192,7 +195,7 @@ def _run(
         return
 
     # ── Step 2: Probe all params for reflection + char survival ──────────────
-    probe_results = probe_url(url, rate=rate, waf=waf_hint, auth_headers=auth_headers)
+    probe_results = probe_url(url, rate=rate, waf=waf_hint, auth_headers=auth_headers, sink_url=sink_url)
 
     injectable = [r for r in probe_results if r.is_injectable]
     reflected  = [r for r in probe_results if r.is_reflected]
@@ -268,6 +271,7 @@ def _run(
                         payload=variant.payload,
                         all_params=flat_params,
                         transform_name=variant.transform_name,
+                        sink_url=sink_url,
                     )
 
                     if result.confirmed:
@@ -308,6 +312,7 @@ def _run(
                             payload=lp,
                             all_params=flat_params,
                             transform_name="local_model",
+                            sink_url=sink_url,
                         )
                         if result.confirmed:
                             finding = _make_finding(
@@ -366,6 +371,7 @@ def _run(
                             payload=cp,
                             all_params=flat_params,
                             transform_name="cloud_model",
+                            sink_url=sink_url,
                         )
                         if result.confirmed:
                             finding = _make_finding(
@@ -529,6 +535,7 @@ def run_post_worker(
     findings_lock: Any,
     auth_headers: dict[str, str] | None = None,
     crawled_pages: list[str] | None = None,
+    sink_url: str | None = None,
 ) -> None:
     """Worker entry point for POST form targets. Mirrors run_worker() for GET URLs."""
     start_time = time.monotonic()
@@ -553,6 +560,7 @@ def run_post_worker(
             put_result=_put_result,
             auth_headers=auth_headers,
             crawled_pages=crawled_pages,
+            sink_url=sink_url,
         )
     except Exception as exc:
         log.exception("POST worker crashed for %s", post_form.action_url)
@@ -577,6 +585,7 @@ def _run_post(
     put_result: Any,
     auth_headers: dict[str, str] | None = None,
     crawled_pages: list[str] | None = None,
+    sink_url: str | None = None,
 ) -> None:
     from ai_xss_generator.probe import probe_post_form
     from ai_xss_generator.active.executor import ActiveExecutor
@@ -602,6 +611,7 @@ def _run_post(
         waf=waf_hint,
         auth_headers=auth_headers,
         crawled_pages=crawled_pages,
+        sink_url=sink_url,
     )
 
     injectable = [r for r in probe_results if r.is_injectable]
@@ -669,6 +679,7 @@ def _run_post(
                         all_param_names=post_form.param_names,
                         csrf_field=post_form.csrf_field,
                         transform_name=variant.transform_name,
+                        sink_url=sink_url,
                     )
 
                     if result.confirmed:
@@ -726,6 +737,7 @@ def _run_post(
                             all_param_names=post_form.param_names,
                             csrf_field=post_form.csrf_field,
                             transform_name="cloud_model",
+                            sink_url=sink_url,
                         )
                         if result.confirmed:
                             finding = _make_finding(

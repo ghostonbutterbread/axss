@@ -601,6 +601,7 @@ def probe_url(
     waf: str | None = None,
     on_result: Callable[[ProbeResult], None] | None = None,
     auth_headers: dict[str, str] | None = None,
+    sink_url: str | None = None,
 ) -> list[ProbeResult]:
     """Probe all query parameters of *url* for XSS reflection contexts.
 
@@ -684,6 +685,43 @@ def probe_url(
                     canary=canary, delay=delay, ua_cycle=ua_cycle, proxy_cycle=proxy_cycle,
                     auth_headers=auth_headers,
                 )
+                # --sink-url: if the immediate GET response had no reflection,
+                # check the user-specified sink page (session cookies carry the
+                # injected canary for session-stored GET XSS).
+                if sink_url and not result.reflections and not result.error:
+                    try:
+                        if delay > 0:
+                            time.sleep(delay)
+                        _sink_resp = _session_get(session, sink_url, {"headers": {"User-Agent": next(ua_cycle)}})
+                        _sink_refs = _find_reflections(_resp_html(_sink_resp), canary)
+                        if _sink_refs:
+                            # Char survival: re-inject with char probe, then re-check sink_url
+                            _char_probe = canary + _PROBE_OPEN + PROBE_CHARS + _PROBE_CLOSE
+                            _char_url = _rebuild_url(url, {**flat_params, param_name: _char_probe})
+                            if delay > 0:
+                                time.sleep(delay)
+                            _session_get(session, _char_url, {"headers": {"User-Agent": next(ua_cycle)}})
+                            if delay > 0:
+                                time.sleep(delay)
+                            _sink_resp2 = _session_get(session, sink_url, {"headers": {"User-Agent": next(ua_cycle)}})
+                            _surviving = _analyze_char_survival(_resp_html(_sink_resp2), canary)
+                            result = ProbeResult(
+                                param_name=param_name,
+                                original_value=original_value,
+                                reflections=[
+                                    ReflectionContext(
+                                        context_type=ctx.context_type,
+                                        attr_name=ctx.attr_name,
+                                        surviving_chars=_surviving,
+                                        snippet=ctx.snippet,
+                                        context_before=ctx.context_before,
+                                    )
+                                    for ctx in _sink_refs
+                                ],
+                            )
+                            log.debug("probe_url: canary found in sink_url %s for param %s", sink_url, param_name)
+                    except Exception as _exc:
+                        log.debug("probe_url: sink_url check failed for %s: %s", sink_url, _exc)
                 results.append(result)
                 if on_result:
                     on_result(result)
@@ -731,6 +769,7 @@ def probe_post_form(
     on_result: Callable[[ProbeResult], None] | None = None,
     auth_headers: dict[str, str] | None = None,
     crawled_pages: list[str] | None = None,
+    sink_url: str | None = None,
 ) -> list[ProbeResult]:
     """Probe POST form parameters for XSS reflection.
 
@@ -851,8 +890,11 @@ def probe_post_form(
                 _origin_root = f"{_pp.scheme}://{_pp.netloc}/"
                 # Priority order: source page → origin root → every crawled page.
                 # dict.fromkeys preserves order and deduplicates.
+                # sink_url (manually specified) is checked first — highest priority
                 _follow_up_candidates = list(dict.fromkeys(
-                    [source_page_url, _origin_root] + list(crawled_pages or [])
+                    ([sink_url] if sink_url else [])
+                    + [source_page_url, _origin_root]
+                    + list(crawled_pages or [])
                 ))
                 for _fu in _follow_up_candidates:
                     try:

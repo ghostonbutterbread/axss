@@ -289,6 +289,17 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
             "but take longer."
         ),
     )
+    parser.add_argument(
+        "--sink-url",
+        metavar="URL",
+        default=None,
+        help=(
+            "--sink-url URL  After each injection, navigate to URL to check for "
+            "XSS execution there. Use when the injected value is stored server-side "
+            "and rendered on a different page (e.g. username shown on /profile after "
+            "being set via a POST form). Checked before auto-discovered follow-up pages."
+        ),
+    )
 
     return parser
 
@@ -641,6 +652,10 @@ def _run_active_scan(
             info("Crawl found no URLs with testable params — testing provided URL directly")
             post_forms = []
 
+    sink_url = getattr(args, "sink_url", None)
+    if sink_url:
+        info(f"Sink URL: {sink_url} (checking this page after each injection)")
+
     scan_config = ActiveScanConfig(
         rate=args.rate,
         workers=getattr(args, "workers", 1),
@@ -651,6 +666,7 @@ def _run_active_scan(
         timeout_seconds=getattr(args, "timeout", 300),
         output_path=getattr(args, "json_out", None),
         auth_headers=auth_headers or {},
+        sink_url=sink_url,
     )
 
     results = run_active_scan(urls, scan_config, post_forms=post_forms, crawled_pages=crawled_pages)

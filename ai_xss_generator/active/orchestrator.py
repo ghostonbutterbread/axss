@@ -48,6 +48,7 @@ class ActiveScanConfig:
     timeout_seconds: int = 300     # 5 minutes per URL
     output_path: str | None = None  # markdown report output; None = auto
     auth_headers: dict[str, str] = field(default_factory=dict)
+    sink_url: str | None = None    # manual sink page for stored XSS (--sink-url)
 
 
 def _auto_workers(rate: float, explicit_workers: int) -> int:
@@ -182,6 +183,7 @@ def run_active_scan(
                             "dedup_lock": dedup_lock,
                             "findings_lock": findings_lock,
                             "auth_headers": config.auth_headers,
+                            "sink_url": config.sink_url,
                         },
                         daemon=True,
                     )
@@ -204,6 +206,7 @@ def run_active_scan(
                             "findings_lock": findings_lock,
                             "auth_headers": config.auth_headers,
                             "crawled_pages": crawled_pages_list,
+                            "sink_url": config.sink_url,
                         },
                         daemon=True,
                     )
@@ -233,15 +236,16 @@ def run_active_scan(
 
 
 def _log_result(r: WorkerResult) -> None:
+    import urllib.parse as _up
     if r.status == "confirmed":
         success(
             f"[active] CONFIRMED {len(r.confirmed_findings)} finding(s) — {r.url} "
             f"({'cloud' if r.cloud_escalated else 'local'})"
         )
-    elif r.status == "no_reflection":
-        info(f"[active] no reflection — {r.url}")
-    elif r.status == "no_params":
-        info(f"[active] no testable params — {r.url}")
+        for f in r.confirmed_findings:
+            # Unquote so full-width / half-width chars display as-is, not percent-encoded
+            display_url = _up.unquote(f.fired_url)
+            success(f"  ↳ [{f.param_name}] {display_url}")
     elif r.status == "no_execution":
         info(
             f"[active] no execution confirmed — {r.url} "
@@ -254,16 +258,24 @@ def _log_result(r: WorkerResult) -> None:
 
 
 def _print_summary(results: list[WorkerResult]) -> None:
+    import urllib.parse as _up
     confirmed = [r for r in results if r.status == "confirmed"]
-    total_findings = sum(len(r.confirmed_findings) for r in confirmed)
+    all_findings = [f for r in confirmed for f in r.confirmed_findings]
     errors = [r for r in results if r.status == "error"]
 
     info(f"\n{'─'*60}")
-    info(f"Active scan complete: {len(results)} URL(s) processed")
-    if total_findings:
-        success(f"  ✅ Confirmed XSS: {total_findings} finding(s) across {len(confirmed)} URL(s)")
+    info(f"Active scan complete: {len(results)} target(s) processed")
+    if all_findings:
+        success(f"  ✅ Confirmed XSS: {len(all_findings)} finding(s) across {len(confirmed)} target(s)")
+        info("")
+        for i, f in enumerate(all_findings, 1):
+            success(f"  Finding {i} — param: {f.param_name}  context: {f.context_type}  via: {f.execution_method}")
+            success(f"  Payload:   {f.payload}")
+            success(f"  URL:       {_up.unquote(f.fired_url)}")
+            if i < len(all_findings):
+                info("")
     else:
         info("  ➖ No confirmed XSS execution detected")
     if errors:
-        warn(f"  ⚠️  Errors: {len(errors)} URL(s) failed")
+        warn(f"  ⚠️  Errors: {len(errors)} target(s) failed")
     info(f"{'─'*60}\n")
