@@ -833,6 +833,38 @@ def probe_post_form(
                 continue
 
             reflections = _find_reflections(html1, canary)
+
+            # --- Follow-up page check for session-stored XSS ---
+            # If the POST response itself doesn't reflect the canary, the input
+            # may be stored server-side and reflected on a subsequent page load
+            # (e.g. "Hello {name}" on the index page after a "Name saved" POST).
+            # Check source_page_url and the origin root as common reflection sites.
+            follow_up_url: str | None = None
+            if not reflections:
+                import urllib.parse as _up
+                _pp = _up.urlparse(source_page_url)
+                _origin_root = f"{_pp.scheme}://{_pp.netloc}/"
+                _follow_up_candidates = list(dict.fromkeys(
+                    [source_page_url, _origin_root]
+                ))
+                for _fu in _follow_up_candidates:
+                    try:
+                        if delay > 0:
+                            time.sleep(delay)
+                        _fu_resp = _session_get(session, _fu, req_kwargs)
+                        _fu_html = _resp_html(_fu_resp)
+                        _fu_refs = _find_reflections(_fu_html, canary)
+                        if _fu_refs:
+                            reflections = _fu_refs
+                            follow_up_url = _fu
+                            log.debug(
+                                "POST probe: canary found on follow-up page %s (session-stored)",
+                                _fu,
+                            )
+                            break
+                    except Exception:
+                        pass
+
             if not reflections:
                 result = ProbeResult(param_name=param_name, original_value="")
                 results.append(result)
@@ -870,7 +902,18 @@ def probe_post_form(
                 char_body[param_name] = char_probe_val
 
                 resp2 = session.post(action_url, data=char_body, **req_kwargs)
-                surviving = _analyze_char_survival(_resp_html(resp2), canary)
+
+                if follow_up_url:
+                    # Char survival is on the follow-up page, not the POST response.
+                    if delay > 0:
+                        time.sleep(delay)
+                    try:
+                        _fu_resp2 = _session_get(session, follow_up_url, req_kwargs)
+                        surviving = _analyze_char_survival(_resp_html(_fu_resp2), canary)
+                    except Exception:
+                        pass
+                else:
+                    surviving = _analyze_char_survival(_resp_html(resp2), canary)
             except Exception:
                 pass
 

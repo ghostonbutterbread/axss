@@ -343,6 +343,23 @@ class ActiveExecutor:
             except Exception as submit_exc:
                 log.debug("fire_post: submit error: %s", submit_exc)
 
+            # Step 4: Navigate to follow-up pages to catch session-stored XSS.
+            # After the form POST, the payload may be stored server-side and
+            # reflected (unescaped) on a subsequent page — most commonly the
+            # origin root or the source form page.  Navigate to both so the
+            # existing dialog/console/network hooks can detect execution there.
+            if not confirmed:
+                import urllib.parse as _up
+                _pp = _up.urlparse(source_page_url)
+                _origin_root = f"{_pp.scheme}://{_pp.netloc}/"
+                for _fu in dict.fromkeys([source_page_url, _origin_root]):
+                    if confirmed:
+                        break
+                    try:
+                        page.goto(_fu, timeout=_NAV_TIMEOUT_MS, wait_until="domcontentloaded")
+                    except Exception as _nav_exc:
+                        log.debug("fire_post: follow-up nav error for %s: %s", _fu, _nav_exc)
+
         except Exception as exc:
             return ExecutionResult(
                 confirmed=False,
