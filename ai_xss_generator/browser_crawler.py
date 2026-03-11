@@ -21,7 +21,6 @@ from typing import Callable
 from ai_xss_generator.crawler import (
     CrawlResult,
     MAX_PAGES,
-    _CSRF_FIELD_NAMES,
     _dedup_key,
     _is_csrf_field,
     _page_key,
