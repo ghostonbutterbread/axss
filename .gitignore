@@ -14,6 +14,7 @@ venv/
 
 # axss runtime data — never commit user data or secrets
 *.jsonl
+*.json
 xssy_*.json
 
 # IDE
