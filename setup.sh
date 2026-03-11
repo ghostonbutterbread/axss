@@ -25,6 +25,28 @@ have_cmd() {
   command -v "$1" >/dev/null 2>&1
 }
 
+# Resolve the system Python 3 executable (python3 > python > error).
+# Sets PYTHON to the full path of the first working Python 3.10+ found.
+find_python() {
+  local candidate
+  for candidate in python3 python python3.13 python3.12 python3.11 python3.10; do
+    if have_cmd "$candidate"; then
+      local ver
+      ver="$("$candidate" -c 'import sys; print(sys.version_info >= (3,10))' 2>/dev/null)"
+      if [ "$ver" = "True" ]; then
+        PYTHON="$(command -v "$candidate")"
+        echo "Using Python: $PYTHON ($("$candidate" --version 2>&1))"
+        return 0
+      fi
+    fi
+  done
+  echo "Error: Python 3.10 or newer is required but was not found on PATH." >&2
+  echo "Install it with your package manager (e.g. apt install python3, brew install python)." >&2
+  exit 1
+}
+
+PYTHON=""
+
 ram_gb() {
   if have_cmd free; then
     free -g | awk '/^Mem:/ {print $2}'
@@ -194,7 +216,7 @@ init_axss_dir() {
   # 3. config.json — create with defaults on first run; on subsequent runs only
   #    update default_model + detected CLI backend so user edits to other fields
   #    (use_cloud, cloud_model, cli_model, etc.) are preserved.
-  python3 - "$CONFIG_PATH" "$SELECTED_MODEL" "$DETECTED_CLI_BACKEND" "$DETECTED_CLI_TOOL" <<'PYEOF'
+  "$PYTHON" - "$CONFIG_PATH" "$SELECTED_MODEL" "$DETECTED_CLI_BACKEND" "$DETECTED_CLI_TOOL" <<'PYEOF'
 import json, sys
 path, model, backend, cli_tool = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 try:
@@ -246,6 +268,7 @@ KEYS
   : >"$OLLAMA_LOG" 2>/dev/null || true
 }
 
+find_python
 echo "Detected RAM: $(ram_summary)"
 echo "Detected GPU: $(gpu_summary)"
 select_model_profile
@@ -262,14 +285,20 @@ fi
 init_axss_dir
 
 if [ ! -d "$VENV_DIR" ]; then
-  python3 -m venv "$VENV_DIR"
+  "$PYTHON" -m venv "$VENV_DIR"
 fi
-source "$VENV_DIR/bin/activate"
+# Reference the venv python by full path — avoids any 'python' vs 'python3'
+# ambiguity regardless of OS, shell, or whether the venv is activated.
+VENV_PYTHON="$VENV_DIR/bin/python"
+if [ ! -f "$VENV_PYTHON" ]; then
+  # Some systems name the venv binary python3
+  VENV_PYTHON="$VENV_DIR/bin/python3"
+fi
 
-python -m pip install --upgrade pip
-python -m pip install -r "$ROOT_DIR/requirements.txt"
+"$VENV_PYTHON" -m pip install --upgrade pip
+"$VENV_PYTHON" -m pip install -r "$ROOT_DIR/requirements.txt"
 # Install Playwright browser binaries required by Scrapling's stealth fetcher
-if ! python -m playwright install chromium --with-deps; then
+if ! "$VENV_PYTHON" -m playwright install chromium --with-deps; then
   echo "Warning: playwright install chromium failed — active scanner (--active) will not work." >&2
 fi
 
