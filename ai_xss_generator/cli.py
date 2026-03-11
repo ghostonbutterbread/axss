@@ -352,6 +352,26 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--resume",
+        action="store_true",
+        default=False,
+        help=(
+            "--resume  Automatically resume a previous interrupted or paused scan "
+            "for the same target without prompting. If no prior session exists, "
+            "starts a new scan."
+        ),
+    )
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        default=False,
+        help=(
+            "--no-resume  Ignore any existing session and start a fresh scan. "
+            "Prior session data is not deleted — use this when you intentionally "
+            "want to re-scan from the beginning."
+        ),
+    )
+    parser.add_argument(
         "--backend",
         metavar="BACKEND",
         choices=("api", "cli"),
@@ -776,6 +796,18 @@ def _run_active_scan(
     cli_tool = getattr(args, "cli_tool", None) or config.cli_tool
     cli_model = getattr(args, "cli_model", None) or config.cli_model
 
+    # Session management: detect an existing in-progress/paused session for this
+    # exact target + scan type combination; offer to resume or start fresh.
+    session = _resolve_session(
+        args=args,
+        urls=list(urls),
+        post_forms=list(post_forms),
+        scan_reflected=scan_reflected,
+        scan_stored=scan_stored,
+        scan_dom=scan_dom,
+        rate=args.rate,
+    )
+
     scan_config = ActiveScanConfig(
         rate=args.rate,
         workers=getattr(args, "workers", 1),
@@ -795,7 +827,12 @@ def _run_active_scan(
         cli_model=cli_model,
     )
 
-    results = run_active_scan(urls, scan_config, post_forms=post_forms, crawled_pages=crawled_pages)
+    results = run_active_scan(
+        urls, scan_config,
+        post_forms=post_forms,
+        crawled_pages=crawled_pages,
+        session=session,
+    )
 
     config_summary = (
         f"rate={args.rate:g} req/s | workers={scan_config.workers} | "
@@ -805,6 +842,89 @@ def _run_active_scan(
     success(f"Report written to: {report_path}")
 
     return 0
+
+
+def _resolve_session(
+    args: Any,
+    urls: list[str],
+    post_forms: list,
+    scan_reflected: bool,
+    scan_stored: bool,
+    scan_dom: bool,
+    rate: float,
+) -> Any:
+    """Detect an existing resumable session and return it, or create a new one.
+
+    Returns the session dict (to be passed to run_active_scan) or None when
+    --no-resume is set.
+    """
+    from ai_xss_generator.session import (
+        compute_seed_hash,
+        create_session,
+        find_existing_session,
+    )
+
+    no_resume = getattr(args, "no_resume", False)
+    auto_resume = getattr(args, "resume", False)
+
+    if no_resume:
+        return None
+
+    seed_hash = compute_seed_hash(
+        urls=urls,
+        post_forms=post_forms,
+        scan_reflected=scan_reflected,
+        scan_stored=scan_stored,
+        scan_dom=scan_dom,
+    )
+
+    existing = find_existing_session(seed_hash)
+    if existing is not None:
+        n_done = len(existing.get("completed", {}))
+        n_total = existing.get("total_items", "?")
+        status_label = "paused" if existing.get("status") == "paused" else "interrupted"
+        prior_confirmed = sum(
+            len(e.get("confirmed_findings", []))
+            for e in existing.get("completed", {}).values()
+            if e.get("status") == "confirmed"
+        )
+
+        if auto_resume:
+            do_resume = True
+        else:
+            created = existing.get("created_at", "")[:16].replace("T", " ")
+            info(
+                f"Found a {status_label} session from {created} UTC — "
+                f"{n_done}/{n_total} item(s) done"
+                + (f", {prior_confirmed} finding(s)" if prior_confirmed else "")
+                + "."
+            )
+            try:
+                answer = input("  Resume from checkpoint? [Y/n] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                answer = "n"
+                print()
+            do_resume = answer in ("", "y", "yes")
+
+        if do_resume:
+            existing["status"] = "in_progress"
+            info(f"Resuming — skipping {n_done} already-completed item(s).")
+            return existing
+
+    # No existing session or user declined — create a fresh one
+    config_summary = (
+        f"target={urls[0] if urls else '?'} | "
+        f"rate={rate:g} req/s | "
+        f"reflected={scan_reflected} stored={scan_stored}"
+    )
+    total_items = (len(urls) if scan_reflected else 0) + (len(post_forms) if scan_stored else 0)
+    session = create_session(
+        seed_hash=seed_hash,
+        config_summary=config_summary,
+        total_items=total_items,
+    )
+    log.debug("New session: %s", seed_hash[:16])
+    return session
 
 
 # ---------------------------------------------------------------------------

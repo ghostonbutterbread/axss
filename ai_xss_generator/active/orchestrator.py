@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import math
 import multiprocessing
+import signal
 import time
 import urllib.parse
 from dataclasses import dataclass, field
@@ -75,6 +76,7 @@ def run_active_scan(
     config: ActiveScanConfig,
     post_forms: "Sequence[PostFormTarget]" = (),
     crawled_pages: Sequence[str] = (),
+    session: "Any | None" = None,
 ) -> list[WorkerResult]:
     """Spawn isolated worker processes for each URL and collect results.
 
@@ -104,9 +106,31 @@ def run_active_scan(
         else:
             info("DOM XSS scanning is not yet implemented — skipping; reflected/stored will still run.")
 
+    # Session resume: filter out already-completed work items and restore
+    # prior results so _print_summary / write_report include all findings.
+    prior_results: list[WorkerResult] = []
+    if session is not None:
+        from ai_xss_generator.session import completed_urls as _completed_urls, restore_results
+        done_urls = _completed_urls(session)
+        if done_urls:
+            before = len(work_items)
+            work_items = [
+                (kind, item) for kind, item in work_items
+                if (item if kind == "get" else item.action_url) not in done_urls
+            ]
+            skipped = before - len(work_items)
+            if skipped:
+                step(f"Session resume: {skipped} item(s) already done, {len(work_items)} remaining")
+        prior_results = restore_results(session)
+
     if not work_items:
         # Explain why there's nothing to do rather than silently returning
         _reasons = []
+        if session is not None and prior_results:
+            # All items already done from a prior session
+            info("Session complete — all work items were already finished in a prior run.")
+            _print_summary(prior_results)
+            return prior_results
         if config.scan_reflected and not url_list:
             _reasons.append("no GET URLs with testable query parameters")
         if config.scan_stored and not post_form_list:
@@ -137,14 +161,21 @@ def run_active_scan(
     findings_lock = manager.Lock()
     result_queue: multiprocessing.Queue = manager.Queue()
 
-    results: list[WorkerResult] = []
+    # Start with results from a prior session run (empty list on fresh scan)
+    results: list[WorkerResult] = list(prior_results)
     # (proc, label, kind) — kind is "get" or "post" for worker pill display
     active_procs: list[tuple[multiprocessing.Process, str, str]] = []
     work_iter = iter(work_items)
     total_count = len(work_items)
     completed = 0
-    confirmed_count = 0
+    # Seed confirmed_count from prior results so the panel shows cumulative total
+    confirmed_count = sum(
+        len(r.confirmed_findings) for r in prior_results if r.status == "confirmed"
+    )
     scan_start = time.monotonic()
+    # Graceful-pause state — modified by signal handler
+    _pause_requested = False
+    _pause_announced = False
 
     def _build_panel() -> tuple[str, str, str]:
         """Build the three panel line strings from current scan state."""
@@ -214,6 +245,10 @@ def run_active_scan(
                 _log_result(r)
                 if r.status == "confirmed":
                     confirmed_count += len(r.confirmed_findings)
+                # Checkpoint every completed result so a crash or pause is resumable
+                if session is not None:
+                    from ai_xss_generator.session import checkpoint as _checkpoint
+                    _checkpoint(session, r.url, r)
             except _queue.Empty:
                 break
             except Exception:
@@ -231,90 +266,136 @@ def run_active_scan(
                 still_running.append((proc, plabel, pkind))
         active_procs = still_running
 
+    # Install SIGINT handler for two-stage graceful pause.
+    # First Ctrl+C: stop accepting new work, let in-flight workers finish.
+    # Second Ctrl+C: kill all workers immediately.
+    _original_sigint = signal.getsignal(signal.SIGINT)
+
+    def _sigint_handler(sig: int, frame: Any) -> None:
+        nonlocal _pause_requested, _pause_announced
+        if _pause_requested:
+            # Second Ctrl+C — kill everything now
+            warn("Force-kill: terminating all workers immediately...")
+            for proc, _, _ in active_procs:
+                proc.kill()
+            raise KeyboardInterrupt
+        _pause_requested = True
+
+    signal.signal(signal.SIGINT, _sigint_handler)
+
     setup_panel()
     update_panel(*_build_panel())
+    _scan_completed_cleanly = False
     try:
         while completed < total_count:
             _drain_queue()
             _reap_finished()
 
-            # Fill up to n_workers slots
-            while len(active_procs) < n_workers:
-                try:
-                    kind, item = next(work_iter)
-                except StopIteration:
+            if _pause_requested:
+                if not _pause_announced:
+                    _pause_announced = True
+                    warn(
+                        "Scan paused — letting in-flight workers finish. "
+                        "Ctrl+C again to kill immediately."
+                    )
+                    if session is not None:
+                        from ai_xss_generator.session import mark_status as _mark_status
+                        _mark_status(session, "paused")
+                # Don't start new workers; wait for active ones to drain
+                if not active_procs:
                     break
-
+            else:
+                # Fill up to n_workers slots
                 _cli_kwargs = {
                     "ai_backend": config.ai_backend,
                     "cli_tool": config.cli_tool,
                     "cli_model": config.cli_model,
                 }
-                if kind == "get":
-                    next_url = item
-                    proc = multiprocessing.Process(
-                        target=run_worker,
-                        kwargs={
-                            "url": next_url,
-                            "rate": config.rate,
-                            "waf_hint": config.waf,
-                            "model": config.model,
-                            "cloud_model": config.cloud_model,
-                            "use_cloud": config.use_cloud,
-                            "timeout_seconds": config.timeout_seconds,
-                            "result_queue": result_queue,
-                            "dedup_registry": dedup_registry,
-                            "dedup_lock": dedup_lock,
-                            "findings_lock": findings_lock,
-                            "auth_headers": config.auth_headers,
-                            "sink_url": config.sink_url,
-                            **_cli_kwargs,
-                        },
-                        daemon=True,
-                    )
-                    log_label = next_url
-                else:
-                    pf = item
-                    proc = multiprocessing.Process(
-                        target=run_post_worker,
-                        kwargs={
-                            "post_form": pf,
-                            "rate": config.rate,
-                            "waf_hint": config.waf,
-                            "model": config.model,
-                            "cloud_model": config.cloud_model,
-                            "use_cloud": config.use_cloud,
-                            "timeout_seconds": config.timeout_seconds,
-                            "result_queue": result_queue,
-                            "dedup_registry": dedup_registry,
-                            "dedup_lock": dedup_lock,
-                            "findings_lock": findings_lock,
-                            "auth_headers": config.auth_headers,
-                            "crawled_pages": crawled_pages_list,
-                            "sink_url": config.sink_url,
-                            **_cli_kwargs,
-                        },
-                        daemon=True,
-                    )
-                    log_label = f"[POST] {pf.action_url}"
-                proc.start()
-                active_procs.append((proc, log_label, kind))
-                info(f"[worker] started → {log_label}")
+                while len(active_procs) < n_workers:
+                    try:
+                        kind, item = next(work_iter)
+                    except StopIteration:
+                        break
+
+                    if kind == "get":
+                        next_url = item
+                        proc = multiprocessing.Process(
+                            target=run_worker,
+                            kwargs={
+                                "url": next_url,
+                                "rate": config.rate,
+                                "waf_hint": config.waf,
+                                "model": config.model,
+                                "cloud_model": config.cloud_model,
+                                "use_cloud": config.use_cloud,
+                                "timeout_seconds": config.timeout_seconds,
+                                "result_queue": result_queue,
+                                "dedup_registry": dedup_registry,
+                                "dedup_lock": dedup_lock,
+                                "findings_lock": findings_lock,
+                                "auth_headers": config.auth_headers,
+                                "sink_url": config.sink_url,
+                                **_cli_kwargs,
+                            },
+                            daemon=True,
+                        )
+                        log_label = next_url
+                    else:
+                        pf = item
+                        proc = multiprocessing.Process(
+                            target=run_post_worker,
+                            kwargs={
+                                "post_form": pf,
+                                "rate": config.rate,
+                                "waf_hint": config.waf,
+                                "model": config.model,
+                                "cloud_model": config.cloud_model,
+                                "use_cloud": config.use_cloud,
+                                "timeout_seconds": config.timeout_seconds,
+                                "result_queue": result_queue,
+                                "dedup_registry": dedup_registry,
+                                "dedup_lock": dedup_lock,
+                                "findings_lock": findings_lock,
+                                "auth_headers": config.auth_headers,
+                                "crawled_pages": crawled_pages_list,
+                                "sink_url": config.sink_url,
+                                **_cli_kwargs,
+                            },
+                            daemon=True,
+                        )
+                        log_label = f"[POST] {pf.action_url}"
+                    proc.start()
+                    active_procs.append((proc, log_label, kind))
+                    info(f"[worker] started → {log_label}")
 
             update_panel(*_build_panel())
             time.sleep(0.25)
 
+        _scan_completed_cleanly = not _pause_requested
+
     except KeyboardInterrupt:
-        warn("Scan interrupted — terminating workers...")
-        for proc, _, _ in active_procs:
-            proc.terminate()
+        # Only reached on second Ctrl+C (force kill raises this after proc.kill())
+        warn("Workers killed.")
     finally:
+        signal.signal(signal.SIGINT, _original_sigint)
         teardown_panel()
         # Final drain after all processes finish
         for proc, _, _ in active_procs:
             proc.join(timeout=config.timeout_seconds + 5)
         _drain_queue()
         manager.shutdown()
+        # Mark session complete only on clean finish; paused/crashed stays in_progress
+        if session is not None and _scan_completed_cleanly:
+            from ai_xss_generator.session import mark_status as _mark_status
+            _mark_status(session, "completed")
+
+    if _pause_requested:
+        remaining = total_count - completed
+        if remaining > 0:
+            info(
+                f"Scan paused with {remaining} item(s) remaining. "
+                f"Re-run with the same target to resume."
+            )
 
     _print_summary(results)
     return results

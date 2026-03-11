@@ -65,6 +65,8 @@ class WorkerResult:
     # Summary counts for the report
     params_tested: int = 0
     params_reflected: int = 0
+    # Work item type — used by session checkpointing
+    kind: str = "get"       # "get" | "post"
 
 
 # ---------------------------------------------------------------------------
@@ -436,6 +438,7 @@ def _run(
         waf=waf_hint,
         params_tested=len(flat_params),
         params_reflected=len(reflected),
+        kind="get",
     ))
 
 
@@ -820,6 +823,7 @@ def _run_post(
         waf=waf_hint,
         params_tested=len(post_form.param_names),
         params_reflected=len(reflected),
+        kind="post",
     ))
 
 

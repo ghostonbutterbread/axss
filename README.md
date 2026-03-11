@@ -40,8 +40,12 @@ Goal: scan a live web target for XSS
   │          --sink-url "https://target.com/dashboard"
   │     (omit --sink-url if you don't know; axss will sweep crawled pages)
   │
-  └── You only want payload suggestions, no active browser execution
-        axss -u "https://target.com/search?q=test" --generate
+  ├── You only want payload suggestions, no active browser execution
+  │     axss -u "https://target.com/search?q=test" --generate
+  │
+  └── A previous scan was interrupted / crashed and you want to resume
+        axss -u "https://target.com" --active --resume
+        (or just re-run the same command — axss will prompt if a session is found)
 ```
 
 ---
@@ -236,6 +240,8 @@ axss --help
 | `--backend api\|cli` | config | Cloud escalation backend: `api` = OpenRouter/OpenAI keys, `cli` = CLI subprocess |
 | `--cli-tool claude\|codex` | config | CLI tool to use when `--backend cli` (requires tool on PATH and logged in) |
 | `--cli-model MODEL` | — | Model to pass to the CLI tool (e.g. `claude-opus-4-6`); omit for tool default |
+| `--resume` | off | Auto-resume a prior interrupted/paused scan without prompting |
+| `--no-resume` | off | Ignore any existing session and always start fresh |
 | `--no-cloud` | off | Never escalate to cloud LLM |
 | `--public` | off | Fetch community XSS payloads and inject as reference |
 | `-o, --output` | `list` | Output format: `list`, `heat`, `json`, `interactive` |
@@ -393,6 +399,37 @@ Most browser cookie export extensions produce this format.
 `cloudflare`, `akamai`, `imperva`, `aws`, `f5`, `modsecurity`, `fastly`, `sucuri`, `barracuda`, `wordfence`, `azure`
 
 WAF is auto-detected from the seed response headers during crawl. Use `--waf NAME` to override or pre-configure.
+
+---
+
+## Resumable sessions
+
+Every active scan automatically creates a session file in `~/.axss/sessions/`. If the scan is interrupted (crash, Ctrl+C, or lost SSH connection), the next invocation with the same target detects the session and prompts:
+
+```
+[~] Found a interrupted session from 2026-03-10 14:22 UTC — 37/120 item(s) done, 2 finding(s).
+  Resume from checkpoint? [Y/n]
+```
+
+Progress is checkpointed after every completed work item using an atomic write, so a crash mid-write never corrupts the session.
+
+**Pause behavior:**
+- First `Ctrl+C` — graceful pause: no new workers are started, in-flight workers are allowed to finish, then the scan stops. Session is marked `paused`.
+- Second `Ctrl+C` — force kill: all workers are terminated immediately. Session stays `in_progress` so the next run can resume.
+
+**Flags:**
+```bash
+# Scan normally — axss prompts if a prior session is found
+axss -u "https://target.com" --active
+
+# Auto-resume without prompting (useful in scripts / tmux)
+axss -u "https://target.com" --active --resume
+
+# Always start fresh, ignoring any prior session
+axss -u "https://target.com" --active --no-resume
+```
+
+Sessions are identified by a hash of the sorted URL/form list and scan type flags. Auth headers, rate, and worker count are not part of the identity — you can adjust them on resume. Session files accumulate in `~/.axss/sessions/` and can be cleaned up with `rm ~/.axss/sessions/*.json`.
 
 ---
 
