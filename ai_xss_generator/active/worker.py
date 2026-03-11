@@ -117,6 +117,9 @@ def run_worker(
     findings_lock: Any,
     auth_headers: dict[str, str] | None = None,
     sink_url: str | None = None,
+    ai_backend: str = "api",
+    cli_tool: str = "claude",
+    cli_model: str | None = None,
 ) -> None:
     """Target function for multiprocessing.Process.
 
@@ -147,6 +150,9 @@ def run_worker(
             put_result=_put_result,
             auth_headers=auth_headers,
             sink_url=sink_url,
+            ai_backend=ai_backend,
+            cli_tool=cli_tool,
+            cli_model=cli_model,
         )
     except Exception as exc:
         log.exception("Worker crashed for %s", url)
@@ -170,6 +176,9 @@ def _run(
     put_result: Any,
     auth_headers: dict[str, str] | None = None,
     sink_url: str | None = None,
+    ai_backend: str = "api",
+    cli_tool: str = "claude",
+    cli_model: str | None = None,
 ) -> None:
     deadline = start_time + timeout_seconds
 
@@ -380,6 +389,9 @@ def _run(
                         dedup_lock=dedup_lock,
                         base_context=_cached_context,
                         auth_headers=auth_headers,
+                        ai_backend=ai_backend,
+                        cli_tool=cli_tool,
+                        cli_model=cli_model,
                     )
 
                     if cloud_payloads:
@@ -505,6 +517,9 @@ def _get_cloud_payloads(
     dedup_lock: Any,
     base_context: Any = None,
     auth_headers: dict[str, str] | None = None,
+    ai_backend: str = "api",
+    cli_tool: str = "claude",
+    cli_model: str | None = None,
 ) -> list[str]:
     """Check dedup registry; call cloud model if this is a novel fingerprint.
 
@@ -529,6 +544,9 @@ def _get_cloud_payloads(
             context=context,
             cloud_model=cloud_model,
             waf=waf,
+            ai_backend=ai_backend,
+            cli_tool=cli_tool,
+            cli_model=cli_model,
         )
         result_strings = [p.payload for p in payloads if p.payload]
     except Exception as exc:
@@ -560,6 +578,9 @@ def run_post_worker(
     auth_headers: dict[str, str] | None = None,
     crawled_pages: list[str] | None = None,
     sink_url: str | None = None,
+    ai_backend: str = "api",
+    cli_tool: str = "claude",
+    cli_model: str | None = None,
 ) -> None:
     """Worker entry point for POST form targets. Mirrors run_worker() for GET URLs."""
     start_time = time.monotonic()
@@ -585,6 +606,9 @@ def run_post_worker(
             auth_headers=auth_headers,
             crawled_pages=crawled_pages,
             sink_url=sink_url,
+            ai_backend=ai_backend,
+            cli_tool=cli_tool,
+            cli_model=cli_model,
         )
     except Exception as exc:
         log.exception("POST worker crashed for %s", post_form.action_url)
@@ -610,6 +634,9 @@ def _run_post(
     auth_headers: dict[str, str] | None = None,
     crawled_pages: list[str] | None = None,
     sink_url: str | None = None,
+    ai_backend: str = "api",
+    cli_tool: str = "claude",
+    cli_model: str | None = None,
 ) -> None:
     from ai_xss_generator.probe import probe_post_form
     from ai_xss_generator.active.executor import ActiveExecutor
@@ -745,6 +772,9 @@ def _run_post(
                         dedup_registry=dedup_registry,
                         dedup_lock=dedup_lock,
                         auth_headers=auth_headers,
+                        ai_backend=ai_backend,
+                        cli_tool=cli_tool,
+                        cli_model=cli_model,
                     )
                     if cloud_payloads:
                         cloud_escalated = True

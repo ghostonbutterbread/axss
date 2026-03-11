@@ -351,6 +351,37 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
             "being set via a POST form). Checked before auto-discovered follow-up pages."
         ),
     )
+    parser.add_argument(
+        "--backend",
+        metavar="BACKEND",
+        choices=("api", "cli"),
+        default=None,
+        help=(
+            "--backend api|cli  AI backend for cloud escalation. "
+            "'api' uses OpenRouter/OpenAI API keys (default). "
+            "'cli' invokes the claude or codex CLI subprocess — uses subscription auth, "
+            "no per-token billing. Overrides the config.json value."
+        ),
+    )
+    parser.add_argument(
+        "--cli-tool",
+        metavar="TOOL",
+        choices=("claude", "codex"),
+        default=None,
+        help=(
+            "--cli-tool claude|codex  Which CLI tool to use when --backend cli is set. "
+            "Defaults to 'claude'. Requires the tool to be on PATH and logged in."
+        ),
+    )
+    parser.add_argument(
+        "--cli-model",
+        metavar="MODEL",
+        default=None,
+        help=(
+            "--cli-model MODEL  Model passed to the CLI tool (e.g. claude-opus-4-6). "
+            "Omit to use the CLI tool's default model."
+        ),
+    )
 
     return parser
 
@@ -734,6 +765,11 @@ def _run_active_scan(
     if sink_url:
         info(f"Sink URL: {sink_url} (checking this page after each injection)")
 
+    # Resolve CLI backend settings: CLI flag > config.json > hardcoded default
+    ai_backend = getattr(args, "backend", None) or config.ai_backend
+    cli_tool = getattr(args, "cli_tool", None) or config.cli_tool
+    cli_model = getattr(args, "cli_model", None) or config.cli_model
+
     scan_config = ActiveScanConfig(
         rate=args.rate,
         workers=getattr(args, "workers", 1),
@@ -748,6 +784,9 @@ def _run_active_scan(
         scan_reflected=scan_reflected,
         scan_stored=scan_stored,
         scan_dom=scan_dom,
+        ai_backend=ai_backend,
+        cli_tool=cli_tool,
+        cli_model=cli_model,
     )
 
     results = run_active_scan(urls, scan_config, post_forms=post_forms, crawled_pages=crawled_pages)

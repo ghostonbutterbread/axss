@@ -54,6 +54,10 @@ class ActiveScanConfig:
     scan_reflected: bool = True   # GET parameter injection (reflected XSS)
     scan_stored: bool = True      # POST form injection (stored XSS)
     scan_dom: bool = True         # DOM source/sink analysis (DOM XSS)
+    # AI backend for cloud escalation
+    ai_backend: str = "api"       # "api" | "cli"
+    cli_tool: str = "claude"      # "claude" | "codex" (when ai_backend="cli")
+    cli_model: str | None = None  # model passed to CLI (None = CLI default)
 
 
 def _auto_workers(rate: float, explicit_workers: int) -> int:
@@ -241,6 +245,11 @@ def run_active_scan(
                 except StopIteration:
                     break
 
+                _cli_kwargs = {
+                    "ai_backend": config.ai_backend,
+                    "cli_tool": config.cli_tool,
+                    "cli_model": config.cli_model,
+                }
                 if kind == "get":
                     next_url = item
                     proc = multiprocessing.Process(
@@ -259,6 +268,7 @@ def run_active_scan(
                             "findings_lock": findings_lock,
                             "auth_headers": config.auth_headers,
                             "sink_url": config.sink_url,
+                            **_cli_kwargs,
                         },
                         daemon=True,
                     )
@@ -282,6 +292,7 @@ def run_active_scan(
                             "auth_headers": config.auth_headers,
                             "crawled_pages": crawled_pages_list,
                             "sink_url": config.sink_url,
+                            **_cli_kwargs,
                         },
                         daemon=True,
                     )

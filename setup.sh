@@ -17,6 +17,10 @@ HIGH_MEM_MODEL="qwen3.5:27b"
 GPU_MODEL="qwen3.5:35b"
 SELECTED_MODEL=""
 
+# CLI tool detection results (set by detect_cli_tools)
+DETECTED_CLI_BACKEND="api"
+DETECTED_CLI_TOOL="claude"
+
 have_cmd() {
   command -v "$1" >/dev/null 2>&1
 }
@@ -120,6 +124,24 @@ select_model_profile() {
   fi
 }
 
+detect_cli_tools() {
+  # Probe for claude and codex on PATH.  Set DETECTED_CLI_BACKEND and
+  # DETECTED_CLI_TOOL so init_axss_dir() can write them to config.json.
+  if have_cmd claude; then
+    DETECTED_CLI_BACKEND="cli"
+    DETECTED_CLI_TOOL="claude"
+    echo "Found claude CLI at $(command -v claude) — will configure backend=cli, tool=claude"
+  elif have_cmd codex; then
+    DETECTED_CLI_BACKEND="cli"
+    DETECTED_CLI_TOOL="codex"
+    echo "Found codex CLI at $(command -v codex) — will configure backend=cli, tool=codex"
+  else
+    DETECTED_CLI_BACKEND="api"
+    DETECTED_CLI_TOOL="claude"
+    echo "No claude/codex CLI found — will configure backend=api (OpenRouter/OpenAI key required)"
+  fi
+}
+
 install_ollama_if_needed() {
   if have_cmd ollama; then
     return 0
@@ -170,11 +192,11 @@ init_axss_dir() {
   mkdir -p "$CONFIG_DIR/findings"
 
   # 3. config.json — create with defaults on first run; on subsequent runs only
-  #    update default_model so user edits to use_cloud / cloud_model are preserved.
-  if [ -f "$CONFIG_PATH" ]; then
-    python3 - "$CONFIG_PATH" "$SELECTED_MODEL" <<'PYEOF'
+  #    update default_model + detected CLI backend so user edits to other fields
+  #    (use_cloud, cloud_model, cli_model, etc.) are preserved.
+  python3 - "$CONFIG_PATH" "$SELECTED_MODEL" "$DETECTED_CLI_BACKEND" "$DETECTED_CLI_TOOL" <<'PYEOF'
 import json, sys
-path, model = sys.argv[1], sys.argv[2]
+path, model, backend, cli_tool = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 try:
     with open(path) as f:
         cfg = json.load(f)
@@ -182,15 +204,18 @@ try:
         cfg = {}
 except Exception:
     cfg = {}
+# Always update model (hardware-detected) and CLI backend (auto-detected).
 cfg["default_model"] = model
+cfg["ai_backend"] = backend
+cfg["cli_tool"] = cli_tool
+# Write defaults for keys the user hasn't set yet.
+cfg.setdefault("use_cloud", True)
+cfg.setdefault("cloud_model", "anthropic/claude-3-5-sonnet")
+cfg.setdefault("cli_model", None)
 with open(path, "w") as f:
     json.dump(cfg, f, indent=2)
     f.write("\n")
 PYEOF
-  else
-    printf '{\n  "default_model": "%s",\n  "use_cloud": true,\n  "cloud_model": "anthropic/claude-3-5-sonnet"\n}\n' \
-      "$SELECTED_MODEL" >"$CONFIG_PATH"
-  fi
 
   # 4. keys — created once with strict permissions so the user can add API keys
   if [ ! -f "$CONFIG_DIR/keys" ]; then
@@ -222,6 +247,7 @@ echo "Detected GPU: $(gpu_summary)"
 select_model_profile
 echo "Selected model profile: $SELECTED_PROFILE ($SELECTED_MODEL)"
 
+detect_cli_tools
 install_ollama_if_needed || echo "Warning: continuing without automatic Ollama install." >&2
 if have_cmd ollama; then
   ensure_ollama_ready || true

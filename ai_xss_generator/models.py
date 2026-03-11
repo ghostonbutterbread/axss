@@ -502,24 +502,59 @@ def _generate_with_openai(
 # Cloud escalation — try OpenRouter then OpenAI
 # ---------------------------------------------------------------------------
 
+def _generate_with_cli(
+    context: ParsedContext,
+    tool: str,
+    cli_model: str | None,
+    reference_payloads: list[Any] | None = None,
+    waf: str | None = None,
+    past_findings: list[Finding] | None = None,
+) -> list[PayloadCandidate]:
+    """Generate payloads by calling the claude or codex CLI subprocess."""
+    from ai_xss_generator.cli_runner import generate_via_cli
+    prompt = _prompt_for_context(
+        context,
+        reference_payloads=reference_payloads,
+        waf=waf,
+        past_findings=past_findings,
+    )
+    raw = generate_via_cli(tool, prompt, cli_model)
+    data = _extract_json_blob(raw)
+    return _normalize_payloads(data.get("payloads", []), source=f"cli:{tool}")
+
+
 def _try_cloud(
     context: ParsedContext,
     cloud_model: str,
     reference_payloads: list[Any] | None,
     waf: str | None,
     past_findings: list[Finding] | None,
+    ai_backend: str = "api",
+    cli_tool: str = "claude",
+    cli_model: str | None = None,
 ) -> tuple[list[PayloadCandidate], str]:
     """Attempt cloud generation. Returns (payloads, engine_label).
 
-    Tries OpenRouter first (if OPENROUTER_API_KEY set), then OpenAI
-    (if OPENAI_API_KEY set). Returns ([], "") if neither is available or
-    both fail.
+    When ai_backend="cli": invokes the claude or codex CLI subprocess.
+    When ai_backend="api": tries OpenRouter then OpenAI (original behaviour).
+    Returns ([], "") if the chosen backend is unavailable or fails.
     """
-    kwargs = dict(
+    kwargs: dict[str, Any] = dict(
         reference_payloads=reference_payloads,
         waf=waf,
         past_findings=past_findings,
     )
+
+    # ── CLI backend ──────────────────────────────────────────────────────────
+    if ai_backend == "cli":
+        try:
+            payloads = _generate_with_cli(context, cli_tool, cli_model, **kwargs)
+            return payloads, f"cli:{cli_tool}"
+        except Exception as exc:
+            log.debug("CLI backend (%s) failed: %s", cli_tool, exc)
+            return [], ""
+
+    # ── API backend (original behaviour) ────────────────────────────────────
     from ai_xss_generator.config import load_api_key
     if os.environ.get("OPENROUTER_API_KEY") or load_api_key("openrouter_api_key"):
         try:
@@ -678,6 +713,13 @@ def check_api_keys() -> list[dict[str, str]]:
             "detail": "add openai_api_key = sk-... to ~/.axss/keys or set OPENAI_API_KEY",
         })
 
+    # ── 4. Claude CLI ─────────────────────────────────────────────────────────
+    from ai_xss_generator.cli_runner import check_cli_tool
+    results.append(check_cli_tool("claude"))
+
+    # ── 5. Codex CLI ──────────────────────────────────────────────────────────
+    results.append(check_cli_tool("codex"))
+
     return results
 
 
@@ -690,6 +732,9 @@ def generate_cloud_payloads(
     cloud_model: str,
     waf: str | None = None,
     past_findings: "list[Finding] | None" = None,
+    ai_backend: str = "api",
+    cli_tool: str = "claude",
+    cli_model: str | None = None,
 ) -> "tuple[list[PayloadCandidate], str]":
     """Call the cloud model directly for active-scanner escalation.
 
@@ -713,6 +758,9 @@ def generate_cloud_payloads(
         reference_payloads=None,
         waf=waf,
         past_findings=past_findings,
+        ai_backend=ai_backend,
+        cli_tool=cli_tool,
+        cli_model=cli_model,
     )
 
     if payloads and engine:
@@ -754,6 +802,9 @@ def generate_payloads(
     waf: str | None = None,
     use_cloud: bool = True,
     cloud_model: str = "anthropic/claude-3-5-sonnet",
+    ai_backend: str = "api",
+    cli_tool: str = "claude",
+    cli_model: str | None = None,
 ) -> tuple[list[PayloadCandidate], str, bool, str]:
     """Generate, rank, and return payloads for *context*.
 
@@ -816,6 +867,9 @@ def generate_payloads(
             reference_payloads=reference_payloads,
             waf=waf,
             past_findings=past_findings,
+            ai_backend=ai_backend,
+            cli_tool=cli_tool,
+            cli_model=cli_model,
         )
 
         if cloud_payloads:

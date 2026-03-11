@@ -45,9 +45,15 @@ class AppConfig:
     # Cloud escalation — set to False to never leave local Ollama.
     # Ignored entirely when no API key (OPENAI_API_KEY / OPENROUTER_API_KEY) is set.
     use_cloud: bool = True
-    # Preferred OpenRouter model (only used when OPENROUTER_API_KEY is set).
+    # Preferred OpenRouter model (only used when ai_backend="api").
     # Example: "anthropic/claude-3-5-sonnet", "google/gemini-2.0-flash-001"
     cloud_model: str = "anthropic/claude-3-5-sonnet"
+    # Cloud escalation backend: "api" = OpenRouter/OpenAI, "cli" = subprocess CLI.
+    ai_backend: str = "api"
+    # Which CLI tool to use when ai_backend="cli": "claude" or "codex".
+    cli_tool: str = "claude"
+    # Model passed to the CLI tool (e.g. "claude-opus-4-6").  None = CLI default.
+    cli_model: str | None = None
 
 
 def load_config() -> AppConfig:
@@ -71,8 +77,23 @@ def load_config() -> AppConfig:
     if not isinstance(cloud_model, str) or not cloud_model.strip():
         cloud_model = "anthropic/claude-3-5-sonnet"
 
+    ai_backend = raw.get("ai_backend", "api")
+    if ai_backend not in ("api", "cli"):
+        ai_backend = "api"
+
+    cli_tool = raw.get("cli_tool", "claude")
+    if cli_tool not in ("claude", "codex"):
+        cli_tool = "claude"
+
+    cli_model = raw.get("cli_model", None)
+    if cli_model is not None and (not isinstance(cli_model, str) or not cli_model.strip()):
+        cli_model = None
+
     return AppConfig(
         default_model=default_model.strip(),
         use_cloud=use_cloud,
         cloud_model=cloud_model.strip(),
+        ai_backend=ai_backend,
+        cli_tool=cli_tool,
+        cli_model=cli_model.strip() if cli_model else None,
     )
