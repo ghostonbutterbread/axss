@@ -73,6 +73,10 @@ def call_codex(prompt: str, model: str | None = None) -> str:
         raise RuntimeError(
             "codex CLI not found — install from: https://github.com/openai/codex"
         )
+    if model:
+        log.warning(
+            "codex CLI does not support model selection; --cli-model %r will be ignored", model
+        )
     cmd = ["codex", "exec", prompt, "--skip-git-repo-check"]
     log.debug("CLI invoke: codex exec <prompt> --skip-git-repo-check")
     return _run(cmd, "codex")

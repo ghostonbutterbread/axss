@@ -212,9 +212,13 @@ cfg["cli_tool"] = cli_tool
 cfg.setdefault("use_cloud", True)
 cfg.setdefault("cloud_model", "anthropic/claude-3-5-sonnet")
 cfg.setdefault("cli_model", None)
-with open(path, "w") as f:
-    json.dump(cfg, f, indent=2)
-    f.write("\n")
+try:
+    with open(path, "w") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
+except Exception as e:
+    print(f"Error: could not write config {path}: {e}", file=sys.stderr)
+    sys.exit(1)
 PYEOF
 
   # 4. keys — created once with strict permissions so the user can add API keys

@@ -310,6 +310,12 @@ def browser_crawl(
 
                     final_url = page.url or url
 
+                    # If the navigation redirected, mark the final destination as
+                    # visited so we don't crawl it again via a different entry URL.
+                    final_pk = _page_key(final_url)
+                    if final_pk != _page_key(url):
+                        visited_pages.add(final_pk)
+
                     # Register as a testable GET target if it has injectable params
                     if _testable_params(url):
                         key = _dedup_key(url)

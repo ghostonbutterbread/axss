@@ -511,6 +511,9 @@ def _build_result(
     waf: str | None = None,
     use_cloud: bool = True,
     cloud_model: str = "anthropic/claude-3-5-sonnet",
+    ai_backend: str = "api",
+    cli_tool: str = "claude",
+    cli_model: str | None = None,
 ) -> GenerationResult:
     payloads, engine, used_fallback, resolved_model = generate_payloads(
         context=context,
@@ -521,6 +524,9 @@ def _build_result(
         waf=waf,
         use_cloud=use_cloud,
         cloud_model=cloud_model,
+        ai_backend=ai_backend,
+        cli_tool=cli_tool,
+        cli_model=cli_model,
     )
     return GenerationResult(
         engine=engine,
@@ -910,6 +916,9 @@ def main(argv: list[str] | None = None) -> int:
     selected_model = args.model or config.default_model
     use_cloud = config.use_cloud and not getattr(args, "no_cloud", False)
     cloud_model = config.cloud_model
+    ai_backend = getattr(args, "backend", None) or config.ai_backend
+    cli_tool = getattr(args, "cli_tool", None) or config.cli_tool
+    cli_model = getattr(args, "cli_model", None) or config.cli_model
     registry = PluginRegistry()
     registry.load_from(Path(__file__).resolve().parent.parent)
 
@@ -1002,6 +1011,9 @@ def main(argv: list[str] | None = None) -> int:
                 waf=resolved_waf,
                 use_cloud=use_cloud,
                 cloud_model=cloud_model,
+                ai_backend=ai_backend,
+                cli_tool=cli_tool,
+                cli_model=cli_model,
             )
             for context in contexts
         ]
@@ -1019,6 +1031,9 @@ def main(argv: list[str] | None = None) -> int:
                 waf=resolved_waf,
                 use_cloud=use_cloud,
                 cloud_model=cloud_model,
+                ai_backend=ai_backend,
+                cli_tool=cli_tool,
+                cli_model=cli_model,
             )
 
         success(f"Done. {sum(len(r.payloads) for r in results)} total payloads ranked.")
@@ -1132,6 +1147,9 @@ def main(argv: list[str] | None = None) -> int:
         waf=resolved_waf,
         use_cloud=use_cloud,
         cloud_model=cloud_model,
+        ai_backend=ai_backend,
+        cli_tool=cli_tool,
+        cli_model=cli_model,
     )
 
     # Apply threshold filter to final payloads
