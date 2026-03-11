@@ -49,6 +49,10 @@ class ActiveScanConfig:
     output_path: str | None = None  # markdown report output; None = auto
     auth_headers: dict[str, str] = field(default_factory=dict)
     sink_url: str | None = None    # manual sink page for stored XSS (--sink-url)
+    # XSS type selectors — control which scan types run
+    scan_reflected: bool = True   # GET parameter injection (reflected XSS)
+    scan_stored: bool = True      # POST form injection (stored XSS)
+    scan_dom: bool = True         # DOM source/sink analysis (DOM XSS)
 
 
 def _auto_workers(rate: float, explicit_workers: int) -> int:
@@ -78,12 +82,45 @@ def run_active_scan(
     url_list = [u.strip() for u in urls if u and u.strip()]
     post_form_list = list(post_forms)
     crawled_pages_list = list(crawled_pages)
-    if not url_list and not post_form_list:
+
+    # Build work items filtered by enabled scan types
+    work_items: list[tuple[str, Any]] = []
+    if config.scan_reflected:
+        work_items += [("get", u) for u in url_list]
+    if config.scan_stored:
+        work_items += [("post", pf) for pf in post_form_list]
+
+    # DOM XSS: not yet implemented — always notify when requested
+    if config.scan_dom:
+        other_types_enabled = config.scan_reflected or config.scan_stored
+        if not other_types_enabled:
+            info("DOM XSS scanning is not yet implemented — coming soon.")
+            return []
+        else:
+            info("DOM XSS scanning is not yet implemented — skipping; reflected/stored will still run.")
+
+    if not work_items:
+        # Explain why there's nothing to do rather than silently returning
+        _reasons = []
+        if config.scan_reflected and not url_list:
+            _reasons.append("no GET URLs with testable query parameters")
+        if config.scan_stored and not post_form_list:
+            _reasons.append("no POST forms discovered (try without --no-crawl)")
+        if _reasons:
+            info(f"Active scan: nothing to test — {'; '.join(_reasons)}")
         return []
+
+    # Human-readable list of types that will actually run (dom excluded — not yet implemented)
+    _active_types = " + ".join(filter(None, [
+        "reflected" if config.scan_reflected else None,
+        "stored" if config.scan_stored else None,
+    ]))
+    n_get = sum(1 for kind, _ in work_items if kind == "get")
+    n_post = sum(1 for kind, _ in work_items if kind == "post")
 
     n_workers = _auto_workers(config.rate, config.workers)
     step(
-        f"Active scan: {len(url_list)} GET URL(s) + {len(post_form_list)} POST form(s) | "
+        f"Active scan [{_active_types}]: {n_get} GET URL(s) + {n_post} POST form(s) | "
         f"{n_workers} worker(s) | "
         f"{config.rate:g} req/s rate | "
         f"{config.timeout_seconds}s timeout"
@@ -97,12 +134,6 @@ def run_active_scan(
 
     results: list[WorkerResult] = []
     active_procs: list[tuple[multiprocessing.Process, str]] = []  # (proc, label)
-
-    # Unified work queue: ('get', url_str) or ('post', PostFormTarget)
-    work_items: list[tuple[str, Any]] = (
-        [("get", u) for u in url_list]
-        + [("post", pf) for pf in post_form_list]
-    )
     work_iter = iter(work_items)
     total_count = len(work_items)
     completed = 0

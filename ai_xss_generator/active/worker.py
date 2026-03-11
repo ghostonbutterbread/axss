@@ -194,7 +194,28 @@ def _run(
         put_result(WorkerResult(url=url, status="no_params", waf=waf_hint))
         return
 
-    # ── Step 2: Probe all params for reflection + char survival ──────────────
+    # ── Step 2: Pre-fetch URL cleanly — used for AI context (avoids a redundant
+    # network round-trip in parse_target later). The probe requests use modified
+    # URLs (canary injected), so this clean fetch is the only time we see the
+    # real page content.
+    _prefetched_html: str | None = None
+    try:
+        from scrapling.fetchers import FetcherSession as _FS
+        with _FS(impersonate="chrome", stealthy_headers=True, timeout=20,
+                 follow_redirects=True, retries=1) as _fs:
+            _clean_resp = _fs.get(
+                url,
+                headers={**(auth_headers or {}),
+                         "User-Agent": "axss/0.1 (+authorized security testing; scrapling)"},
+            )
+            _prefetched_html = _clean_resp.text or (
+                _clean_resp.body.decode("utf-8", errors="replace")
+                if _clean_resp.body else None
+            )
+    except Exception as _exc:
+        log.debug("Pre-fetch of %s failed (parse_target will re-fetch): %s", url, _exc)
+
+    # ── Step 3: Probe all params for reflection + char survival ──────────────
     probe_results = probe_url(url, rate=rate, waf=waf_hint, auth_headers=auth_headers, sink_url=sink_url)
 
     injectable = [r for r in probe_results if r.is_injectable]
@@ -219,15 +240,18 @@ def _run(
         ))
         return
 
-    # ── Step 2b: Parse target HTML once — reused by local/cloud model helpers ─
+    # ── Step 4: Parse target HTML once — reused by local/cloud model helpers ─
     from ai_xss_generator.parser import parse_target as _parse_target
     _cached_context: Any = None
     try:
-        _cached_context = _parse_target(url=url, html_value=None, waf=waf_hint, auth_headers=auth_headers)
+        _cached_context = _parse_target(
+            url=url, html_value=None, waf=waf_hint, auth_headers=auth_headers,
+            cached_html=_prefetched_html,
+        )
     except Exception as exc:
         log.debug("Pre-parse of %s failed (will retry per-param): %s", url, exc)
 
-    # ── Step 3: Start Playwright executor (shared for all payload attempts) ──
+    # ── Step 5: Start Playwright executor (shared for all payload attempts) ──
     from ai_xss_generator.active.executor import ActiveExecutor
     executor = ActiveExecutor(auth_headers=auth_headers)
     try:

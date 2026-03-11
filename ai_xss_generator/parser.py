@@ -734,12 +734,24 @@ def parse_target(
     rate: float = 25.0,
     waf: str | None = None,
     auth_headers: dict[str, str] | None = None,
+    cached_html: str | None = None,
 ) -> ParsedContext:
     if bool(url) == bool(html_value):
         raise ValueError("Choose exactly one of --url or --input")
 
     parser_plugins = parser_plugins or []
     if url:
+        # Fast path: caller already fetched the page — skip the network round-trip.
+        if cached_html is not None:
+            from ai_xss_generator.auth import describe_auth
+            _auth_notes = describe_auth(auth_headers) if auth_headers else []
+            return _build_context(
+                html=cached_html,
+                source=url,
+                source_type="url",
+                parser_plugins=parser_plugins,
+                auth_notes=_auth_notes,
+            )
         contexts, errors = parse_targets(
             urls=[url],
             parser_plugins=parser_plugins,

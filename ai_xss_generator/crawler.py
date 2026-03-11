@@ -55,6 +55,7 @@ class CrawlResult:
     get_urls: list[str]
     post_forms: list[PostFormTarget]
     visited_urls: list[str]  # All pages actually fetched — used for post-injection sweep
+    detected_waf: str | None = None  # WAF auto-detected from crawl seed response
 
 
 MAX_PAGES = 300  # hard cap on pages visited per crawl session
@@ -248,6 +249,7 @@ def crawl(
     post_forms: list[PostFormTarget] = []
 
     current_level: list[str] = [start_url]
+    _crawl_detected_waf: str | None = None
 
     for current_depth in range(depth + 1):
         if not current_level:
@@ -269,7 +271,18 @@ def crawl(
             current_depth, len(to_fetch), len(visited_pages), len(seen_targets),
         )
 
-        crawled = crawl_urls(to_fetch, rate=rate, waf=waf, auth_headers=auth_headers)
+        crawled = crawl_urls(
+            to_fetch, rate=rate, waf=waf, auth_headers=auth_headers,
+            detect_waf_on_seed=(current_depth == 0 and waf is None),
+        )
+
+        # Extract WAF detected from seed response (first BFS level only)
+        _seed_waf_entry = crawled.pop("__detected_waf__", None)
+        if _seed_waf_entry and waf is None:
+            waf = _seed_waf_entry.get("waf")
+            if waf:
+                _crawl_detected_waf = waf
+                log.info("WAF auto-detected from crawl seed: %s", waf)
 
         next_level: list[str] = []
 
@@ -353,10 +366,11 @@ def crawl(
                         abs_action, param_names, csrf_field,
                     )
 
+        next_level = sorted(next_level, key=lambda u: 0 if _testable_params(u) else 1)
         current_level = next_level
 
     log.info(
         "Crawl complete: %d page(s) visited | %d GET target(s) | %d POST form(s)",
         len(visited_pages), len(ordered_targets), len(post_forms),
     )
-    return CrawlResult(get_urls=ordered_targets, post_forms=post_forms, visited_urls=all_fetched_urls)
+    return CrawlResult(get_urls=ordered_targets, post_forms=post_forms, visited_urls=all_fetched_urls, detected_waf=_crawl_detected_waf)

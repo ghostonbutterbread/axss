@@ -317,6 +317,18 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--browser-crawl",
+        action="store_true",
+        default=False,
+        help=(
+            "--browser-crawl  Use a real Playwright browser for crawling instead of "
+            "the default HTTP crawler. Renders JavaScript so Angular/React/Vue "
+            "client-side routes are discovered. Also intercepts XHR/fetch requests "
+            "to surface API endpoints with injectable query parameters. "
+            "Slower than the default crawler but finds far more surface on SPAs."
+        ),
+    )
+    parser.add_argument(
         "--depth",
         metavar="N",
         type=int,
@@ -640,6 +652,7 @@ def _run_active_scan(
     # Crawl to discover testable endpoints — only for single-URL mode.
     # When --urls is given the user already knows what they want to test.
     crawl_depth = getattr(args, "depth", 2)
+    use_browser_crawl = getattr(args, "browser_crawl", False)
     post_forms: list = []
     crawled_pages: list = []
     if args.url and not no_crawl:
@@ -647,7 +660,6 @@ def _run_active_scan(
             clear_status_bar, fmt_duration, set_status_bar,
             spin_char, update_status_bar,
         )
-        from ai_xss_generator.crawler import crawl as crawl_site, CrawlResult
         import time as _time
 
         crawl_start = _time.monotonic()
@@ -663,22 +675,40 @@ def _run_active_scan(
                 f"{fmt_duration(elapsed)} elapsed\033[0m"
             )
 
-        step(f"Crawling {urls[0]} (depth={crawl_depth})...")
-        set_status_bar(
-            f"\033[2m[~] ⠋ Crawling | depth 0/{crawl_depth} | "
-            f"0 pages visited | 0 target(s) found\033[0m"
-        )
-        try:
-            crawl_result = crawl_site(
-                urls[0],
-                depth=crawl_depth,
-                rate=args.rate,
-                waf=waf,
-                auth_headers=auth_headers,
-                on_progress=_crawl_progress,
+        if use_browser_crawl:
+            from ai_xss_generator.browser_crawler import browser_crawl
+            step(f"Browser-crawling {urls[0]} (depth={crawl_depth}, Playwright)...")
+            set_status_bar(
+                f"\033[2m[~] ⠋ Browser crawl | depth 0/{crawl_depth} | "
+                f"0 pages visited | 0 target(s) found\033[0m"
             )
-        finally:
-            clear_status_bar()
+            try:
+                crawl_result = browser_crawl(
+                    urls[0],
+                    depth=crawl_depth,
+                    auth_headers=auth_headers,
+                    on_progress=_crawl_progress,
+                )
+            finally:
+                clear_status_bar()
+        else:
+            from ai_xss_generator.crawler import crawl as crawl_site, CrawlResult
+            step(f"Crawling {urls[0]} (depth={crawl_depth})...")
+            set_status_bar(
+                f"\033[2m[~] ⠋ Crawling | depth 0/{crawl_depth} | "
+                f"0 pages visited | 0 target(s) found\033[0m"
+            )
+            try:
+                crawl_result = crawl_site(
+                    urls[0],
+                    depth=crawl_depth,
+                    rate=args.rate,
+                    waf=waf,
+                    auth_headers=auth_headers,
+                    on_progress=_crawl_progress,
+                )
+            finally:
+                clear_status_bar()
 
         post_forms = crawl_result.post_forms
         crawled_pages = crawl_result.visited_urls

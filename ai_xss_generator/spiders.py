@@ -66,19 +66,23 @@ def crawl_urls(
     rate: float = 25.0,
     waf: str | None = None,
     auth_headers: dict[str, str] | None = None,
+    detect_waf_on_seed: bool = False,
 ) -> dict[str, dict[str, Any]]:
     """Fetch a list of URLs and return parsed results keyed by URL.
 
     Parameters
     ----------
-    urls:         URLs to fetch.
-    rate:         Max requests per second. 0 disables throttling entirely.
-    waf:          Detected/known WAF name. Used to decide fetch strategy.
-    auth_headers: Extra headers (e.g. Authorization, Cookie) merged into every
-                  request so authenticated pages are fetched correctly.
+    urls:               URLs to fetch.
+    rate:               Max requests per second. 0 disables throttling entirely.
+    waf:                Detected/known WAF name. Used to decide fetch strategy.
+    auth_headers:       Extra headers (e.g. Authorization, Cookie) merged into every
+                        request so authenticated pages are fetched correctly.
+    detect_waf_on_seed: When True and waf is None, detect the WAF from the first
+                        successful response and store it as __detected_waf__ in results.
     """
     url_list = [u.strip() for u in urls if u and u.strip()]
     results: dict[str, dict[str, Any]] = {}
+    _waf_detected: bool = False
     delay = (1.0 / rate) if rate > 0 else 0
 
     user_agents = (
@@ -117,6 +121,15 @@ def crawl_urls(
                 try:
                     response = session.get(url, **fetch_kwargs)
                     results[url] = _build_result(url, response)
+                    if detect_waf_on_seed and not _waf_detected and waf is None:
+                        try:
+                            from ai_xss_generator.waf_detect import detect_waf as _detect_waf
+                            _waf_name = _detect_waf(response)
+                            if _waf_name:
+                                results["__detected_waf__"] = {"waf": _waf_name}
+                        except Exception:
+                            pass
+                        _waf_detected = True
                     continue
                 except Exception as exc:
                     curl_error = exc
@@ -127,6 +140,15 @@ def crawl_urls(
                             h1_kwargs = {**fetch_kwargs, "http_version": CurlHttpVersion.V1_1}
                             response = session.get(url, **h1_kwargs)
                             results[url] = _build_result(url, response)
+                            if detect_waf_on_seed and not _waf_detected and waf is None:
+                                try:
+                                    from ai_xss_generator.waf_detect import detect_waf as _detect_waf
+                                    _waf_name = _detect_waf(response)
+                                    if _waf_name:
+                                        results["__detected_waf__"] = {"waf": _waf_name}
+                                except Exception:
+                                    pass
+                                _waf_detected = True
                             continue
                         except Exception as exc2:
                             curl_error = exc2
@@ -137,6 +159,15 @@ def crawl_urls(
                 try:
                     response = _fetch_with_playwright(url, proxy=proxy, auth_headers=auth_headers or {})
                     results[url] = _build_result(url, response, note="Fetched with Playwright (WAF bypass).")
+                    if detect_waf_on_seed and not _waf_detected and waf is None:
+                        try:
+                            from ai_xss_generator.waf_detect import detect_waf as _detect_waf
+                            _waf_name = _detect_waf(response)
+                            if _waf_name:
+                                results["__detected_waf__"] = {"waf": _waf_name}
+                        except Exception:
+                            pass
+                        _waf_detected = True
                     continue
                 except Exception as exc:
                     results[url] = {"source": url, "source_type": "url", "error": str(exc)}
