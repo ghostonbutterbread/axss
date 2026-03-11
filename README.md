@@ -233,6 +233,9 @@ axss --help
 | `--header 'Name: Value'` | — | Add a request header (repeatable) |
 | `--cookies FILE` | — | Load session cookies from Netscape cookies.txt |
 | `-m, --model MODEL` | config | Override local Ollama model |
+| `--backend api\|cli` | config | Cloud escalation backend: `api` = OpenRouter/OpenAI keys, `cli` = CLI subprocess |
+| `--cli-tool claude\|codex` | config | CLI tool to use when `--backend cli` (requires tool on PATH and logged in) |
+| `--cli-model MODEL` | — | Model to pass to the CLI tool (e.g. `claude-opus-4-6`); omit for tool default |
 | `--no-cloud` | off | Never escalate to cloud LLM |
 | `--public` | off | Fetch community XSS payloads and inject as reference |
 | `-o, --output` | `list` | Output format: `list`, `heat`, `json`, `interactive` |
@@ -300,6 +303,10 @@ playwright install chromium --with-deps
 
 ### Cloud escalation (optional)
 
+Two backends are supported — configure one or both, axss picks the best available:
+
+**API backend (default):** per-token billing via OpenRouter or OpenAI.
+
 ```
 # ~/.axss/keys
 openrouter_api_key = sk-or-v1-...
@@ -308,7 +315,22 @@ openai_api_key     = sk-...
 
 Or via environment: `OPENROUTER_API_KEY`, `OPENAI_API_KEY`. Verify with `axss --check-keys`.
 
-Cloud escalation only fires when local model output fails a quality check. Use `--no-cloud` to disable even if keys are set.
+**CLI backend:** subscription-based auth via `claude` or `codex` CLI — no API key, no per-token cost. Requires the CLI tool to be installed and logged in.
+
+```bash
+# Use Claude CLI (subscription auth, no API key needed)
+axss -u "https://target.com" --active --backend cli --cli-tool claude
+
+# Use specific model
+axss -u "https://target.com" --active --backend cli --cli-tool claude --cli-model claude-opus-4-6
+
+# Use Codex CLI
+axss -u "https://target.com" --active --backend cli --cli-tool codex
+```
+
+`setup.sh` auto-detects `claude`/`codex` on PATH and writes the result to `~/.axss/config.json`. Use `--backend api|cli` flag to override at runtime.
+
+Cloud escalation only fires when local model output fails a quality check. Use `--no-cloud` to disable entirely.
 
 ### Model escalation chain
 
@@ -319,10 +341,13 @@ Context-aware generator (always runs, no LLM)
 Local Ollama (qwen3.5:9b default, findings-enriched prompt)
     │ if output weak (< 3 payloads or all generic)
     ▼
-OpenRouter (preferred cloud)
-    │ if unavailable or fails
-    ▼
-OpenAI (gpt-4o-mini fallback)
+Cloud escalation (one of:)
+  ├── CLI backend (--backend cli)
+  │     claude -p PROMPT [--model MODEL]
+  │     codex exec PROMPT --skip-git-repo-check
+  └── API backend (--backend api, default)
+        OpenRouter → anthropic/claude-3-5-sonnet (preferred)
+        OpenAI → gpt-4o-mini (fallback)
 ```
 
 ---
@@ -335,9 +360,14 @@ OpenAI (gpt-4o-mini fallback)
 {
   "default_model": "qwen3.5:9b",
   "use_cloud": true,
-  "cloud_model": "anthropic/claude-3-5-sonnet"
+  "cloud_model": "anthropic/claude-3-5-sonnet",
+  "ai_backend": "cli",
+  "cli_tool": "claude",
+  "cli_model": null
 }
 ```
+
+`ai_backend` and `cli_tool` are auto-configured by `setup.sh` based on what CLI tools are found on PATH. Set `ai_backend` to `"api"` to use OpenRouter/OpenAI keys instead.
 
 ### `~/.axss/keys`
 
