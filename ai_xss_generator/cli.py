@@ -913,7 +913,7 @@ def _resolve_session(
         config_summary=config_summary,
         total_items=total_items,
     )
-    log.debug("New session: %s", seed_hash[:16])
+    info(f"New session: {seed_hash[:16]}")
     return session
 
 
