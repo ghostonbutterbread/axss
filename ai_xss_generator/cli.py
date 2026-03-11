@@ -95,6 +95,11 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
             "probe request to each service, and reports status."
         ),
     )
+    action_group.add_argument(
+        "--clear-reports",
+        action="store_true",
+        help="--clear-reports  Delete all saved reports from ~/.axss/reports/.",
+    )
 
     # Payload sourcing flags
     parser.add_argument(
@@ -934,7 +939,7 @@ def main(argv: list[str] | None = None) -> int:
         _logging.getLogger("scrapling").setLevel(_logging.WARNING)
 
     has_target = bool(args.url or args.urls or args.input)
-    is_utility = args.list_models or args.search_models or args.check_keys
+    is_utility = args.list_models or args.search_models or args.check_keys or args.clear_reports
 
     # Validate: need at least one of: target, --public, or a utility action
     if not has_target and not args.public and not is_utility:
@@ -957,6 +962,22 @@ def main(argv: list[str] | None = None) -> int:
         print()
         any_invalid = any(r["status"] in {"invalid", "error"} for r in results)
         return 1 if any_invalid else 0
+
+    # --- Utility: clear reports ---
+    if args.clear_reports:
+        from ai_xss_generator.config import CONFIG_DIR
+        reports_dir = CONFIG_DIR / "reports"
+        if not reports_dir.exists():
+            info("No reports directory found — nothing to clear.")
+            return 0
+        files = sorted(reports_dir.glob("*.md"))
+        if not files:
+            info("No reports found.")
+            return 0
+        for f in files:
+            f.unlink()
+        success(f"Cleared {len(files)} report(s) from {reports_dir}")
+        return 0
 
     # --- Utility: list / search models ---
     if args.list_models:
