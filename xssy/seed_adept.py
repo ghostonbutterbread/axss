@@ -1135,11 +1135,8 @@ def main() -> int:
 
 
 def _count_partition(context_type: str) -> int:
-    from ai_xss_generator.findings import _partition_path
-    path = _partition_path(context_type)
-    if not path.exists():
-        return 0
-    return sum(1 for l in path.read_text(encoding="utf-8").splitlines() if l.strip())
+    from ai_xss_generator.findings import count_findings
+    return count_findings(context_type)
 
 
 if __name__ == "__main__":

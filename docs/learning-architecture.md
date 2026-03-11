@@ -1,107 +1,92 @@
-# Verified Learning Architecture
+# Learning Architecture
 
-## Goal
+## Design goals
 
-Make `axss` learn from evidence without poisoning future generations with unverified guesses.
+- Learn generalizable XSS bypass patterns across scans without accumulating noise
+- Keep scan performance fast — no disk I/O on the hot path
+- No manual review queue — only deliberately curated findings enter the knowledge base
 
-The system now has two complementary memory paths:
+## Two-tier model
 
-- findings memory
-  Exact payload evidence and exploit outcomes.
-- lesson memory
-  Reusable logic, filter, and mapping observations.
+### Curated findings (persisted, global)
 
-## Memory tiers
+Stored in SQLite at `~/.axss/knowledge.db`.
+All entries are globally scoped — no per-host partitioning.
+Indexed by `context_type`, `bypass_family`, `waf_name`, `delivery_mode` for fast retrieval.
 
-- `curated`
-  Hand-authored or manually reviewed findings. Highest trust.
-- `verified-runtime`
-  Payloads confirmed during active scans or other browser-verified execution paths.
-- `experimental`
-  Offline-generated or otherwise unverified candidates. Useful for review, not trusted retrieval.
+Populated two ways:
+1. **Seed scripts** (`xssy/seed_*.py`) — hand-curated lab knowledge written directly to the store
+2. **Curation pipeline** (`xssy/curate.py`) — LLM extracts a structured finding from lab payloads and saves it
 
-## Promotion rules
+Retrieval scores candidates by: context_type / sink_type match, surviving chars overlap,
+WAF name, delivery mode, framework hints, and auth context.
 
-- Active scan confirmations are promoted directly into `verified-runtime`.
-- Offline `xssy/learn.py` generations are stored as `experimental`.
-- Duplicate findings are merged.
-  Higher-trust tiers upgrade lower-trust entries instead of creating parallel records.
+### Session lessons (ephemeral, in-memory)
 
-## Retrieval rules
+`Lesson` objects built by `ai_xss_generator/lessons.py` from probe results during a scan.
+They carry three kinds of observations:
 
-- Default retrieval only uses `curated` and `verified-runtime`.
-- `experimental` findings are excluded from normal prompt context unless a caller explicitly opts in.
-- Retrieval stays hybrid and structured:
-  exact sink/context matches first, surviving-char overlap second, tier confidence last.
-- Retrieval is target-aware:
-  host-scoped findings only apply back to the same host, while global findings can transfer across targets.
-- Retrieval also scores landscape matches:
-  WAF, delivery mode, framework hints, and auth context all influence ranking.
+- `xss_logic` — reflection context type detected by probing (e.g. `html_attr_value`, `js_string_dq`)
+- `filter` — surviving and blocked probe characters for a confirmed reflection sink
+- `mapping` — application hints: forms, authenticated surfaces, framework-rendered DOM, source presence
 
-## Lesson memory
+Lessons are passed directly into the payload generation prompt as context and discarded
+when the scan ends. Nothing is written to disk.
 
-Lesson memory lives in `~/.axss/lessons/` and stores three kinds of reusable observations:
+## Curation pipeline (`xssy/curate.py`)
 
-- `xss_logic`
-  Reflection logic such as `html_attr_url`, `js_string_dq`, or `html_body`.
-- `filter`
-  Surviving and blocked probe characters for a confirmed reflection.
-- `mapping`
-  Non-payload application hints: forms, authenticated workflows, framework-rendered surfaces, and DOM-source presence.
+```
+lab HTML → parse_target() → generate_payloads() → curate_lab_finding()
+                                                          │
+                                              configured AI backend
+                                         (cli_tool=claude/codex or api)
+                                                          │
+                                              structured Finding JSON
+                                                          │
+                                              save_finding() → SQLite
+```
 
-Active probe observations are trusted runtime lessons because they describe what the application actually did, even when no payload executed. Offline lab parsing writes experimental mapping lessons.
+`curate_lab_finding()` sends the top candidate payloads + parsed page context to the
+configured AI backend (same `ai_backend` / `cli_tool` / `cloud_model` as scanning),
+asks it to describe the best bypass technique as a structured finding, and saves the
+result with a confidence < 1.0 (not browser-confirmed).
 
-## Memory fingerprint
+## Storage layout
 
-Each finding can carry a reusable fingerprint:
+```
+~/.axss/
+  knowledge.db          SQLite — curated_findings table (WAL mode)
+  config.json           AppConfig (ai_backend, cli_tool, cloud_model, ...)
+  keys                  API keys (openrouter_api_key, openai_api_key, xssy_jwt, ...)
+  .jsonl_migrated       Sentinel: one-time migration of old JSONL partitions complete
+  findings/             (legacy JSONL backup — not used after migration)
+```
 
-- sink type
-- context type
-- surviving chars
-- target scope (`host` or `global`)
-- WAF name
-- delivery mode (`get`, `post`, `offline`, etc.)
-- framework hints
-- auth requirement
+## CLI memory commands
+
+| Command | Description |
+|---------|-------------|
+| `axss --memory-list` | Show all curated findings |
+| `axss --memory-stats` | Count findings by context type |
+| `axss --memory-export PATH` | Export all findings to JSON file |
+| `axss --memory-import PATH` | Import findings from JSON file |
 
 ## File ownership
 
-- `xssy/learn.py`
-  Offline lab runner. Generates experimental findings and mapping lessons.
-- `ai_xss_generator/active/worker.py`
-  Runtime promotion path for verified findings and probe-derived logic/filter lessons.
-- `ai_xss_generator/findings.py`
-  Persistent store, merge rules, retrieval policy.
-- `ai_xss_generator/learning.py`
-  Shared constructors for promoted findings.
-- `ai_xss_generator/lessons.py`
-  Lesson storage, extraction, and retrieval for logic/filter/mapping memory.
+| File | Role |
+|------|------|
+| `ai_xss_generator/store.py` | SQLite backend (schema, CRUD, migration) |
+| `ai_xss_generator/findings.py` | `Finding` dataclass, retrieval scoring, public API |
+| `ai_xss_generator/lessons.py` | Ephemeral `Lesson` objects, prompt formatting |
+| `ai_xss_generator/learning.py` | `build_memory_profile()` — context fingerprinting |
+| `xssy/curate.py` | LLM curation pipeline — extracts Finding from lab payloads |
+| `xssy/learn.py` | Lab runner — fetch → parse → generate → curate |
+| `xssy/seed_*.py` | Hand-curated seed findings written directly to the store |
+| `ai_xss_generator/active/worker.py` | Builds session lessons from probe results, passes to generation |
 
-## Review workflow
+## Invariants
 
-- `axss --memory-review`
-  Open the interactive review inbox for pending experimental memory items.
-- `axss --memory-list`
-  Show the current pending queue as a table without entering the interactive flow.
-- `--memory-review [all|labs|targets]`
-  The source filter is inline on the review command and defaults to `all`.
-- `--memory-list [all|labs|targets]`
-  The source filter is inline on the list command and defaults to `all`.
-- `--memory-stats [all|labs|targets]`
-  The source filter is inline on the stats command and defaults to `all`.
-- `axss --memory-show <id>`
-  Inspect one memory item in full.
-- `axss --memory-promote <id> --memory-tier curated --memory-scope global`
-  Promote a reviewed memory item into trusted memory.
-- `axss --memory-reject <id>`
-  Mark a memory item as rejected so it leaves the queue.
-
-## Re-entry guidance
-
-Future work should preserve these invariants:
-
-`generated payload != learned fact`
-
-`observed reflection/filter behavior == valid lesson`
-
-Only verified execution or curated review should produce trusted memory.
+- `generated payload ≠ curated fact` — only LLM-extracted structured findings enter the store
+- `observed filter behaviour == valid session lesson` — probe results inform generation immediately
+- Confirmed XSS goes to the scan report, not the knowledge base
+- All curated findings are global — no target-host contamination
