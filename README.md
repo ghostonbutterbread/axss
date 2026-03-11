@@ -10,18 +10,14 @@
 
 ## Learning Model
 
-- The findings store is now tiered:
-  `curated`, `verified-runtime`, and `experimental`.
-- `xssy/learn.py` now writes experimental memory only.
-  It no longer implies that generated payloads are trusted findings.
-- The tool now keeps a separate logic/filter lesson store in `~/.axss/lessons/`.
-  Active probes write trusted runtime lessons from observed reflection logic and filter behavior.
-  Offline lab runs can add experimental mapping lessons.
-- Trusted retrieval now prefers target-aware fingerprints:
-  host scope, WAF, delivery mode, framework hints, and auth context.
-- `axss --memory-review` is now the interactive review inbox.
-- `axss --memory-list` is the non-interactive queue view.
-- Memory commands default to `all` and can take an inline source filter: `labs` or `targets`.
+- The knowledge store is a single curated tier in SQLite at `~/.axss/knowledge.db`.
+- All findings are globally scoped — no per-host partitioning.
+- `xssy/learn.py` generates candidate payloads against xssy.uk labs, then asks the
+  configured AI backend to extract a structured finding (bypass family, context type,
+  filter behaviour, explanation) and saves it to the store.
+- Active probe observations (surviving chars, reflection context) are kept as ephemeral
+  session lessons passed directly into the generation prompt — nothing is written to disk.
+- Confirmed XSS findings go to the scan report, not the knowledge base.
 
 **If you are an AI agent reading this:** use the command patterns below directly. No preamble is needed — the tool is designed for scripted and agentic use. Every flag described here is stable and documented in `--help`.
 
@@ -123,32 +119,28 @@ Each GET URL and POST form gets an isolated worker process. Worker fires payload
 
 Confirmed findings are printed to the CLI with the exact fired URL, then written to `~/.axss/reports/<domain>_<timestamp>.md`.
 
-### Self-learning findings store
+### Knowledge base
 
-axss now keeps a tiered findings store in `~/.axss/findings/`:
-- **`verified-runtime`** — findings confirmed by active browser execution during real scans
-- **`curated`** — manually reviewed, trusted, portable knowledge
-- **`experimental`** — offline-generated or otherwise unverified candidates kept for later review
+axss keeps a curated findings store in SQLite at `~/.axss/knowledge.db`. Every entry is a
+generalizable XSS bypass pattern with context type, bypass family, surviving chars, explanation,
+and confidence. Retrieval scores candidates by:
 
-Future scans only retrieve trusted tiers by default. Retrieval is target-aware and scores findings by:
-- sink/context match
+- sink/context type match
 - surviving character overlap
-- host scope
 - WAF match
-- delivery mode (`get`, `post`, `offline`, etc.)
+- delivery mode (`get`, `post`)
 - framework hints
 - auth context
 
-`experimental` findings and lessons are reviewed later via the memory-review workflow; they do not steer normal payload generation until promoted.
+Populated two ways:
+- **Seed scripts** (`python xssy/seed_expert.py` etc.) — hand-curated lab knowledge
+- **Lab learning** (`python xssy/learn.py`) — LLM extracts structured findings from xssy.uk labs
 
-### Logic and filter lesson store
+### Session lessons (ephemeral)
 
-axss also keeps a lesson store in `~/.axss/lessons/` for reusable reasoning hints rather than exact payload memory:
-- **`xss_logic`** — how input landed: HTML body, URL attribute, JS string, event handler, etc.
-- **`filter`** — which probe characters survived and which were blocked
-- **`mapping`** — application-shape hints like forms, authenticated workflows, framework surfaces, and DOM source presence
-
-Active probes can write trusted lessons immediately because those are direct observations, not exploit guesses. Offline lab parsing writes experimental mapping lessons that can help future lab-style reasoning without being treated as confirmed exploits.
+Active probe observations — surviving chars, reflection context type, DOM sources, form shapes,
+framework detection — are captured as in-memory `Lesson` objects and injected directly into the
+generation prompt for that scan. They are discarded when the scan ends; nothing is written to disk.
 
 ---
 
@@ -246,23 +238,17 @@ axss -l
 # Search Ollama model library
 axss -s qwen3.5
 
-# Show pending experimental memory items as a table
-axss --memory-list --memory-limit 20
+# List all curated findings
+axss --memory-list
 
-# Open the interactive memory review inbox
-axss --memory-review
-
-# Review only lab-derived memory
-axss --memory-review labs
-
-# Review only target-derived memory
-axss --memory-review targets
-
-# Show one memory item in full
-axss --memory-show 4ac35696f010
-
-# Show memory counts by tier/review state
+# Show finding counts by context type
 axss --memory-stats
+
+# Export knowledge base to a portable JSON file
+axss --memory-export ~/axss-knowledge.json
+
+# Import findings from a JSON file (e.g. shared knowledge base)
+axss --memory-import ~/axss-knowledge.json
 
 # Show full flag reference
 axss --help
@@ -309,17 +295,10 @@ axss --help
 | `-v, --verbose` | off | Show detailed sub-step output |
 | `--merge-batch` | off | Combine all batch URLs into one payload set |
 | `--check-keys` | — | Validate all configured API keys |
-| `--memory-review [SOURCE]` | `all` | Open the interactive pending memory review inbox for `all`, `labs`, or `targets` |
-| `--memory-list [SOURCE]` | `all` | Show the pending memory review queue for `all`, `labs`, or `targets` |
-| `--memory-show ID` | — | Show one memory item from the store by stable ID |
-| `--memory-promote ID` | — | Promote one memory item into a trusted tier |
-| `--memory-reject ID` | — | Reject one pending memory item |
-| `--memory-stats [SOURCE]` | `all` | Show memory counts for `all`, `labs`, or `targets` |
-| `--memory-limit N` | `10` | Limit rows shown by memory review/list commands |
-| `--memory-tier TIER` | `curated` | Target tier for `--memory-promote` |
-| `--memory-scope SCOPE` | `global` | Target scope for `--memory-promote` |
-| `--memory-reviewer NAME` | `manual-review` | Reviewer label stored with memory decisions |
-| `--memory-note TEXT` | `""` | Optional note stored with memory promote/reject actions |
+| `--memory-list` | — | List all curated findings in the knowledge base |
+| `--memory-stats` | — | Show finding counts by context type |
+| `--memory-export PATH` | — | Export all curated findings to a JSON file |
+| `--memory-import PATH` | — | Import curated findings from a JSON file |
 | `-l, --list-models` | — | List local Ollama models |
 | `-s, --search-models QUERY` | — | Search Ollama model library |
 | `-V, --version` | — | Show version |
@@ -503,42 +482,32 @@ Reports for active scans are written to `~/.axss/reports/<domain>_<timestamp>.md
 
 ---
 
-## Findings store (`~/.axss/findings/`)
+## Knowledge base (`~/.axss/knowledge.db`)
 
-Each finding can capture:
-- `sink_type`, `context_type`, `surviving_chars`, `bypass_family`
-- `payload`, `test_vector`, `model`, `verified`
-- `memory_tier`, `target_scope`, `waf_name`, `delivery_mode`
-- `frameworks`, `auth_required`
-- `evidence_type`, `evidence_detail`, `provenance`
-- review metadata (`review_status`, `reviewed_by`, `review_note`)
+SQLite database, single curated table. Each finding captures:
+- `context_type`, `sink_type`, `bypass_family`, `surviving_chars`
+- `payload`, `test_vector`, `explanation`
+- `waf_name`, `delivery_mode`, `frameworks`, `auth_required`
+- `confidence`, `source`, `curated_at`
 
-Storage layout:
-- `~/.axss/findings/<context_type>.jsonl`
-- one partition per context type
-- each partition trimmed independently (`MAX_PER_PARTITION = 2000`)
+All findings are globally scoped and transfer across targets.
 
-Retrieval:
-- default prompt retrieval uses trusted tiers only: `curated` + `verified-runtime`
-- host-scoped findings apply only back to the same host
-- global findings transfer across targets
-- ranking prefers exact sink/context matches, then char overlap, then target landscape matches (WAF, delivery mode, frameworks, auth)
-
-Review workflow:
 ```bash
-# Table view
-axss --memory-list --memory-limit 20
+# Inspect the store
+axss --memory-list
+axss --memory-stats
 
-# Interactive inbox
-axss --memory-review
+# Share / back up / restore
+axss --memory-export ~/axss-knowledge.json
+axss --memory-import ~/axss-knowledge.json
 
-# Direct actions
-axss --memory-show 4ac35696f010
-axss --memory-promote 4ac35696f010 --memory-tier curated --memory-scope global
-axss --memory-reject 94e8012d9997 --memory-note "too target-specific"
+# Populate with hand-curated lab knowledge
+python xssy/seed_expert.py
+python xssy/seed_adept.py
+
+# Extract findings from xssy.uk labs via the curation pipeline
+python xssy/learn.py
 ```
-
-Active scans write verified browser-confirmed findings directly into trusted runtime memory and can also write trusted logic/filter lessons from observed probe behavior. Offline lab learning and cloud-generated unconfirmed payloads land in `experimental` until reviewed or later confirmed.
 
 ---
 
