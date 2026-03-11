@@ -9,6 +9,22 @@ from typing import Callable
 from ai_xss_generator import __version__
 from ai_xss_generator.config import APP_NAME, CONFIG_PATH, DEFAULT_MODEL, load_config
 from ai_xss_generator.console import header, info, step, success, warn, waf_label
+from ai_xss_generator.findings import (
+    MEMORY_SOURCE_ALL,
+    MEMORY_SOURCE_LABS,
+    MEMORY_SOURCE_TARGETS,
+    MEMORY_TIER_CURATED,
+    MEMORY_TIER_EXPERIMENTAL,
+    MEMORY_TIER_VERIFIED_RUNTIME,
+    TARGET_SCOPE_GLOBAL,
+    TARGET_SCOPE_HOST,
+    find_finding_by_id,
+    finding_memory_source,
+    finding_id,
+    memory_stats,
+    review_finding,
+    review_queue,
+)
 from ai_xss_generator.models import check_api_keys, generate_payloads, list_ollama_models, search_ollama_models
 from ai_xss_generator.output import render_batch_json, render_heat, render_json, render_list, render_summary
 from ai_xss_generator.parser import BatchParseError, parse_target, parse_targets, read_url_list
@@ -16,6 +32,15 @@ from ai_xss_generator.plugin_system import PluginRegistry
 from ai_xss_generator.public_payloads import FetchResult, fetch_public_payloads, select_reference_payloads
 from ai_xss_generator.types import GenerationResult, ParsedContext
 from ai_xss_generator.waf_detect import SUPPORTED_WAFS, detect_waf
+from ai_xss_generator.lessons import (
+    find_lesson_by_id,
+    lesson_id,
+    lesson_memory_source,
+    memory_stats as lesson_memory_stats,
+    relevant_lessons,
+    review_lesson,
+    review_queue as lesson_review_queue,
+)
 
 
 class _HelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter):
@@ -27,6 +52,16 @@ class _HelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescrip
         if default in (None, False, argparse.SUPPRESS):
             return help_text
         return super()._get_help_string(action)
+
+
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than 0")
+    return parsed
 
 
 def build_parser(config_default_model: str) -> argparse.ArgumentParser:
@@ -99,6 +134,45 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
         "--clear-reports",
         action="store_true",
         help="--clear-reports  Delete all saved reports from ~/.axss/reports/.",
+    )
+    action_group.add_argument(
+        "--memory-review",
+        nargs="?",
+        metavar="SOURCE",
+        choices=(MEMORY_SOURCE_ALL, MEMORY_SOURCE_LABS, MEMORY_SOURCE_TARGETS),
+        const=MEMORY_SOURCE_ALL,
+        help="--memory-review [SOURCE]  Open the interactive pending memory review inbox for all, labs, or targets.",
+    )
+    action_group.add_argument(
+        "--memory-list",
+        nargs="?",
+        metavar="SOURCE",
+        choices=(MEMORY_SOURCE_ALL, MEMORY_SOURCE_LABS, MEMORY_SOURCE_TARGETS),
+        const=MEMORY_SOURCE_ALL,
+        help="--memory-list [SOURCE]  Show the pending memory review queue for all, labs, or targets.",
+    )
+    action_group.add_argument(
+        "--memory-show",
+        metavar="ID",
+        help="--memory-show ID  Show one memory item from the store by stable ID.",
+    )
+    action_group.add_argument(
+        "--memory-promote",
+        metavar="ID",
+        help="--memory-promote ID  Promote one memory item from the review queue into a trusted tier.",
+    )
+    action_group.add_argument(
+        "--memory-reject",
+        metavar="ID",
+        help="--memory-reject ID  Reject one pending memory item so it no longer appears in review.",
+    )
+    action_group.add_argument(
+        "--memory-stats",
+        nargs="?",
+        metavar="SOURCE",
+        choices=(MEMORY_SOURCE_ALL, MEMORY_SOURCE_LABS, MEMORY_SOURCE_TARGETS),
+        const=MEMORY_SOURCE_ALL,
+        help="--memory-stats [SOURCE]  Show memory counts for all, labs, or targets.",
     )
 
     # Payload sourcing flags
@@ -407,6 +481,39 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
             "Omit to use the CLI tool's default model."
         ),
     )
+    parser.add_argument(
+        "--memory-limit",
+        metavar="N",
+        type=_positive_int,
+        default=10,
+        help="--memory-limit N  Limit memory review output rows (default: 10).",
+    )
+    parser.add_argument(
+        "--memory-tier",
+        metavar="TIER",
+        choices=(MEMORY_TIER_CURATED, MEMORY_TIER_VERIFIED_RUNTIME, MEMORY_TIER_EXPERIMENTAL),
+        default=MEMORY_TIER_CURATED,
+        help="--memory-tier TIER  Target tier when using --memory-promote.",
+    )
+    parser.add_argument(
+        "--memory-scope",
+        metavar="SCOPE",
+        choices=(TARGET_SCOPE_GLOBAL, TARGET_SCOPE_HOST),
+        default=TARGET_SCOPE_GLOBAL,
+        help="--memory-scope SCOPE  Target scope when using --memory-promote.",
+    )
+    parser.add_argument(
+        "--memory-reviewer",
+        metavar="NAME",
+        default="manual-review",
+        help="--memory-reviewer NAME  Reviewer label written into memory promotion metadata.",
+    )
+    parser.add_argument(
+        "--memory-note",
+        metavar="TEXT",
+        default="",
+        help="--memory-note TEXT  Optional review note stored with a promote/reject action.",
+    )
 
     return parser
 
@@ -430,6 +537,383 @@ def _render_table(rows: list[dict[str, str]]) -> str:
         for row in rows
     ]
     return "\n".join([header_line, separator, *body])
+
+
+def _memory_item_kind(item: object) -> str:
+    return "lesson" if hasattr(item, "lesson_type") else "finding"
+
+
+def _memory_item_id(item: object) -> str:
+    return lesson_id(item) if _memory_item_kind(item) == "lesson" else finding_id(item)
+
+
+def _memory_item_source(item: object) -> str:
+    return lesson_memory_source(item) if _memory_item_kind(item) == "lesson" else finding_memory_source(item)
+
+
+def _find_memory_item_by_id(item_id: str) -> tuple[str, object] | None:
+    finding = find_finding_by_id(item_id)
+    if finding is not None:
+        return "finding", finding
+    lesson = find_lesson_by_id(item_id)
+    if lesson is not None:
+        return "lesson", lesson
+    return None
+
+
+def _review_memory_item(
+    item_id: str,
+    *,
+    reviewer: str,
+    note: str,
+    promote_to: str | None = None,
+    target_scope: str | None = None,
+    reject: bool = False,
+) -> tuple[str, object]:
+    located = _find_memory_item_by_id(item_id)
+    if located is None:
+        raise KeyError(f"memory item {item_id!r} not found")
+    kind, item = located
+    if kind == "lesson":
+        return kind, review_lesson(
+            item_id,
+            reviewer=reviewer,
+            note=note,
+            promote_to=promote_to,
+            target_scope=target_scope,
+            reject=reject,
+        )
+    return kind, review_finding(
+        item_id,
+        reviewer=reviewer,
+        note=note,
+        promote_to=promote_to,
+        target_scope=target_scope,
+        reject=reject,
+    )
+
+
+def _memory_review_queue(limit: int, memory_source: str) -> list[tuple[str, object]]:
+    fetch_limit = max(limit * 2, 25)
+    items: list[tuple[str, object]] = [
+        *[("finding", item) for item in review_queue(limit=fetch_limit, memory_source=memory_source)],
+        *[("lesson", item) for item in lesson_review_queue(limit=fetch_limit, memory_source=memory_source)],
+    ]
+    items.sort(key=lambda entry: (-(1 if entry[0] == "finding" else 0), getattr(entry[1], "ts", "")), reverse=False)
+    items.sort(key=lambda entry: getattr(entry[1], "ts", ""), reverse=True)
+    return items[:limit]
+
+
+def _render_memory_item(item: "object") -> str:
+    kind = _memory_item_kind(item)
+    fields = [
+        ("id", _memory_item_id(item)),
+        ("kind", kind),
+        ("source", _memory_item_source(item)),
+        ("tier", getattr(item, "memory_tier", "-")),
+        ("review_status", getattr(item, "review_status", "-")),
+        ("scope", getattr(item, "target_scope", "-")),
+        ("context", getattr(item, "context_type", "") or "-"),
+        ("sink", getattr(item, "sink_type", "") or "-"),
+        ("waf", getattr(item, "waf_name", "") or "-"),
+        ("delivery", getattr(item, "delivery_mode", "") or "-"),
+        ("frameworks", ",".join(getattr(item, "frameworks", [])) or "-"),
+        ("auth_required", "yes" if getattr(item, "auth_required", False) else "no"),
+        ("target_host", getattr(item, "target_host", "") or "-"),
+        ("provenance", getattr(item, "provenance", "") or "-"),
+        ("reviewed_by", getattr(item, "reviewed_by", "") or "-"),
+        ("reviewed_at", getattr(item, "reviewed_at", "") or "-"),
+    ]
+    lines = [f"{label:>13}: {value}" for label, value in fields]
+
+    if kind == "lesson":
+        lines.append(f"{'lesson_type':>13}: {getattr(item, 'lesson_type', '-')}")
+        lines.append(f"{'title':>13}: {getattr(item, 'title', '-')}")
+        source_pattern = getattr(item, "source_pattern", "")
+        if source_pattern:
+            lines.append(f"{'source_pattern':>13}: {source_pattern}")
+        summary = getattr(item, "summary", "")
+        if summary:
+            lines.append(f"{'summary':>13}: {summary}")
+        surviving = getattr(item, "surviving_chars", "")
+        blocked = getattr(item, "blocked_chars", "")
+        if surviving or blocked:
+            lines.append(f"{'filter':>13}: surviving={surviving or '-'} blocked={blocked or '-'}")
+        evidence_type = getattr(item, "evidence_type", "")
+        if evidence_type:
+            lines.append(f"{'evidence':>13}: {evidence_type}")
+    else:
+        lines.append(f"{'bypass_family':>13}: {getattr(item, 'bypass_family', '') or '-'}")
+        payload = getattr(item, "payload", "")
+        if payload:
+            lines.append(f"{'payload':>13}: {payload}")
+        test_vector = getattr(item, "test_vector", "")
+        if test_vector:
+            lines.append(f"{'test_vector':>13}: {test_vector}")
+        explanation = getattr(item, "explanation", "")
+        if explanation:
+            lines.append(f"{'explanation':>13}: {explanation}")
+        evidence_type = getattr(item, "evidence_type", "")
+        evidence_detail = getattr(item, "evidence_detail", "")
+        if evidence_type or evidence_detail:
+            lines.append(f"{'evidence':>13}: {evidence_type or '-'}")
+            if evidence_detail:
+                lines.append(f"{'':>13}  {evidence_detail}")
+
+    review_note = getattr(item, "review_note", "")
+    if review_note:
+        lines.append(f"{'review_note':>13}: {review_note}")
+    return "\n".join(lines)
+
+
+def _handle_memory_stats(memory_source: str) -> int:
+    finding_stats = memory_stats(memory_source=memory_source)
+    lesson_stats = lesson_memory_stats(memory_source=memory_source)
+    total_stats = {
+        key: finding_stats[key] + lesson_stats[key]
+        for key in finding_stats
+    }
+    print(_render_table([
+        {
+            "kind": "findings",
+            "source": memory_source,
+            "total": str(finding_stats["total"]),
+            "curated": str(finding_stats["curated"]),
+            "verified-runtime": str(finding_stats["verified_runtime"]),
+            "experimental": str(finding_stats["experimental"]),
+            "pending": str(finding_stats["pending_review"]),
+            "approved": str(finding_stats["approved"]),
+            "rejected": str(finding_stats["rejected"]),
+        },
+        {
+            "kind": "lessons",
+            "source": memory_source,
+            "total": str(lesson_stats["total"]),
+            "curated": str(lesson_stats["curated"]),
+            "verified-runtime": str(lesson_stats["verified_runtime"]),
+            "experimental": str(lesson_stats["experimental"]),
+            "pending": str(lesson_stats["pending_review"]),
+            "approved": str(lesson_stats["approved"]),
+            "rejected": str(lesson_stats["rejected"]),
+        },
+        {
+            "kind": "all",
+            "source": memory_source,
+            "total": str(total_stats["total"]),
+            "curated": str(total_stats["curated"]),
+            "verified-runtime": str(total_stats["verified_runtime"]),
+            "experimental": str(total_stats["experimental"]),
+            "pending": str(total_stats["pending_review"]),
+            "approved": str(total_stats["approved"]),
+            "rejected": str(total_stats["rejected"]),
+        },
+    ]))
+    return 0
+
+
+def _handle_memory_list(limit: int, memory_source: str) -> int:
+    items = _memory_review_queue(limit=limit, memory_source=memory_source)
+    if not items:
+        info(f"No pending experimental memory items in the review queue for source={memory_source}.")
+        return 0
+    rows = []
+    for kind, item in items:
+        detail = item.payload[:60] if kind == "finding" else getattr(item, "title", "")[:60]
+        rows.append({
+            "id": _memory_item_id(item),
+            "kind": kind,
+            "context": getattr(item, "context_type", "") or "-",
+            "topic": getattr(item, "bypass_family", "") if kind == "finding" else getattr(item, "lesson_type", ""),
+            "scope": getattr(item, "target_scope", "-"),
+            "source": _memory_item_source(item),
+            "waf": getattr(item, "waf_name", "") or "-",
+            "delivery": getattr(item, "delivery_mode", "") or "-",
+            "frameworks": ",".join(getattr(item, "frameworks", [])) or "-",
+            "detail": detail or "-",
+        })
+    print(_render_table(rows))
+    return 0
+
+
+def _similar_trusted_rows(item: "object", limit: int = 3) -> list[dict[str, str]]:
+    kind = _memory_item_kind(item)
+    rows = []
+    if kind == "lesson":
+        matches = relevant_lessons(
+            sink_type=getattr(item, "sink_type", ""),
+            context_type=getattr(item, "context_type", ""),
+            surviving_chars=getattr(item, "surviving_chars", ""),
+            target_host=getattr(item, "target_host", "") if getattr(item, "target_scope", "") == TARGET_SCOPE_HOST else "",
+            waf_name=getattr(item, "waf_name", ""),
+            delivery_mode=getattr(item, "delivery_mode", ""),
+            frameworks=tuple(getattr(item, "frameworks", [])),
+            auth_required=bool(getattr(item, "auth_required", False)),
+            limit=limit,
+        )
+        for match in matches:
+            rows.append({
+                "id": lesson_id(match),
+                "tier": match.memory_tier,
+                "scope": match.target_scope,
+                "detail": getattr(match, "title", "")[:60],
+            })
+        return rows
+
+    from ai_xss_generator.findings import relevant_findings
+    matches = relevant_findings(
+        sink_type=getattr(item, "sink_type", ""),
+        context_type=getattr(item, "context_type", ""),
+        surviving_chars=getattr(item, "surviving_chars", ""),
+        target_host=getattr(item, "target_host", "") if getattr(item, "target_scope", "") == TARGET_SCOPE_HOST else "",
+        waf_name=getattr(item, "waf_name", ""),
+        delivery_mode=getattr(item, "delivery_mode", ""),
+        frameworks=tuple(getattr(item, "frameworks", [])),
+        auth_required=bool(getattr(item, "auth_required", False)),
+        limit=limit,
+    )
+    for match in matches:
+        rows.append({
+            "id": finding_id(match),
+            "tier": match.memory_tier,
+            "scope": match.target_scope,
+            "detail": match.payload[:60],
+        })
+    return rows
+
+
+def _handle_memory_review_interactive(args: argparse.Namespace) -> int:
+    items = _memory_review_queue(limit=args.memory_limit, memory_source=args.memory_source)
+    if not items:
+        info(f"No pending experimental memory items in the review queue for source={args.memory_source}.")
+        return 0
+
+    total = len(items)
+    idx = 0
+    while idx < total:
+        _, queued_item = items[idx]
+        located = _find_memory_item_by_id(_memory_item_id(queued_item))
+        if located is None:
+            idx += 1
+            continue
+        kind, item = located
+        if item.review_status != "pending" or item.memory_tier != MEMORY_TIER_EXPERIMENTAL:
+            idx += 1
+            continue
+
+        print()
+        header(f"Memory Review [{idx + 1}/{total}]")
+        info(f"source filter: {args.memory_source}")
+        print(_render_memory_item(item))
+        similar_rows = _similar_trusted_rows(item)
+        if similar_rows:
+            print()
+            info(f"Similar trusted {kind}s:")
+            print(_render_table(similar_rows))
+
+        print()
+        print("Actions: [g]lobal curate  [h]ost curate  [v]erified-host  [r]eject  [s]kip  [q]uit")
+        choice = input("> ").strip().lower()
+
+        if choice in {"q", "quit"}:
+            break
+        if choice in {"s", "skip", ""}:
+            idx += 1
+            continue
+        try:
+            if choice in {"g", "global"}:
+                _, updated = _review_memory_item(
+                    _memory_item_id(item),
+                    reviewer=args.memory_reviewer,
+                    note=args.memory_note,
+                    promote_to=MEMORY_TIER_CURATED,
+                    target_scope=TARGET_SCOPE_GLOBAL,
+                )
+                success(f"Promoted {_memory_item_id(updated)} to curated/global.")
+            elif choice in {"h", "host"}:
+                _, updated = _review_memory_item(
+                    _memory_item_id(item),
+                    reviewer=args.memory_reviewer,
+                    note=args.memory_note,
+                    promote_to=MEMORY_TIER_CURATED,
+                    target_scope=TARGET_SCOPE_HOST,
+                )
+                success(f"Promoted {_memory_item_id(updated)} to curated/host.")
+            elif choice in {"v", "verified"}:
+                _, updated = _review_memory_item(
+                    _memory_item_id(item),
+                    reviewer=args.memory_reviewer,
+                    note=args.memory_note,
+                    promote_to=MEMORY_TIER_VERIFIED_RUNTIME,
+                    target_scope=TARGET_SCOPE_HOST,
+                )
+                success(f"Promoted {_memory_item_id(updated)} to verified-runtime/host.")
+            elif choice in {"r", "reject"}:
+                _, updated = _review_memory_item(
+                    _memory_item_id(item),
+                    reviewer=args.memory_reviewer,
+                    note=args.memory_note,
+                    reject=True,
+                )
+                success(f"Rejected {_memory_item_id(updated)}.")
+            else:
+                warn(f"Unknown action: {choice}")
+                continue
+        except Exception as exc:
+            warn(str(exc))
+            continue
+        idx += 1
+
+    return 0
+
+
+def _handle_memory_show(finding_ref: str) -> int:
+    located = _find_memory_item_by_id(finding_ref)
+    if located is None:
+        warn(f"Memory item not found: {finding_ref}")
+        return 1
+    _, item = located
+    print(_render_memory_item(item))
+    return 0
+
+
+def _handle_memory_promote(args: argparse.Namespace) -> int:
+    try:
+        kind, item = _review_memory_item(
+            args.memory_promote,
+            reviewer=args.memory_reviewer,
+            note=args.memory_note,
+            promote_to=args.memory_tier,
+            target_scope=args.memory_scope,
+        )
+    except Exception as exc:
+        warn(str(exc))
+        return 1
+    success(f"Promoted {kind} {_memory_item_id(item)} to {item.memory_tier} ({item.target_scope}).")
+    print(_render_memory_item(item))
+    return 0
+
+
+def _handle_memory_reject(args: argparse.Namespace) -> int:
+    try:
+        kind, item = _review_memory_item(
+            args.memory_reject,
+            reviewer=args.memory_reviewer,
+            note=args.memory_note,
+            reject=True,
+        )
+    except Exception as exc:
+        warn(str(exc))
+        return 1
+    success(f"Rejected {kind} {_memory_item_id(item)}.")
+    print(_render_memory_item(item))
+    return 0
+
+
+def _memory_source_for(args: argparse.Namespace, action_name: str) -> str:
+    value = getattr(args, action_name, None)
+    if isinstance(value, str) and value:
+        return value
+    return MEMORY_SOURCE_ALL
 
 
 def _print_context_banner(result: GenerationResult, waf: str | None = None) -> None:
@@ -939,13 +1423,18 @@ def main(argv: list[str] | None = None) -> int:
         _logging.getLogger("scrapling").setLevel(_logging.WARNING)
 
     has_target = bool(args.url or args.urls or args.input)
-    is_utility = args.list_models or args.search_models or args.check_keys or args.clear_reports
+    is_utility = (
+        args.list_models or args.search_models or args.check_keys or args.clear_reports
+        or args.memory_review or args.memory_list or args.memory_show
+        or args.memory_promote or args.memory_reject or args.memory_stats
+    )
 
     # Validate: need at least one of: target, --public, or a utility action
     if not has_target and not args.public and not is_utility:
         parser.error(
             "one of the arguments -u/--url --urls -i/--input -l/--list-models "
-            "-s/--search-models --check-keys --public is required"
+            "-s/--search-models --check-keys --public --memory-review --memory-list --memory-show "
+            "--memory-promote --memory-reject --memory-stats is required"
         )
 
     # --- Utility: check API keys ---
@@ -997,6 +1486,25 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Ollama model search for {args.search_models!r} ({source})")
         print(_render_table(rows))
         return 0
+
+    if args.memory_stats:
+        return _handle_memory_stats(_memory_source_for(args, "memory_stats"))
+
+    if args.memory_review:
+        args.memory_source = _memory_source_for(args, "memory_review")
+        return _handle_memory_review_interactive(args)
+
+    if args.memory_list:
+        return _handle_memory_list(args.memory_limit, _memory_source_for(args, "memory_list"))
+
+    if args.memory_show:
+        return _handle_memory_show(args.memory_show)
+
+    if args.memory_promote:
+        return _handle_memory_promote(args)
+
+    if args.memory_reject:
+        return _handle_memory_reject(args)
 
     # --- Validate rate ---
     if not math.isfinite(args.rate) or args.rate < 0:

@@ -20,6 +20,10 @@ class CliHelpTest(unittest.TestCase):
         self.assertIn("-j PATH, --json-out PATH", help_text)
         self.assertIn("-v, --verbose", help_text)
         self.assertIn("--merge-batch", help_text)
+        self.assertIn("--memory-review [SOURCE]", help_text)
+        self.assertIn("--memory-list [SOURCE]", help_text)
+        self.assertIn("--memory-stats [SOURCE]", help_text)
+        self.assertNotIn("--memory-source SOURCE", help_text)
         self.assertIn("-V, --version", help_text)
         # New XSS type selectors
         self.assertIn("--generate", help_text)
@@ -28,6 +32,27 @@ class CliHelpTest(unittest.TestCase):
         self.assertIn("--dom", help_text)
         self.assertNotIn("--html", help_text)
         self.assertNotIn("(default: None)", help_text)
+
+    def test_memory_command_source_arguments_parse_cleanly(self) -> None:
+        parser = build_parser(DEFAULT_MODEL)
+
+        args = parser.parse_args(["--memory-review"])
+        self.assertEqual(args.memory_review, "all")
+
+        args = parser.parse_args(["--memory-review", "labs"])
+        self.assertEqual(args.memory_review, "labs")
+
+        args = parser.parse_args(["--memory-list", "targets"])
+        self.assertEqual(args.memory_list, "targets")
+
+        args = parser.parse_args(["--memory-stats"])
+        self.assertEqual(args.memory_stats, "all")
+
+    def test_memory_limit_must_be_positive(self) -> None:
+        parser = build_parser(DEFAULT_MODEL)
+
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["--memory-review", "--memory-limit", "0"])
 
 
 if __name__ == "__main__":

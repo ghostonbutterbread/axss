@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""axss-learn — mass-learn XSS from xssy.uk labs.
+"""axss-learn — offline XSS learning from xssy.uk labs.
 
 Fetches every published XSS lab, parses its live HTML, runs the axss payload
-generator, and saves interesting findings to ~/.axss/findings/ so the local
-model keeps getting better with every session.
+generator, and saves generated candidates to ~/.axss/findings/ as experimental
+memory. These entries are intentionally unverified; active runtime findings are
+promoted separately by the scanner when browser execution is confirmed.
 
 Usage examples
 --------------
@@ -51,10 +52,13 @@ from ai_xss_generator.console import (
     warn,
 )
 from ai_xss_generator.findings import (
-    Finding,
-    infer_bypass_family,
+    MEMORY_TIER_CURATED,
+    MEMORY_TIER_EXPERIMENTAL,
+    MEMORY_TIER_VERIFIED_RUNTIME,
     save_finding,
 )
+from ai_xss_generator.learning import build_experimental_finding, build_memory_profile
+from ai_xss_generator.lessons import build_mapping_lessons, save_lesson
 from ai_xss_generator.models import generate_payloads
 from ai_xss_generator.parser import parse_target
 from ai_xss_generator.plugin_system import PluginRegistry
@@ -82,28 +86,63 @@ def _persist_payloads(
     payloads: list[PayloadCandidate],
     lab: XssyLab,
     model_label: str,
+    context: object,
 ) -> int:
     """Save high-scoring payloads as findings.  Returns count saved."""
     saved = 0
+    memory_profile = build_memory_profile(context=context, delivery_mode="offline", target_scope="global")
+    default_sink = context.dom_sinks[0].sink if context.dom_sinks else ""
+    context_hint = "unknown"
+    if default_sink:
+        context_hint = default_sink
+    elif context.forms:
+        context_hint = "form_submission"
+    elif context.frameworks:
+        context_hint = f"framework:{context.frameworks[0].lower()}"
+
     for p in payloads:
         if p.risk_score < 40:
             continue  # not interesting enough to store
-        family = infer_bypass_family(p.payload, p.tags)
-        context_type = p.target_sink or "unknown"
-        finding = Finding(
-            sink_type=p.target_sink or "",
-            context_type=context_type,
-            surviving_chars="",
-            bypass_family=family,
+        finding = build_experimental_finding(
             payload=p.payload,
+            sink_type=p.target_sink or default_sink,
+            context_type=p.target_sink or context_hint,
+            surviving_chars="",
             test_vector=p.test_vector,
             model=model_label,
-            explanation=p.explanation,
-            target_host=lab.lab_url,
-            tags=p.tags + [f"xssy:{lab.id}", f"lab:{lab.name}"],
+            explanation=p.explanation or "Generated during offline xssy lab learning; not browser-verified.",
+            target_host=str(memory_profile.get("target_host", "")),
+            tags=p.tags + [f"xssy:{lab.id}", f"lab:{lab.name}", "offline-learning"],
+            evidence_type="xssy_generation",
+            evidence_detail=f"Generated from xssy lab {lab.id} ({lab.name}) without active confirmation.",
+            provenance=lab.lab_url,
+            target_scope="global",
+            waf_name=str(memory_profile.get("waf_name", "")),
+            delivery_mode="offline",
+            frameworks=list(memory_profile.get("frameworks", [])),
+            auth_required=bool(memory_profile.get("auth_required", False)),
         )
         try:
             if save_finding(finding):
+                saved += 1
+        except Exception:
+            pass
+    return saved
+
+
+def _persist_mapping_lessons(context: object, lab: XssyLab) -> int:
+    saved = 0
+    memory_profile = build_memory_profile(context=context, delivery_mode="offline", target_scope="global")
+    lessons = build_mapping_lessons(
+        context,
+        memory_profile=memory_profile,
+        evidence_type="xssy_context",
+        memory_tier=MEMORY_TIER_EXPERIMENTAL,
+        provenance=lab.lab_url,
+    )
+    for lesson in lessons:
+        try:
+            if save_lesson(lesson):
                 saved += 1
         except Exception:
             pass
@@ -135,7 +174,7 @@ def _print_lab_result(
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="axss-learn",
-        description="Mass-learn XSS from xssy.uk labs — generates payloads and saves findings.",
+        description="Offline XSS learning from xssy.uk labs — generates payloads and saves experimental findings.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -266,6 +305,7 @@ def main(argv: list[str] | None = None) -> int:
     # ── Per-lab pipeline ──────────────────────────────────────────────────────
     all_results: list[dict] = []
     total_saved = 0
+    total_lessons_saved = 0
     failures = 0
 
     print()
@@ -354,6 +394,7 @@ def main(argv: list[str] | None = None) -> int:
             continue
 
         # ── Generate payloads ─────────────────────────────────────────────────
+        lesson_saved = _persist_mapping_lessons(context, lab)
         try:
             payloads, engine, _, resolved_model = generate_payloads(
                 context=context,
@@ -362,6 +403,11 @@ def main(argv: list[str] | None = None) -> int:
                 progress=lambda msg: info(f"  {msg}") if args.verbose else None,
                 use_cloud=use_cloud,
                 cloud_model=config.cloud_model,
+                allowed_lesson_tiers=(
+                    MEMORY_TIER_CURATED,
+                    MEMORY_TIER_VERIFIED_RUNTIME,
+                    MEMORY_TIER_EXPERIMENTAL,
+                ),
             )
         except Exception as exc:
             warn(f"  Generation failed: {exc}")
@@ -374,8 +420,9 @@ def main(argv: list[str] | None = None) -> int:
             continue
 
         # ── Persist findings ──────────────────────────────────────────────────
-        saved = _persist_payloads(payloads, lab, resolved_model)
+        saved = _persist_payloads(payloads, lab, resolved_model, context)
         total_saved += saved
+        total_lessons_saved += lesson_saved
 
         # ── Print result ──────────────────────────────────────────────────────
         _print_lab_result(lab, payloads, engine, saved, args.top)
@@ -403,10 +450,13 @@ def main(argv: list[str] | None = None) -> int:
     success(
         f"Labs processed: {len(labs) - failures}/{len(labs)}  |  "
         f"Findings saved: {total_saved}  |  "
+        f"Lessons saved: {total_lessons_saved}  |  "
         f"Failures: {failures}"
     )
     if total_saved:
         info(f"Findings stored at ~/.axss/findings/ — future axss runs will use them as few-shot examples.")
+    if total_lessons_saved:
+        info(f"Lessons stored at ~/.axss/lessons/ — future axss runs can reuse logic and mapping hints.")
 
     # ── JSON output ───────────────────────────────────────────────────────────
     if args.json_out:
