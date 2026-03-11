@@ -922,9 +922,16 @@ def _resolve_session(
 # ---------------------------------------------------------------------------
 
 def main(argv: list[str] | None = None) -> int:
+    import logging as _logging
     config = load_config()
     parser = build_parser(config.default_model)
     args = parser.parse_args(argv)
+
+    # Scrapling emits INFO-level fetch logs to stderr on every request.
+    # These bypass our status-bar hooks and corrupt the terminal display.
+    # Suppress them unless the user explicitly asked for verbose output.
+    if not getattr(args, "verbose", False):
+        _logging.getLogger("scrapling").setLevel(_logging.WARNING)
 
     has_target = bool(args.url or args.urls or args.input)
     is_utility = args.list_models or args.search_models or args.check_keys

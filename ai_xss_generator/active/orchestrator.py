@@ -31,8 +31,8 @@ if TYPE_CHECKING:
 
 from ai_xss_generator.active.worker import WorkerResult, run_worker
 from ai_xss_generator.console import (
-    fmt_duration, info, setup_panel, step, success,
-    teardown_panel, update_panel, warn,
+    clear_status_bar, fmt_duration, info, set_status_bar, spin_char, step, success,
+    update_status_bar, warn,
     BOLD, CYAN, DIM, GREEN, RESET,
 )
 
@@ -177,17 +177,10 @@ def run_active_scan(
     _pause_requested = False
     _pause_announced = False
 
-    def _build_panel() -> tuple[str, str, str]:
-        """Build the three panel line strings from current scan state."""
-        import shutil as _sh
-        cols = _sh.get_terminal_size(fallback=(80, 24)).columns
+    def _build_status(tick: int) -> str:
+        """Build a single status-bar line for the current scan state."""
         elapsed = time.monotonic() - scan_start
-
-        # ── Separator ──────────────────────────────────────────────────────
-        sep = f"  {DIM}{'─' * max(cols - 4, 10)}{RESET}"
-
-        # ── Progress bar ───────────────────────────────────────────────────
-        BAR_W = 28
+        BAR_W = 20
         safe_total = max(total_count, 1)
         pct = int(completed * 100 / safe_total)
         filled = int(completed * BAR_W / safe_total)
@@ -197,43 +190,22 @@ def run_active_scan(
             eta_str = fmt_duration(eta_secs)
         else:
             eta_str = "--:--"
-        bar = (
-            f"  {DIM}[{RESET}"
-            f"{GREEN}{'█' * filled}{RESET}"
-            f"{DIM}{'░' * empty}]{RESET}"
-            f"  {BOLD}{pct}%{RESET}"
-            f"  {DIM}{completed}/{total_count}{RESET}"
-            f"  {fmt_duration(elapsed)} elapsed"
-            f"  {DIM}ETA {eta_str}{RESET}"
-        )
 
-        # ── Workers + confirmed + active label ─────────────────────────────
+        bar = f"[{'█' * filled}{'░' * empty}] {pct}%  {completed}/{total_count}"
+
         pills: list[str] = []
         for _, _lbl, _kind in active_procs:
-            if _kind == "get":
-                pills.append(f"{GREEN}GET●{RESET}")
-            else:
-                pills.append(f"{CYAN}POST●{RESET}")
+            pills.append("GET●" if _kind == "get" else "POST●")
         for _ in range(max(0, n_workers - len(active_procs))):
-            pills.append(f"{DIM}idle○{RESET}")
-        pills_str = "  ".join(pills)
+            pills.append("idle○")
+        pills_str = " ".join(pills)
 
-        conf_str = (
-            f"{GREEN}{BOLD}✓ {confirmed_count}{RESET}"
-            if confirmed_count else f"{DIM}✓ 0{RESET}"
+        conf_str = f"✓ {confirmed_count}"
+        sp = spin_char(tick)
+        return (
+            f"\033[2m[~] {sp} {bar}  {fmt_duration(elapsed)} elapsed  "
+            f"ETA {eta_str}  │  {conf_str}  │  {pills_str}\033[0m"
         )
-
-        max_label = max(cols - 56, 12)
-        if active_procs:
-            raw = active_procs[0][1]
-            if len(raw) > max_label:
-                raw = "…" + raw[-(max_label - 1):]
-            label_part = f"  {DIM}│{RESET}  {DIM}{raw}{RESET}"
-        else:
-            label_part = ""
-
-        workers = f"  {pills_str}   {DIM}│{RESET}  {conf_str} confirmed{label_part}"
-        return sep, bar, workers
 
     def _drain_queue() -> None:
         nonlocal confirmed_count
@@ -283,8 +255,8 @@ def run_active_scan(
 
     signal.signal(signal.SIGINT, _sigint_handler)
 
-    setup_panel()
-    update_panel(*_build_panel())
+    _tick = 0
+    set_status_bar(_build_status(_tick))
     _scan_completed_cleanly = False
     try:
         while completed < total_count:
@@ -368,7 +340,8 @@ def run_active_scan(
                     active_procs.append((proc, log_label, kind))
                     info(f"[worker] started → {log_label}")
 
-            update_panel(*_build_panel())
+            _tick += 1
+            update_status_bar(_build_status(_tick))
             time.sleep(0.25)
 
         _scan_completed_cleanly = not _pause_requested
@@ -378,7 +351,7 @@ def run_active_scan(
         warn("Workers killed.")
     finally:
         signal.signal(signal.SIGINT, _original_sigint)
-        teardown_panel()
+        clear_status_bar()
         # Final drain after all processes finish
         for proc, _, _ in active_procs:
             proc.join(timeout=config.timeout_seconds + 5)
