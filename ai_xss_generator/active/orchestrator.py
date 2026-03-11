@@ -30,8 +30,9 @@ if TYPE_CHECKING:
 
 from ai_xss_generator.active.worker import WorkerResult, run_worker
 from ai_xss_generator.console import (
-    clear_status_bar, fmt_duration, info, set_status_bar,
-    spin_char, step, success, update_status_bar, warn,
+    fmt_duration, info, setup_panel, step, success,
+    teardown_panel, update_panel, warn,
+    BOLD, CYAN, DIM, GREEN, RESET,
 )
 
 log = logging.getLogger(__name__)
@@ -133,40 +134,82 @@ def run_active_scan(
     result_queue: multiprocessing.Queue = manager.Queue()
 
     results: list[WorkerResult] = []
-    active_procs: list[tuple[multiprocessing.Process, str]] = []  # (proc, label)
+    # (proc, label, kind) — kind is "get" or "post" for worker pill display
+    active_procs: list[tuple[multiprocessing.Process, str, str]] = []
     work_iter = iter(work_items)
     total_count = len(work_items)
     completed = 0
+    confirmed_count = 0
     scan_start = time.monotonic()
-    tick = 0  # spinner frame counter
 
-    def _fmt_status() -> str:
+    def _build_panel() -> tuple[str, str, str]:
+        """Build the three panel line strings from current scan state."""
+        import shutil as _sh
+        cols = _sh.get_terminal_size(fallback=(80, 24)).columns
         elapsed = time.monotonic() - scan_start
-        remaining = total_count - completed
-        if completed > 0:
-            avg = elapsed / completed
-            eta_str = f"ETA ~{fmt_duration(avg * remaining)}"
+
+        # ── Separator ──────────────────────────────────────────────────────
+        sep = f"  {DIM}{'─' * max(cols - 4, 10)}{RESET}"
+
+        # ── Progress bar ───────────────────────────────────────────────────
+        BAR_W = 28
+        safe_total = max(total_count, 1)
+        pct = int(completed * 100 / safe_total)
+        filled = int(completed * BAR_W / safe_total)
+        empty = BAR_W - filled
+        if completed > 0 and elapsed > 0:
+            eta_secs = (elapsed / completed) * (total_count - completed)
+            eta_str = fmt_duration(eta_secs)
         else:
-            eta_str = "ETA ~?"
-        sp = spin_char(tick)
-        return (
-            f"\033[2m[~] {sp} Scanning | "
-            f"{completed}/{total_count} targets done | "
-            f"{len(active_procs)} active | "
-            f"{fmt_duration(elapsed)} elapsed | "
-            f"{eta_str}\033[0m"
+            eta_str = "--:--"
+        bar = (
+            f"  {DIM}[{RESET}"
+            f"{GREEN}{'█' * filled}{RESET}"
+            f"{DIM}{'░' * empty}]{RESET}"
+            f"  {BOLD}{pct}%{RESET}"
+            f"  {DIM}{completed}/{total_count}{RESET}"
+            f"  {fmt_duration(elapsed)} elapsed"
+            f"  {DIM}ETA {eta_str}{RESET}"
         )
 
+        # ── Workers + confirmed + active label ─────────────────────────────
+        pills: list[str] = []
+        for _, _lbl, _kind in active_procs:
+            if _kind == "get":
+                pills.append(f"{GREEN}GET●{RESET}")
+            else:
+                pills.append(f"{CYAN}POST●{RESET}")
+        for _ in range(max(0, n_workers - len(active_procs))):
+            pills.append(f"{DIM}idle○{RESET}")
+        pills_str = "  ".join(pills)
+
+        conf_str = (
+            f"{GREEN}{BOLD}✓ {confirmed_count}{RESET}"
+            if confirmed_count else f"{DIM}✓ 0{RESET}"
+        )
+
+        max_label = max(cols - 56, 12)
+        if active_procs:
+            raw = active_procs[0][1]
+            if len(raw) > max_label:
+                raw = "…" + raw[-(max_label - 1):]
+            label_part = f"  {DIM}│{RESET}  {DIM}{raw}{RESET}"
+        else:
+            label_part = ""
+
+        workers = f"  {pills_str}   {DIM}│{RESET}  {conf_str} confirmed{label_part}"
+        return sep, bar, workers
+
     def _drain_queue() -> None:
-        # Use a short timeout rather than get_nowait() so results aren't lost
-        # when a worker puts an item into the queue at the exact moment empty()
-        # returns True.
+        nonlocal confirmed_count
         import queue as _queue
         while True:
             try:
                 r = result_queue.get(timeout=0.05)
                 results.append(r)
                 _log_result(r)
+                if r.status == "confirmed":
+                    confirmed_count += len(r.confirmed_findings)
             except _queue.Empty:
                 break
             except Exception:
@@ -175,16 +218,17 @@ def run_active_scan(
     def _reap_finished() -> None:
         nonlocal active_procs, completed
         still_running = []
-        for proc, plabel in active_procs:
+        for proc, plabel, pkind in active_procs:
             if not proc.is_alive():
                 proc.join(timeout=1)
                 completed += 1
                 log.debug("Worker done for %s (%d/%d)", plabel, completed, total_count)
             else:
-                still_running.append((proc, plabel))
+                still_running.append((proc, plabel, pkind))
         active_procs = still_running
 
-    set_status_bar(_fmt_status())
+    setup_panel()
+    update_panel(*_build_panel())
     try:
         while completed < total_count:
             _drain_queue()
@@ -243,21 +287,20 @@ def run_active_scan(
                     )
                     log_label = f"[POST] {pf.action_url}"
                 proc.start()
-                active_procs.append((proc, log_label))
+                active_procs.append((proc, log_label, kind))
                 info(f"[worker] started → {log_label}")
 
-            tick += 1
-            update_status_bar(_fmt_status())
+            update_panel(*_build_panel())
             time.sleep(0.25)
 
     except KeyboardInterrupt:
         warn("Scan interrupted — terminating workers...")
-        for proc, _ in active_procs:
+        for proc, _, _ in active_procs:
             proc.terminate()
     finally:
-        clear_status_bar()
+        teardown_panel()
         # Final drain after all processes finish
-        for proc, _ in active_procs:
+        for proc, _, _ in active_procs:
             proc.join(timeout=config.timeout_seconds + 5)
         _drain_queue()
         manager.shutdown()

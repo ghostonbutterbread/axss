@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import shutil
 import sys
 
 
@@ -120,6 +121,7 @@ def waf_label(name: str) -> str:
 # ---------------------------------------------------------------------------
 # Persistent status bar — a single line pinned to the current cursor position
 # that is erased before any log output and redrawn after.
+# Used during the crawl phase.
 # ---------------------------------------------------------------------------
 
 _status_text: str = ""
@@ -130,13 +132,18 @@ _SPIN_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 def _before_print() -> None:
     """Erase the status bar line so the upcoming print lands cleanly."""
+    if _panel_active:
+        return  # scroll region keeps panel pinned — nothing to erase
     if _status_active and _tty():
         sys.stdout.write("\r\033[2K")
         # No explicit flush — the print() call flushes immediately after.
 
 
 def _after_print() -> None:
-    """Redraw the status bar after a log line has been emitted."""
+    """Redraw the status bar / panel after a log line has been emitted."""
+    if _panel_active:
+        _redraw_panel()
+        return
     if _status_active and _status_text and _tty():
         sys.stdout.write(_status_text)
         sys.stdout.flush()
@@ -169,6 +176,99 @@ def clear_status_bar() -> None:
         sys.stdout.flush()
     _status_active = False
     _status_text = ""
+
+
+# ---------------------------------------------------------------------------
+# Multi-line progress panel — scroll-region–based, used during active scan.
+#
+# Reserves _PANEL_LINES rows at the bottom of the terminal using an ANSI
+# scroll region so all log output scrolls naturally above the panel without
+# ever pushing into it.  The three panel rows are:
+#
+#   row -2  ──── separator ────
+#   row -1  [████░░░░] 48%  24/50  02:14 elapsed  ETA 02:23
+#   row  0  GET● POST● idle○  │  ✓ 3 confirmed  │  /api/users?role=admin
+# ---------------------------------------------------------------------------
+
+_PANEL_LINES: int = 3  # separator + progress bar + workers row
+
+_panel_active: bool = False
+_panel_content: list[str] = ["", "", ""]  # current rendered strings for each row
+
+
+def _term_rows_cols() -> tuple[int, int]:
+    sz = shutil.get_terminal_size(fallback=(80, 24))
+    return sz.lines, sz.columns
+
+
+def _redraw_panel() -> None:
+    """Internal: repaint panel rows from _panel_content without updating content."""
+    if not _panel_active or not _tty():
+        return
+    rows, _ = _term_rows_cols()
+    out = ["\033[s"]  # save cursor
+    for i, line in enumerate(_panel_content):
+        row = rows - _PANEL_LINES + 1 + i
+        out.append(f"\033[{row};1H\033[2K{line}")
+    out.append("\033[u")  # restore cursor
+    sys.stdout.write("".join(out))
+    sys.stdout.flush()
+
+
+def setup_panel() -> None:
+    """Lock the scroll region and reserve _PANEL_LINES rows at the bottom.
+
+    Call once before the active scan loop begins.  All subsequent print()
+    calls stay within the scroll region and never touch the panel rows.
+    """
+    global _panel_active, _panel_content
+    if not _tty():
+        return
+    rows, _ = _term_rows_cols()
+    scroll_bottom = rows - _PANEL_LINES
+    _panel_active = True
+    _panel_content = ["", "", ""]
+    out = [
+        f"\033[1;{scroll_bottom}r",   # set scroll region rows 1..scroll_bottom
+        "\033[?7l",                   # disable auto-wrap on the panel rows
+    ]
+    # Clear the reserved panel rows
+    for r in range(rows - _PANEL_LINES + 1, rows + 1):
+        out.append(f"\033[{r};1H\033[2K")
+    out.append("\033[1;1H")           # cursor to top of scroll region
+    sys.stdout.write("".join(out))
+    sys.stdout.flush()
+
+
+def update_panel(sep: str, bar: str, workers: str) -> None:
+    """Update panel content and repaint.  Call from the orchestrator loop."""
+    global _panel_content
+    if not _tty():
+        return
+    _panel_content = [sep, bar, workers]
+    _redraw_panel()
+
+
+def teardown_panel() -> None:
+    """Clear the panel and restore the full scroll region.
+
+    Call in the finally block after the active scan loop exits.
+    """
+    global _panel_active, _panel_content
+    if not _tty() or not _panel_active:
+        _panel_active = False
+        return
+    rows, _ = _term_rows_cols()
+    out = ["\033[s"]
+    for r in range(rows - _PANEL_LINES + 1, rows + 1):
+        out.append(f"\033[{r};1H\033[2K")
+    out.append("\033[u")
+    out.append(f"\033[1;{rows}r")    # restore full scroll region
+    out.append("\033[?7h")           # re-enable auto-wrap
+    sys.stdout.write("".join(out))
+    sys.stdout.flush()
+    _panel_active = False
+    _panel_content = ["", "", ""]
 
 
 def fmt_duration(seconds: float) -> str:
