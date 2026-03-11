@@ -45,7 +45,6 @@ Goal: scan a live web target for XSS
   │
   └── A previous scan was interrupted / crashed and you want to resume
         axss -u "https://target.com" --active --resume
-        (or just re-run the same command — axss will prompt if a session is found)
 ```
 
 ---
@@ -240,8 +239,8 @@ axss --help
 | `--backend api\|cli` | config | Cloud escalation backend: `api` = OpenRouter/OpenAI keys, `cli` = CLI subprocess |
 | `--cli-tool claude\|codex` | config | CLI tool to use when `--backend cli` (requires tool on PATH and logged in) |
 | `--cli-model MODEL` | — | Model to pass to the CLI tool (e.g. `claude-opus-4-6`); omit for tool default |
-| `--resume` | off | Auto-resume a prior interrupted/paused scan without prompting |
-| `--no-resume` | off | Ignore any existing session and always start fresh |
+| `--resume` | off | Resume the most recent interrupted/paused session for this target |
+| `--no-resume` | off | Explicit fresh start (same as default; useful in scripts) |
 | `--no-cloud` | off | Never escalate to cloud LLM |
 | `--public` | off | Fetch community XSS payloads and inject as reference |
 | `-o, --output` | `list` | Output format: `list`, `heat`, `json`, `interactive` |
@@ -404,14 +403,7 @@ WAF is auto-detected from the seed response headers during crawl. Use `--waf NAM
 
 ## Resumable sessions
 
-Every active scan automatically creates a session file in `~/.axss/sessions/`. If the scan is interrupted (crash, Ctrl+C, or lost SSH connection), the next invocation with the same target detects the session and prompts:
-
-```
-[~] Found a interrupted session from 2026-03-10 14:22 UTC — 37/120 item(s) done, 2 finding(s).
-  Resume from checkpoint? [Y/n]
-```
-
-Progress is checkpointed after every completed work item using an atomic write, so a crash mid-write never corrupts the session.
+Every active scan automatically creates a session file in `~/.axss/sessions/` and checkpoints progress after every completed work item (atomic write — crash-safe). By default, axss always starts fresh; pass `--resume` to reload a prior session.
 
 **Pause behavior:**
 - First `Ctrl+C` — graceful pause: no new workers are started, in-flight workers are allowed to finish, then the scan stops. Session is marked `paused`.
@@ -419,13 +411,13 @@ Progress is checkpointed after every completed work item using an atomic write, 
 
 **Flags:**
 ```bash
-# Scan normally — axss prompts if a prior session is found
+# Default — always starts fresh, session file created for future resume
 axss -u "https://target.com" --active
 
-# Auto-resume without prompting (useful in scripts / tmux)
+# Resume the most recent interrupted/paused session for this target
 axss -u "https://target.com" --active --resume
 
-# Always start fresh, ignoring any prior session
+# Explicit fresh start (same as default, useful to make intent clear in scripts)
 axss -u "https://target.com" --active --no-resume
 ```
 

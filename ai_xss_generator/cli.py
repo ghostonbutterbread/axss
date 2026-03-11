@@ -366,9 +366,9 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help=(
-            "--no-resume  Ignore any existing session and start a fresh scan. "
-            "Prior session data is not deleted — use this when you intentionally "
-            "want to re-scan from the beginning."
+            "--no-resume  Explicit no-op: start fresh (the default). "
+            "Sessions are still created for future --resume use, but no prior "
+            "session is loaded. Useful to make intent clear in scripts."
         ),
     )
     parser.add_argument(
@@ -853,10 +853,13 @@ def _resolve_session(
     scan_dom: bool,
     rate: float,
 ) -> Any:
-    """Detect an existing resumable session and return it, or create a new one.
+    """Create or resume a scan session.
 
-    Returns the session dict (to be passed to run_active_scan) or None when
-    --no-resume is set.
+    Default behaviour (no flags): always create a fresh session so the run is
+    checkpointed, but never auto-resume a prior one.
+
+    --resume: look for an existing in-progress/paused session and resume it.
+    --no-resume: same as the default (explicit opt-out, kept for clarity).
     """
     from ai_xss_generator.session import (
         compute_seed_hash,
@@ -864,11 +867,7 @@ def _resolve_session(
         find_existing_session,
     )
 
-    no_resume = getattr(args, "no_resume", False)
     auto_resume = getattr(args, "resume", False)
-
-    if no_resume:
-        return None
 
     seed_hash = compute_seed_hash(
         urls=urls,
@@ -878,40 +877,31 @@ def _resolve_session(
         scan_dom=scan_dom,
     )
 
-    existing = find_existing_session(seed_hash)
-    if existing is not None:
-        n_done = len(existing.get("completed", {}))
-        n_total = existing.get("total_items", "?")
-        status_label = "paused" if existing.get("status") == "paused" else "interrupted"
-        prior_confirmed = sum(
-            len(e.get("confirmed_findings", []))
-            for e in existing.get("completed", {}).values()
-            if e.get("status") == "confirmed"
-        )
-
-        if auto_resume:
-            do_resume = True
-        else:
+    # Only look for an existing session when --resume is explicitly passed.
+    if auto_resume:
+        existing = find_existing_session(seed_hash)
+        if existing is not None:
+            n_done = len(existing.get("completed", {}))
+            n_total = existing.get("total_items", "?")
+            status_label = "paused" if existing.get("status") == "paused" else "interrupted"
+            prior_confirmed = sum(
+                len(e.get("confirmed_findings", []))
+                for e in existing.get("completed", {}).values()
+                if e.get("status") == "confirmed"
+            )
             created = existing.get("created_at", "")[:16].replace("T", " ")
             info(
-                f"Found a {status_label} session from {created} UTC — "
+                f"Resuming {status_label} session from {created} UTC — "
                 f"{n_done}/{n_total} item(s) done"
-                + (f", {prior_confirmed} finding(s)" if prior_confirmed else "")
+                + (f", {prior_confirmed} finding(s) so far" if prior_confirmed else "")
                 + "."
             )
-            try:
-                answer = input("  Resume from checkpoint? [Y/n] ").strip().lower()
-            except (EOFError, KeyboardInterrupt):
-                answer = "n"
-                print()
-            do_resume = answer in ("", "y", "yes")
-
-        if do_resume:
             existing["status"] = "in_progress"
-            info(f"Resuming — skipping {n_done} already-completed item(s).")
             return existing
+        else:
+            info("--resume: no prior session found for this target — starting fresh.")
 
-    # No existing session or user declined — create a fresh one
+    # Default path (and --no-resume): create a new session for this run.
     config_summary = (
         f"target={urls[0] if urls else '?'} | "
         f"rate={rate:g} req/s | "
