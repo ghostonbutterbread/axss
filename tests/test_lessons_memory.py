@@ -1,208 +1,105 @@
+"""Tests for ephemeral probe lessons (lessons.py — no file I/O)."""
 from __future__ import annotations
 
-import tempfile
 import unittest
-from pathlib import Path
+from unittest.mock import MagicMock
 
-import ai_xss_generator.lessons as lessons
-from ai_xss_generator.probe import ProbeResult, ReflectionContext
-from ai_xss_generator.types import DomSink, FormContext, ParsedContext
+from ai_xss_generator.lessons import (
+    Lesson,
+    LESSON_TYPE_FILTER,
+    LESSON_TYPE_MAPPING,
+    LESSON_TYPE_XSS_LOGIC,
+    build_mapping_lessons,
+    build_probe_lessons,
+    lessons_prompt_section,
+)
 
 
-class LessonsMemoryTest(unittest.TestCase):
-    def setUp(self) -> None:
-        self.tmpdir = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmpdir.cleanup)
-        self.original_dir = lessons.LESSONS_DIR
-        lessons.LESSONS_DIR = Path(self.tmpdir.name) / "lessons"
+def _make_reflection(**kwargs):
+    r = MagicMock()
+    r.context_type = kwargs.get("context_type", "html_attr_value")
+    r.attr_name = kwargs.get("attr_name", "")
+    r.surviving_chars = frozenset(kwargs.get("surviving_chars", "<>\"'"))
+    return r
 
-    def tearDown(self) -> None:
-        lessons.LESSONS_DIR = self.original_dir
 
-    def test_relevant_lessons_prefers_matching_landscape(self) -> None:
-        generic = lessons.Lesson(
-            lesson_type=lessons.LESSON_TYPE_XSS_LOGIC,
-            title="html_attr_url reflection logic",
-            summary="Generic URL-attribute lesson.",
-            sink_type="probe:html_attr_url",
-            context_type="html_attr_url",
-            surviving_chars=":/()",
-            delivery_mode="get",
-            memory_tier="curated",
+def _make_probe_result(param_name: str, reflections: list) -> MagicMock:
+    r = MagicMock()
+    r.param_name = param_name
+    r.reflections = reflections
+    return r
+
+
+class EphemeralLessonsTest(unittest.TestCase):
+
+    def test_build_probe_lessons_returns_logic_and_filter(self):
+        reflection = _make_reflection(context_type="html_attr_value")
+        probe_result = _make_probe_result("q", [reflection])
+
+        lessons = build_probe_lessons([probe_result], delivery_mode="get")
+
+        types = {lesson.lesson_type for lesson in lessons}
+        self.assertIn(LESSON_TYPE_XSS_LOGIC, types)
+        self.assertIn(LESSON_TYPE_FILTER, types)
+        self.assertEqual(len(lessons), 2)
+
+    def test_probe_lessons_capture_surviving_chars(self):
+        reflection = _make_reflection(
+            context_type="html_body",
+            surviving_chars=frozenset("<>()")
         )
-        tailored = lessons.Lesson(
-            lesson_type=lessons.LESSON_TYPE_XSS_LOGIC,
-            title="html_attr_url reflection logic",
-            summary="Host-specific URL-attribute lesson.",
-            sink_type="probe:html_attr_url",
-            context_type="html_attr_url",
-            surviving_chars=":/()",
-            target_scope="host",
-            target_host="app.example.test",
-            waf_name="cloudflare",
-            delivery_mode="get",
-            frameworks=["react"],
-            memory_tier="verified-runtime",
-            confidence=0.9,
-        )
+        probe_result = _make_probe_result("name", [reflection])
+        lessons = build_probe_lessons([probe_result], delivery_mode="get")
+        filter_lesson = next(l for l in lessons if l.lesson_type == LESSON_TYPE_FILTER)
+        for ch in "<>()":
+            self.assertIn(ch, filter_lesson.surviving_chars)
 
-        lessons.save_lesson(generic)
-        lessons.save_lesson(tailored)
+    def test_build_mapping_lessons_capture_forms_dom_auth(self):
+        form = MagicMock()
+        form.method = "POST"
+        dom_sink = MagicMock()
+        dom_sink.sink = "dom_source:location.hash"
+        context = MagicMock()
+        context.forms = [form]
+        context.dom_sinks = [dom_sink]
+        context.frameworks = ["angular"]
+        context.auth_notes = ["Bearer token detected"]
 
-        retrieved = lessons.relevant_lessons(
-            sink_type="probe:html_attr_url",
-            context_type="html_attr_url",
-            surviving_chars=":/()",
-            target_host="app.example.test",
-            waf_name="cloudflare",
-            delivery_mode="get",
-            frameworks=("react",),
-        )
-        self.assertEqual(retrieved[0].summary, "Host-specific URL-attribute lesson.")
+        lessons = build_mapping_lessons(context)
 
-    def test_build_probe_lessons_capture_logic_and_filter(self) -> None:
-        probe_result = ProbeResult(
-            param_name="next",
-            original_value="",
-            reflections=[
-                ReflectionContext(
-                    context_type="html_attr_url",
-                    attr_name="href",
-                    surviving_chars=frozenset(":/()"),
-                )
-            ],
-        )
-        memory_profile = {
-            "target_host": "app.example.test",
-            "target_scope": "host",
-            "waf_name": "",
-            "delivery_mode": "get",
-            "frameworks": ["react"],
-            "auth_required": False,
-        }
+        lesson_titles = [l.title for l in lessons]
+        self.assertTrue(any("Form" in t for t in lesson_titles))
+        self.assertTrue(any("source" in t.lower() for t in lesson_titles))
+        self.assertTrue(any("Framework" in t for t in lesson_titles))
+        self.assertTrue(any("Authenticated" in t for t in lesson_titles))
 
-        built = lessons.build_probe_lessons(
-            [probe_result],
-            memory_profile=memory_profile,
-            delivery_mode="get",
-            provenance="https://app.example.test/",
-            memory_tier="verified-runtime",
-        )
+    def test_lessons_are_not_persisted(self):
+        """lessons.py exposes no persistence — no save_lesson or LESSONS_DIR."""
+        import ai_xss_generator.lessons as lessons_module
+        self.assertFalse(hasattr(lessons_module, "save_lesson"))
+        self.assertFalse(hasattr(lessons_module, "load_lessons"))
+        self.assertFalse(hasattr(lessons_module, "LESSONS_DIR"))
 
-        self.assertEqual({lesson.lesson_type for lesson in built}, {
-            lessons.LESSON_TYPE_XSS_LOGIC,
-            lessons.LESSON_TYPE_FILTER,
-        })
-        logic = next(lesson for lesson in built if lesson.lesson_type == lessons.LESSON_TYPE_XSS_LOGIC)
-        filt = next(lesson for lesson in built if lesson.lesson_type == lessons.LESSON_TYPE_FILTER)
-        self.assertIn("scheme control", logic.summary)
-        self.assertEqual(filt.surviving_chars, "()/:")
-        self.assertIn("<", filt.blocked_chars)
-        self.assertEqual(logic.review_status, "approved")
-        self.assertEqual(filt.review_status, "approved")
-
-    def test_build_mapping_lessons_capture_forms_dom_and_auth(self) -> None:
-        context = ParsedContext(
-            source="https://app.example.test/profile",
-            source_type="url",
-            frameworks=["React"],
-            forms=[FormContext(action="/profile", method="POST")],
-            dom_sinks=[
-                DomSink(
-                    sink="dom_source:location.hash",
-                    source="location.hash read in script[1]; co-located with sinks: innerHTML",
-                    location="script[1]",
-                    confidence=0.9,
-                )
-            ],
-            auth_notes=["Authorization header present"],
-        )
-        memory_profile = {
-            "target_host": "app.example.test",
-            "target_scope": "host",
-            "waf_name": "",
-            "delivery_mode": "get",
-            "frameworks": ["react"],
-            "auth_required": True,
-        }
-
-        built = lessons.build_mapping_lessons(
-            context,
-            memory_profile=memory_profile,
-            evidence_type="xssy_context",
-            memory_tier="experimental",
-            provenance="https://app.example.test/profile",
-        )
-        titles = {lesson.title for lesson in built}
-        self.assertIn("Form workflow surface", titles)
-        self.assertIn("Client-side source surface", titles)
-        self.assertIn("Framework rendering surface", titles)
-        self.assertIn("Authenticated workflow surface", titles)
-
-    def test_review_lesson_updates_metadata(self) -> None:
-        lesson = lessons.Lesson(
-            lesson_type=lessons.LESSON_TYPE_MAPPING,
-            title="Form workflow surface",
-            summary="Lab workflow lesson.",
-            memory_tier="experimental",
-            evidence_type="xssy_context",
-            provenance="https://demo.xssy.uk/",
-        )
-        lessons.save_lesson(lesson)
-
-        promoted = lessons.review_lesson(
-            lessons.lesson_id(lesson),
-            reviewer="tester",
-            note="useful across many labs",
-            promote_to="curated",
-            target_scope="global",
-        )
-        self.assertEqual(promoted.review_status, "approved")
-        self.assertEqual(promoted.memory_tier, "curated")
-        self.assertEqual(promoted.reviewed_by, "tester")
-
-        second = lessons.Lesson(
-            lesson_type=lessons.LESSON_TYPE_FILTER,
+    def test_lessons_prompt_section_formats_correctly(self):
+        lesson = Lesson(
+            lesson_type=LESSON_TYPE_FILTER,
             title="html_body filter profile",
-            summary="Target filter lesson.",
-            memory_tier="experimental",
-            evidence_type="active_probe",
-            provenance="https://app.example.test/",
+            summary="Surviving chars: <>(). Blocked: everything else.",
+            context_type="html_body",
+            surviving_chars="<>()",
+            blocked_chars=";",
         )
-        lessons.save_lesson(second)
-        rejected = lessons.review_lesson(
-            lessons.lesson_id(second),
-            reviewer="tester",
-            note="too noisy",
-            reject=True,
-        )
-        self.assertEqual(rejected.review_status, "rejected")
-        self.assertEqual(rejected.review_note, "too noisy")
+        section = lessons_prompt_section([lesson])
+        self.assertIn("html_body filter profile", section)
+        self.assertIn("Surviving chars", section)
 
-    def test_memory_source_filters_labs_vs_targets(self) -> None:
-        lab_lesson = lessons.Lesson(
-            lesson_type=lessons.LESSON_TYPE_MAPPING,
-            title="Framework rendering surface",
-            summary="Lab lesson.",
-            memory_tier="experimental",
-            evidence_type="xssy_context",
-            provenance="https://demo.xssy.uk/",
-        )
-        target_lesson = lessons.Lesson(
-            lesson_type=lessons.LESSON_TYPE_MAPPING,
-            title="Authenticated workflow surface",
-            summary="Target lesson.",
-            memory_tier="experimental",
-            evidence_type="parsed_context",
-            provenance="https://app.example.test/profile",
-        )
-        lessons.save_lesson(lab_lesson)
-        lessons.save_lesson(target_lesson)
-
-        self.assertEqual(len(lessons.review_queue(memory_source="labs")), 1)
-        self.assertEqual(len(lessons.review_queue(memory_source="targets")), 1)
-        self.assertEqual(lessons.memory_stats(memory_source="labs")["total"], 1)
-        self.assertEqual(lessons.memory_stats(memory_source="targets")["total"], 1)
+    def test_no_storage_fields_on_lesson_dataclass(self):
+        """Lesson dataclass has no persistence-specific fields."""
+        lesson = Lesson(lesson_type=LESSON_TYPE_MAPPING, title="t", summary="s")
+        self.assertFalse(hasattr(lesson, "target_host"))
+        self.assertFalse(hasattr(lesson, "target_scope"))
+        self.assertFalse(hasattr(lesson, "memory_tier"))
+        self.assertFalse(hasattr(lesson, "review_status"))
 
 
 if __name__ == "__main__":

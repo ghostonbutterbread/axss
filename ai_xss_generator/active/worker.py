@@ -243,6 +243,7 @@ def _run(
     except Exception as exc:
         log.debug("Pre-parse of %s failed (will retry per-param): %s", url, exc)
 
+    session_lessons: list[Any] = []
     try:
         from ai_xss_generator.learning import build_memory_profile
         from ai_xss_generator.lessons import build_mapping_lessons, build_probe_lessons
@@ -256,30 +257,18 @@ def _run(
         if auth_headers:
             memory_profile["auth_required"] = True
         if _cached_context is not None:
-            _save_lessons_safe(
-                build_mapping_lessons(
-                    _cached_context,
-                    memory_profile=memory_profile,
-                    evidence_type="parsed_context",
-                    memory_tier="verified-runtime",
-                    provenance=url,
-                ),
-                findings_lock,
-            )
+            session_lessons.extend(build_mapping_lessons(
+                _cached_context,
+                memory_profile=memory_profile,
+            ))
         if reflected:
-            _save_lessons_safe(
-                build_probe_lessons(
-                    reflected,
-                    memory_profile=memory_profile,
-                    delivery_mode="get",
-                    provenance=url,
-                    evidence_type="active_probe",
-                    memory_tier="verified-runtime",
-                ),
-                findings_lock,
-            )
+            session_lessons.extend(build_probe_lessons(
+                reflected,
+                memory_profile=memory_profile,
+                delivery_mode="get",
+            ))
     except Exception as exc:
-        log.debug("Lesson capture failed for %s: %s", url, exc)
+        log.debug("Session lesson build failed for %s: %s", url, exc)
 
     if not reflected:
         put_result(WorkerResult(
@@ -358,13 +347,6 @@ def _run(
                             cloud_escalated=False,
                         )
                         confirmed_findings.append(finding)
-                        _save_finding_safe(
-                            finding,
-                            findings_lock,
-                            delivery_mode="get",
-                            frameworks=list(getattr(_cached_context, "frameworks", [])) if _cached_context else [],
-                            auth_required=bool(auth_headers),
-                        )
                         context_confirmed = True
                         break  # confirmed for this context — move to next param
                     else:
@@ -380,6 +362,7 @@ def _run(
                         base_context=_cached_context,
                         auth_headers=auth_headers,
                         delivery_mode="get",
+                        session_lessons=session_lessons,
                     )
 
                     for lp in local_payloads:
@@ -405,13 +388,6 @@ def _run(
                                 cloud_escalated=False,
                             )
                             confirmed_findings.append(finding)
-                            _save_finding_safe(
-                                finding,
-                                findings_lock,
-                                delivery_mode="get",
-                                frameworks=list(getattr(_cached_context, "frameworks", [])) if _cached_context else [],
-                                auth_required=bool(auth_headers),
-                            )
                             context_confirmed = True
                             break
                         else:
@@ -446,6 +422,7 @@ def _run(
                         cli_tool=cli_tool,
                         cli_model=cli_model,
                         delivery_mode="get",
+                        session_lessons=session_lessons,
                     )
 
                     if cloud_payloads:
@@ -474,13 +451,6 @@ def _run(
                                 cloud_escalated=True,
                             )
                             confirmed_findings.append(finding)
-                            _save_finding_safe(
-                                finding,
-                                findings_lock,
-                                delivery_mode="get",
-                                frameworks=list(getattr(_cached_context, "frameworks", [])) if _cached_context else [],
-                                auth_required=bool(auth_headers),
-                            )
                             break
 
     finally:
@@ -541,6 +511,7 @@ def _get_local_payloads(
     base_context: Any = None,
     auth_headers: dict[str, str] | None = None,
     delivery_mode: str = "get",
+    session_lessons: list[Any] | None = None,
 ) -> list[str]:
     """Ask the local model for payloads. Returns raw payload strings.
 
@@ -569,6 +540,7 @@ def _get_local_payloads(
             waf=waf,
             use_cloud=False,  # local only at this step
             memory_profile=memory_profile,
+            past_lessons=session_lessons,
         )
         return [p.payload for p in payloads if p.payload]
     except Exception as exc:
@@ -590,6 +562,7 @@ def _get_cloud_payloads(
     cli_tool: str = "claude",
     cli_model: str | None = None,
     delivery_mode: str = "get",
+    session_lessons: list[Any] | None = None,
 ) -> list[str]:
     """Check dedup registry; call cloud model if this is a novel fingerprint.
 
@@ -620,6 +593,7 @@ def _get_cloud_payloads(
             context=context,
             cloud_model=cloud_model,
             waf=waf,
+            past_lessons=session_lessons,
             ai_backend=ai_backend,
             cli_tool=cli_tool,
             cli_model=cli_model,
@@ -745,6 +719,7 @@ def _run_post(
     injectable = [r for r in probe_results if r.is_injectable]
     reflected  = [r for r in probe_results if r.is_reflected]
 
+    post_session_lessons: list[Any] = []
     try:
         from ai_xss_generator.learning import build_memory_profile
         from ai_xss_generator.lessons import build_probe_lessons
@@ -754,24 +729,17 @@ def _run_post(
             waf_name=waf_hint,
             delivery_mode="post",
             target_host=urllib.parse.urlparse(post_form.action_url).netloc,
-            target_scope="host",
         )
         if auth_headers:
             memory_profile["auth_required"] = True
         if reflected:
-            _save_lessons_safe(
-                build_probe_lessons(
-                    reflected,
-                    memory_profile=memory_profile,
-                    delivery_mode="post",
-                    provenance=post_form.action_url,
-                    evidence_type="active_probe",
-                    memory_tier="verified-runtime",
-                ),
-                findings_lock,
-            )
+            post_session_lessons.extend(build_probe_lessons(
+                reflected,
+                memory_profile=memory_profile,
+                delivery_mode="post",
+            ))
     except Exception as exc:
-        log.debug("POST lesson capture failed for %s: %s", post_form.action_url, exc)
+        log.debug("POST lesson build failed for %s: %s", post_form.action_url, exc)
 
     if not reflected:
         put_result(WorkerResult(
@@ -849,13 +817,6 @@ def _run_post(
                             cloud_escalated=False,
                         )
                         confirmed_findings.append(finding)
-                        _save_finding_safe(
-                            finding,
-                            findings_lock,
-                            delivery_mode="post",
-                            frameworks=[],
-                            auth_required=bool(auth_headers),
-                        )
                         context_confirmed = True
                         break
                     else:
@@ -887,6 +848,7 @@ def _run_post(
                         cli_tool=cli_tool,
                         cli_model=cli_model,
                         delivery_mode="post",
+                        session_lessons=post_session_lessons,
                     )
                     if cloud_payloads:
                         cloud_escalated = True
@@ -916,13 +878,6 @@ def _run_post(
                                 cloud_escalated=True,
                             )
                             confirmed_findings.append(finding)
-                            _save_finding_safe(
-                                finding,
-                                findings_lock,
-                                delivery_mode="post",
-                                frameworks=[],
-                                auth_required=bool(auth_headers),
-                            )
                             break
 
     finally:
@@ -942,46 +897,3 @@ def _run_post(
     ))
 
 
-def _save_finding_safe(
-    finding: ConfirmedFinding,
-    findings_lock: Any,
-    *,
-    delivery_mode: str = "get",
-    frameworks: list[str] | None = None,
-    auth_required: bool = False,
-) -> None:
-    """Write to findings store with process-safe lock.
-
-    Finding construction (including infer_bypass_family) is done *outside* the
-    lock so the critical section only covers the file write.
-    """
-    try:
-        from ai_xss_generator.findings import save_finding
-        from ai_xss_generator.learning import build_verified_runtime_finding
-        f = build_verified_runtime_finding(
-            finding,
-            delivery_mode=delivery_mode,
-            frameworks=frameworks,
-            auth_required=auth_required,
-        )
-    except Exception as exc:
-        log.debug("Failed to build Finding object: %s", exc)
-        return
-    try:
-        with findings_lock:
-            save_finding(f)
-    except Exception as exc:
-        log.debug("Failed to save finding: %s", exc)
-
-
-def _save_lessons_safe(lessons: list[Any], findings_lock: Any) -> None:
-    if not lessons:
-        return
-    try:
-        from ai_xss_generator.lessons import save_lesson
-
-        with findings_lock:
-            for lesson in lessons:
-                save_lesson(lesson)
-    except Exception as exc:
-        log.debug("Failed to save lessons: %s", exc)
