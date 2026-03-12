@@ -14,10 +14,13 @@ output parsing (_extract_json_blob + _normalize_payloads) is shared.
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 import shutil
 import subprocess
+import tempfile
+from pathlib import Path
 
 log = logging.getLogger(__name__)
 
@@ -114,6 +117,38 @@ def _run(cmd: list[str], tool: str) -> str:
     return result.stdout
 
 
+def _codex_output_schema() -> dict[str, object]:
+    """JSON Schema for the final Codex message used by payload generation."""
+    return {
+        "type": "object",
+        "properties": {
+            "payloads": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "payload": {"type": "string"},
+                        "title": {"type": "string"},
+                        "explanation": {"type": "string"},
+                        "test_vector": {"type": "string"},
+                        "tags": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "target_sink": {"type": "string"},
+                        "bypass_family": {"type": "string"},
+                        "risk_score": {"type": "integer"},
+                    },
+                    "required": ["payload"],
+                    "additionalProperties": True,
+                },
+            },
+        },
+        "required": ["payloads"],
+        "additionalProperties": True,
+    }
+
+
 def call_claude(prompt: str, model: str | None = None) -> str:
     """Run 'claude -p PROMPT [--model MODEL]' and return stdout."""
     if not is_available("claude"):
@@ -146,10 +181,44 @@ def call_codex(prompt: str, model: str | None = None) -> str:
         log.warning(
             "codex CLI does not support model selection; --cli-model %r will be ignored", model
         )
-    cmd = ["codex", "exec", prompt, "--skip-git-repo-check"]
-    log.debug("CLI invoke: codex exec <prompt> --skip-git-repo-check")
-    log.debug("codex CLI prompt preview:\n%s", _trace_preview(prompt))
-    return _run(cmd, "codex")
+    with tempfile.TemporaryDirectory(prefix="axss-codex-") as tmpdir:
+        schema_path = Path(tmpdir) / "payload-schema.json"
+        output_path = Path(tmpdir) / "codex-last-message.json"
+        schema_path.write_text(json.dumps(_codex_output_schema(), indent=2), encoding="utf-8")
+        cmd = [
+            "codex",
+            "exec",
+            prompt,
+            "--skip-git-repo-check",
+            "--color",
+            "never",
+            "--output-schema",
+            str(schema_path),
+            "--output-last-message",
+            str(output_path),
+        ]
+        log.debug(
+            "CLI invoke: codex exec <prompt> --skip-git-repo-check --color never "
+            "--output-schema <schema> --output-last-message <file>"
+        )
+        log.debug("codex CLI prompt preview:\n%s", _trace_preview(prompt))
+        stdout = _run(cmd, "codex")
+        final_message = ""
+        try:
+            final_message = output_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            final_message = ""
+        if final_message:
+            log.debug("codex CLI final message preview:\n%s", _trace_preview(final_message))
+            return final_message
+        if stdout.strip():
+            log.debug("codex CLI falling back to stdout as final message")
+            return stdout
+        raise CliInvocationError(
+            "codex",
+            "codex CLI completed but did not produce a final structured message",
+            fallback_recommended=False,
+        )
 
 
 def generate_via_cli_with_tool(tool: str, prompt: str, model: str | None = None) -> tuple[str, str]:
