@@ -139,13 +139,22 @@ def _codex_output_schema() -> dict[str, object]:
                         "bypass_family": {"type": "string"},
                         "risk_score": {"type": "integer"},
                     },
-                    "required": ["payload"],
-                    "additionalProperties": True,
+                    "required": [
+                        "payload",
+                        "title",
+                        "explanation",
+                        "test_vector",
+                        "tags",
+                        "target_sink",
+                        "bypass_family",
+                        "risk_score",
+                    ],
+                    "additionalProperties": False,
                 },
             },
         },
         "required": ["payloads"],
-        "additionalProperties": True,
+        "additionalProperties": False,
     }
 
 
