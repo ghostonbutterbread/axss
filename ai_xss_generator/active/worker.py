@@ -4,11 +4,9 @@ Full lifecycle per URL:
   1. WAF detect (reuse existing helper)
   2. Fetch + surface-map the target page
   3. Probe all query parameters for reflection + surviving chars
-  4. For each injectable param: fire Phase 1 mechanical transforms via Playwright
-  5. If Phase 1 exhausted with no execution confirmed:
-       - Run local model to get AI payloads; fire those
-       - If still unconfirmed: escalate directly to cloud model
-  6. Write confirmed findings to the findings store (process-safe via lock)
+  4. Build enriched reasoning context from parsed page state + probe lessons
+  5. For each injectable param: ask the model for tailored payloads and fire those
+  6. If model-driven attempts do not confirm execution: fall back to deterministic transforms
   7. Return WorkerResult to orchestrator via result_queue
 """
 from __future__ import annotations
@@ -20,6 +18,7 @@ import time
 import urllib.parse
 from dataclasses import dataclass, field
 from multiprocessing.managers import DictProxy
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -307,7 +306,7 @@ def _run(
     try:
         from ai_xss_generator.active.transforms import all_variants_for_probe
 
-        # ── Step 4: Phase 1 — mechanical transforms per injectable param ──────
+        # ── Step 5: Model-first execution per injectable param ────────────────
         for probe_result in injectable:
             if _timed_out():
                 break
@@ -319,46 +318,19 @@ def _run(
                 if _timed_out():
                     break
 
-                failed_transform_names: list[str] = []
+                context_probe_result = _probe_result_for_context(probe_result, context_type)
                 # Track confirmation per context — a confirmed finding on one
                 # param must not suppress escalation on a different param.
                 context_confirmed = False
 
-                for variant in variants:
-                    if _timed_out():
-                        break
-
-                    total_transforms_tried += 1
-                    result = executor.fire(
-                        url=url,
-                        param_name=param_name,
-                        payload=variant.payload,
-                        all_params=flat_params,
-                        transform_name=variant.transform_name,
-                        sink_url=sink_url,
-                    )
-
-                    if result.confirmed:
-                        finding = _make_finding(
-                            url=url,
-                            probe_result=probe_result,
-                            context_type=context_type,
-                            result=result,
-                            waf=waf_hint,
-                            source="phase1_transform",
-                            cloud_escalated=False,
-                        )
-                        confirmed_findings.append(finding)
-                        context_confirmed = True
-                        break  # confirmed for this context — move to next param
-                    else:
-                        failed_transform_names.append(variant.transform_name)
-
-                # ── Step 5: No Phase 1 confirmation — try local model ─────────
+                # Ask the local model first using the enriched target context.
+                # Only AI-origin payloads are returned here; heuristic payloads
+                # still exist in generate_payloads() but stay out of active
+                # execution so deterministic fallback remains explicit.
                 if not context_confirmed and not _timed_out():
                     local_payloads = _get_local_payloads(
                         url=url,
-                        probe_result=probe_result,
+                        probe_result=context_probe_result,
                         model=model,
                         waf=waf_hint,
                         base_context=_cached_context,
@@ -382,7 +354,7 @@ def _run(
                         if result.confirmed:
                             finding = _make_finding(
                                 url=url,
-                                probe_result=probe_result,
+                                probe_result=context_probe_result,
                                 context_type=context_type,
                                 result=result,
                                 waf=waf_hint,
@@ -392,15 +364,14 @@ def _run(
                             confirmed_findings.append(finding)
                             context_confirmed = True
                             break
-                        else:
-                            failed_transform_names.append("local_model")
 
-                # ── Step 6: Still nothing — escalate to cloud ─────────────────
+                # If the local model misses, try the cloud model before giving
+                # up on dynamic reasoning for this reflection context.
                 if not context_confirmed and use_cloud and not _timed_out():
                     # Each unique (endpoint + param + waf + char profile + context)
                     # combination gets exactly one cloud call.
                     surviving_chars = frozenset().union(
-                        *(ctx.surviving_chars for ctx in probe_result.reflections)
+                        *(ctx.surviving_chars for ctx in context_probe_result.reflections)
                     )
                     ekey = _escalation_key(
                         url=url,
@@ -412,7 +383,7 @@ def _run(
 
                     cloud_payloads = _get_cloud_payloads(
                         url=url,
-                        probe_result=probe_result,
+                        probe_result=context_probe_result,
                         cloud_model=cloud_model,
                         waf=waf_hint,
                         ekey=ekey,
@@ -445,7 +416,7 @@ def _run(
                         if result.confirmed:
                             finding = _make_finding(
                                 url=url,
-                                probe_result=probe_result,
+                                probe_result=context_probe_result,
                                 context_type=context_type,
                                 result=result,
                                 waf=waf_hint,
@@ -453,6 +424,38 @@ def _run(
                                 cloud_escalated=True,
                             )
                             confirmed_findings.append(finding)
+                            context_confirmed = True
+                            break
+
+                # Deterministic transforms are now a fallback stage instead of
+                # the primary search strategy.
+                if not context_confirmed and not _timed_out():
+                    for variant in variants:
+                        if _timed_out():
+                            break
+
+                        total_transforms_tried += 1
+                        result = executor.fire(
+                            url=url,
+                            param_name=param_name,
+                            payload=variant.payload,
+                            all_params=flat_params,
+                            transform_name=variant.transform_name,
+                            sink_url=sink_url,
+                        )
+
+                        if result.confirmed:
+                            finding = _make_finding(
+                                url=url,
+                                probe_result=context_probe_result,
+                                context_type=context_type,
+                                result=result,
+                                waf=waf_hint,
+                                source="phase1_transform",
+                                cloud_escalated=False,
+                            )
+                            confirmed_findings.append(finding)
+                            context_confirmed = True
                             break
 
     finally:
@@ -505,6 +508,22 @@ def _make_finding(
     )
 
 
+def _probe_result_for_context(probe_result: Any, context_type: str) -> Any:
+    """Return a lightweight probe result containing only one reflection context."""
+    reflections = [
+        ctx for ctx in getattr(probe_result, "reflections", [])
+        if getattr(ctx, "context_type", "") == context_type
+    ]
+    if not reflections:
+        reflections = list(getattr(probe_result, "reflections", []))
+    return SimpleNamespace(
+        param_name=getattr(probe_result, "param_name", ""),
+        original_value=getattr(probe_result, "original_value", ""),
+        reflections=reflections,
+        error=getattr(probe_result, "error", None),
+    )
+
+
 def _get_local_payloads(
     url: str,
     probe_result: Any,
@@ -536,7 +555,7 @@ def _get_local_payloads(
             waf_name=waf,
             delivery_mode=delivery_mode,
         )
-        payloads, *_ = generate_payloads(
+        payloads, engine, *_ = generate_payloads(
             context=context,
             model=model,
             waf=waf,
@@ -544,7 +563,13 @@ def _get_local_payloads(
             memory_profile=memory_profile,
             past_lessons=session_lessons,
         )
-        return [p.payload for p in payloads if p.payload]
+        if engine == "heuristic":
+            return []
+        return [
+            p.payload
+            for p in payloads
+            if p.payload and getattr(p, "source", "heuristic") != "heuristic"
+        ]
     except Exception as exc:
         log.debug("Local model failed for %s param=%s: %s", url, probe_result.param_name, exc)
         return []
@@ -799,6 +824,7 @@ def _run_post(
     from ai_xss_generator.probe import probe_post_form
     from ai_xss_generator.active.executor import ActiveExecutor
     from ai_xss_generator.active.transforms import all_variants_for_probe
+    from ai_xss_generator.parser import parse_target as _parse_target
 
     deadline = start_time + timeout_seconds
 
@@ -826,19 +852,35 @@ def _run_post(
     injectable = [r for r in probe_results if r.is_injectable]
     reflected  = [r for r in probe_results if r.is_reflected]
 
+    _cached_context: Any = None
+    try:
+        _cached_context = _parse_target(
+            url=post_form.source_page_url,
+            html_value=None,
+            waf=waf_hint,
+            auth_headers=auth_headers,
+        )
+    except Exception as exc:
+        log.debug("Pre-parse of form source %s failed: %s", post_form.source_page_url, exc)
+
     post_session_lessons: list[Any] = []
     try:
         from ai_xss_generator.learning import build_memory_profile
-        from ai_xss_generator.lessons import build_probe_lessons
+        from ai_xss_generator.lessons import build_mapping_lessons, build_probe_lessons
 
         memory_profile = build_memory_profile(
-            context=None,
+            context=_cached_context,
             waf_name=waf_hint,
             delivery_mode="post",
             target_host=urllib.parse.urlparse(post_form.action_url).netloc,
         )
         if auth_headers:
             memory_profile["auth_required"] = True
+        if _cached_context is not None:
+            post_session_lessons.extend(build_mapping_lessons(
+                _cached_context,
+                memory_profile=memory_profile,
+            ))
         if reflected:
             post_session_lessons.extend(build_probe_lessons(
                 reflected,
@@ -894,46 +936,52 @@ def _run_post(
                 if _timed_out():
                     break
 
+                context_probe_result = _probe_result_for_context(probe_result, context_type)
                 context_confirmed = False
-                failed_transform_names: list[str] = []
 
-                for variant in variants:
-                    if _timed_out():
-                        break
-
-                    total_transforms_tried += 1
-                    result = executor.fire_post(
-                        source_page_url=post_form.source_page_url,
-                        action_url=post_form.action_url,
-                        param_name=param_name,
-                        payload=variant.payload,
-                        all_param_names=post_form.param_names,
-                        csrf_field=post_form.csrf_field,
-                        transform_name=variant.transform_name,
-                        sink_url=sink_url,
+                if not context_confirmed and not _timed_out():
+                    local_payloads = _get_local_payloads(
+                        url=post_form.source_page_url,
+                        probe_result=context_probe_result,
+                        model=model,
+                        waf=waf_hint,
+                        base_context=_cached_context,
+                        auth_headers=auth_headers,
+                        delivery_mode="post",
+                        session_lessons=post_session_lessons,
                     )
 
-                    if result.confirmed:
-                        finding = _make_finding(
-                            url=post_form.action_url,
-                            probe_result=probe_result,
-                            context_type=context_type,
-                            result=result,
-                            waf=waf_hint,
-                            source="phase1_transform",
-                            cloud_escalated=False,
+                    for lp in local_payloads:
+                        if _timed_out():
+                            break
+                        total_transforms_tried += 1
+                        result = executor.fire_post(
+                            source_page_url=post_form.source_page_url,
+                            action_url=post_form.action_url,
+                            param_name=param_name,
+                            payload=lp,
+                            all_param_names=post_form.param_names,
+                            csrf_field=post_form.csrf_field,
+                            transform_name="local_model",
+                            sink_url=sink_url,
                         )
-                        confirmed_findings.append(finding)
-                        context_confirmed = True
-                        break
-                    else:
-                        failed_transform_names.append(variant.transform_name)
+                        if result.confirmed:
+                            finding = _make_finding(
+                                url=post_form.action_url,
+                                probe_result=context_probe_result,
+                                context_type=context_type,
+                                result=result,
+                                waf=waf_hint,
+                                source="local_model",
+                                cloud_escalated=False,
+                            )
+                            confirmed_findings.append(finding)
+                            context_confirmed = True
+                            break
 
-                # Local model fallback (reuse existing helper — it needs a URL context
-                # so we skip it for POST forms where URL has no params; cloud still usable)
                 if not context_confirmed and use_cloud and not _timed_out():
                     surviving_chars = frozenset().union(
-                        *(ctx.surviving_chars for ctx in probe_result.reflections)
+                        *(ctx.surviving_chars for ctx in context_probe_result.reflections)
                     )
                     ekey = _escalation_key(
                         url=post_form.action_url,
@@ -943,13 +991,14 @@ def _run_post(
                         context_type=context_type,
                     )
                     cloud_payloads = _get_cloud_payloads(
-                        url=post_form.action_url,
-                        probe_result=probe_result,
+                        url=post_form.source_page_url,
+                        probe_result=context_probe_result,
                         cloud_model=cloud_model,
                         waf=waf_hint,
                         ekey=ekey,
                         dedup_registry=dedup_registry,
                         dedup_lock=dedup_lock,
+                        base_context=_cached_context,
                         auth_headers=auth_headers,
                         ai_backend=ai_backend,
                         cli_tool=cli_tool,
@@ -977,7 +1026,7 @@ def _run_post(
                         if result.confirmed:
                             finding = _make_finding(
                                 url=post_form.action_url,
-                                probe_result=probe_result,
+                                probe_result=context_probe_result,
                                 context_type=context_type,
                                 result=result,
                                 waf=waf_hint,
@@ -985,6 +1034,38 @@ def _run_post(
                                 cloud_escalated=True,
                             )
                             confirmed_findings.append(finding)
+                            context_confirmed = True
+                            break
+
+                if not context_confirmed and not _timed_out():
+                    for variant in variants:
+                        if _timed_out():
+                            break
+
+                        total_transforms_tried += 1
+                        result = executor.fire_post(
+                            source_page_url=post_form.source_page_url,
+                            action_url=post_form.action_url,
+                            param_name=param_name,
+                            payload=variant.payload,
+                            all_param_names=post_form.param_names,
+                            csrf_field=post_form.csrf_field,
+                            transform_name=variant.transform_name,
+                            sink_url=sink_url,
+                        )
+
+                        if result.confirmed:
+                            finding = _make_finding(
+                                url=post_form.action_url,
+                                probe_result=context_probe_result,
+                                context_type=context_type,
+                                result=result,
+                                waf=waf_hint,
+                                source="phase1_transform",
+                                cloud_escalated=False,
+                            )
+                            confirmed_findings.append(finding)
+                            context_confirmed = True
                             break
 
     finally:
@@ -1002,4 +1083,3 @@ def _run_post(
         params_reflected=len(reflected),
         kind="post",
     ))
-

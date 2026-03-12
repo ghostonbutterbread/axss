@@ -156,7 +156,7 @@ def _format_finding(index: int, f: ConfirmedFinding) -> list[str]:
     endpoint = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
     is_dom = f.context_type == "dom_xss"
     source_label = {
-        "phase1_transform": "Phase 1 mechanical transform",
+        "phase1_transform": "Deterministic fallback transform",
         "local_model":      "Local AI model payload",
         "cloud_model":      "Cloud model payload (escalated)",
         "dom_xss_runtime":  "DOM XSS runtime sink hooking",
@@ -263,7 +263,7 @@ def _explain_why(f: ConfirmedFinding) -> str:
         "autofocus":        "`onfocus` + `autofocus` attributes triggered execution without user interaction.",
         "details_toggle":   "`<details open ontoggle=...>` triggered execution on page load without clicks.",
         "local_model":      "The local AI model generated a payload tailored to this exact context.",
-        "cloud_model":      "The cloud AI model generated a targeted bypass after local and mechanical approaches failed.",
+        "cloud_model":      "The cloud AI model generated a targeted bypass after the local model could not produce a working payload.",
     }
     if f.transform_name in transform_explanations:
         parts.append(transform_explanations[f.transform_name])
