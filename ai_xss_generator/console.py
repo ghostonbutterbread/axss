@@ -32,6 +32,16 @@ BRIGHT_CYAN = "\033[96m"
 WHITE = "\033[37m"
 
 
+# Global verbosity level — 0=normal, 1=-v, 2=-vv
+# Set once in main() before spawning workers (inherited via fork on Linux).
+VERBOSE_LEVEL: int = 0
+
+
+def set_verbose_level(level: int) -> None:
+    global VERBOSE_LEVEL
+    VERBOSE_LEVEL = level
+
+
 def _tty() -> bool:
     return hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
 
@@ -91,6 +101,16 @@ def dim_line(message: str) -> None:
     """Dimmed supporting text."""
     _before_print()
     print(_c(DIM, message), flush=True)
+    _after_print()
+
+
+def debug(message: str) -> None:
+    """[.] Trace output — only printed at -vv (VERBOSE_LEVEL >= 2)."""
+    if VERBOSE_LEVEL < 2:
+        return
+    _before_print()
+    prefix = _c(DIM, "[.]") if _tty() else "[.]"
+    print(f"{prefix} {message}", flush=True)
     _after_print()
 
 

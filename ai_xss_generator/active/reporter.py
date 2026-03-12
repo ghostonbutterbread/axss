@@ -52,10 +52,14 @@ def _build_report(results: Sequence[WorkerResult], config_summary: str) -> str:
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     confirmed_results = [r for r in results if r.status == "confirmed"]
+    taint_results     = [r for r in results if r.status == "taint_only"]
     error_results     = [r for r in results if r.status == "error"]
 
     all_findings: list[ConfirmedFinding] = [
         f for r in confirmed_results for f in r.confirmed_findings
+    ]
+    taint_findings: list[ConfirmedFinding] = [
+        f for r in taint_results for f in r.confirmed_findings
     ]
 
     domains = sorted({urllib.parse.urlparse(r.url).netloc for r in results if r.url})
@@ -92,6 +96,23 @@ def _build_report(results: Sequence[WorkerResult], config_summary: str) -> str:
             "",
         ]
 
+    # ── DOM taint without execution ──────────────────────────────────────────
+    if taint_findings:
+        lines += [
+            f"## ℹ️ DOM Taint Only ({len(taint_findings)})",
+            "",
+            "| URL | Parameter | Sink | Detail | Test URL |",
+            "|-----|-----------|------|--------|----------|",
+        ]
+        for f in taint_findings:
+            detail = f.execution_detail.replace("|", "\\|")
+            test_url = f.fired_url.replace("|", "\\|")
+            lines.append(
+                f"| `{f.url}` | `{f.param_name}` | `{f.sink_context}` | "
+                f"{detail} | `{test_url}` |"
+            )
+        lines += ["", "---", ""]
+
     # ── Errors ────────────────────────────────────────────────────────────────
     if error_results:
         lines += [
@@ -115,8 +136,12 @@ def _build_report(results: Sequence[WorkerResult], config_summary: str) -> str:
           "during crawl. Payloads stored and rendered on pages outside the crawl "
           "boundary (admin panels, other users' sessions) require `--sink-url` or "
           "blind XSS to detect.",
-        "- **DOM XSS (fragment/hash):** Client-side sinks driven by `location.hash` or "
-          "`location.search` without a server round-trip are not covered.",
+        "- **DOM XSS (CSP-blocked payloads):** When taint flow is confirmed but "
+          "execution fails (`dom_taint`), a strict Content Security Policy is the "
+          "most likely cause. Manual verification with a CSP-aware payload is recommended.",
+        "- **DOM XSS (external JS bundles):** The runtime hook covers inline scripts "
+          "and dynamically evaluated code. Sinks inside lazy-loaded chunk bundles "
+          "may not be reached if they load after the hook fires.",
         "- **Cloud model web search:** Bypass reasoning is based on the cloud model's "
           "training knowledge only. Novel WAF bypasses published after the training "
           "cutoff may be missed.",
@@ -129,43 +154,75 @@ def _build_report(results: Sequence[WorkerResult], config_summary: str) -> str:
 def _format_finding(index: int, f: ConfirmedFinding) -> list[str]:
     parsed = urllib.parse.urlparse(f.url)
     endpoint = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+    is_dom = f.context_type == "dom_xss"
     source_label = {
         "phase1_transform": "Phase 1 mechanical transform",
         "local_model":      "Local AI model payload",
         "cloud_model":      "Cloud model payload (escalated)",
+        "dom_xss_runtime":  "DOM XSS runtime sink hooking",
     }.get(f.source, f.source)
 
     why = _explain_why(f)
 
-    return [
+    lines = [
         f"### Finding {index} — `{endpoint}`",
         "",
-        f"| Field | Value |",
-        f"|-------|-------|",
-        f"| **Parameter** | `{f.param_name}` |",
-        f"| **Sink context** | `{f.context_type}` |",
+        "| Field | Value |",
+        "|-------|-------|",
+        f"| **Parameter / Source** | `{f.param_name}` |",
+        f"| **Sink** | `{f.sink_context}` |",
+        f"| **Context type** | `{f.context_type}` |",
         f"| **WAF** | {f.waf or '—'} |",
-        f"| **Confirmed by** | {f.execution_method} ({f.execution_detail}) |",
+        f"| **Confirmed by** | `{f.execution_method}` |",
         f"| **Source** | {source_label} |",
-        f"| **Transform** | `{f.transform_name}` |",
-        f"| **Surviving chars** | `{f.surviving_chars or '?'}` |",
-        "",
-        "**Payload:**",
+    ]
+
+    if not is_dom:
+        lines += [
+            f"| **Transform** | `{f.transform_name}` |",
+            f"| **Surviving chars** | `{f.surviving_chars or '?'}` |",
+        ]
+
+    lines += [""]
+
+    if f.payload:
+        lines += [
+            "**Payload:**",
+            "```",
+            f.payload,
+            "```",
+            "",
+        ]
+
+    lines += [
+        "**Test URL** _(paste into browser to reproduce)_:",
         "```",
-        f.payload,
+        urllib.parse.unquote(f.fired_url),
         "```",
         "",
-        f"**Test URL:**",
-        f"```",
-        f.fired_url,
-        "```",
+    ]
+
+    # DOM XSS: show the JS call stack so the tester can locate the sink in source
+    if is_dom and f.code_location:
+        lines += [
+            "**JS sink location** _(where in the page's JS the sink was reached)_:",
+            "```",
+            f.code_location,
+            "```",
+            "",
+        ]
+
+    lines += [
+        "**Detail:**",
+        f"{f.execution_detail}",
         "",
-        f"**Why it worked:**",
+        "**Why it worked:**",
         f"{why}",
         "",
         "---",
         "",
     ]
+    return lines
 
 
 def _explain_why(f: ConfirmedFinding) -> str:

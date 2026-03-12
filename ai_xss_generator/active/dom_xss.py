@@ -21,6 +21,13 @@ import os
 import urllib.parse
 from dataclasses import dataclass
 
+from ai_xss_generator.console import debug as _debug
+from ai_xss_generator.active.console_signals import (
+    console_init_script,
+    is_execution_console_text,
+    strip_execution_console_text,
+)
+
 log = logging.getLogger(__name__)
 
 _NAV_TIMEOUT_MS = 10_000
@@ -50,7 +57,12 @@ _HOOK_JS_TEMPLATE = r"""(function() {
     function _record(sink, data) {
         var s = (data == null) ? '' : String(data);
         if (s.indexOf(CANARY) !== -1) {
-            window.__axss_dom_hits.push({sink: sink, snippet: s.slice(0, 300)});
+            var loc = '';
+            try {
+                var frames = new Error().stack.split('\n').slice(2, 5);
+                loc = frames.map(function(f) { return f.trim(); }).join(' → ');
+            } catch(e) {}
+            window.__axss_dom_hits.push({sink: sink, snippet: s.slice(0, 300), loc: loc});
         }
     }
 
@@ -148,6 +160,7 @@ class DomXssResult:
     payload_fired: str | None # the payload that triggered execution, or None
     detail: str               # human-readable summary of what was found
     fired_url: str            # full URL used for the final confirmation attempt
+    code_location: str = ""   # JS call stack frames showing where the sink was reached
 
 
 def _make_canary() -> str:
@@ -192,6 +205,7 @@ def _attempt_execution(
         )
         try:
             page = ctx.new_page()
+            page.add_init_script(console_init_script())
             page.route(
                 "**/*",
                 lambda route: route.abort()
@@ -213,11 +227,12 @@ def _attempt_execution(
 
             def _on_console(msg, _p=payload, _s=sink):
                 nonlocal _confirmed, _detail
-                if not _confirmed:
+                if not _confirmed and is_execution_console_text(msg.text):
                     _confirmed = True
                     _detail = (
                         f"DOM XSS confirmed via console.{msg.type}() — "
-                        f"sink:{_s} source:{source_name!r} payload:{_p!r}"
+                        f"sink:{_s} source:{source_name!r} payload:{_p!r} "
+                        f"text:{strip_execution_console_text(msg.text)!r}"
                     )
 
             page.on("dialog", _on_dialog)
@@ -275,11 +290,14 @@ def scan_dom_xss(
     sources: list[tuple[str, str]] = [("query_param", k) for k in raw_params]
     sources.append(("fragment", "hash"))
 
+    _debug(f"DOM XSS scan: {url}  canary={canary}  sources={[s[1] for s in sources]}")
+
     # Dedup: avoid reporting the same (source_name, sink) pair twice
     seen: set[tuple[str, str]] = set()
 
     for source_type, source_name in sources:
         canary_url = _inject_source(url, source_type, source_name, canary)
+        _debug(f"  probing source={source_type}/{source_name}  url={canary_url}")
         ctx = browser.new_context(
             ignore_https_errors=True,
             extra_http_headers=extra_headers,
@@ -312,19 +330,25 @@ def scan_dom_xss(
             except Exception:
                 hits = []
 
+            _debug(f"  hits from sink hooks: {len(hits)}")
             for hit in hits:
                 sink_name: str = hit.get("sink", "unknown")
+                code_loc: str = hit.get("loc", "")
                 dedup_key = (source_name, sink_name)
                 if dedup_key in seen:
                     continue
                 seen.add(dedup_key)
 
                 log.debug(
-                    "DOM taint: source=%s/%s → sink=%s",
-                    source_type, source_name, sink_name,
+                    "DOM taint: source=%s/%s → sink=%s  loc=%s",
+                    source_type, source_name, sink_name, code_loc or "(unknown)",
                 )
+                _debug(f"  TAINT: {source_name} → {sink_name}")
+                if code_loc:
+                    _debug(f"    JS location: {code_loc}")
 
                 payloads = _SINK_PAYLOADS.get(sink_name, _DEFAULT_PAYLOADS)
+                _debug(f"    trying {len(payloads)} payload(s) for sink '{sink_name}'")
                 exec_ok, exec_payload, exec_detail = _attempt_execution(
                     browser=browser,
                     url=url,
@@ -337,9 +361,11 @@ def scan_dom_xss(
                 )
 
                 if exec_ok:
+                    _debug(f"    CONFIRMED execution via payload: {exec_payload!r}")
                     fired_url = _inject_source(url, source_type, source_name, exec_payload)
                     detail = exec_detail
                 else:
+                    _debug(f"    taint confirmed but no payload executed (CSP or mismatch)")
                     fired_url = canary_url
                     detail = (
                         f"DOM taint confirmed — canary reached sink '{sink_name}' via "
@@ -358,6 +384,7 @@ def scan_dom_xss(
                         payload_fired=exec_payload if exec_ok else None,
                         detail=detail,
                         fired_url=fired_url,
+                        code_location=code_loc,
                     )
                 )
 

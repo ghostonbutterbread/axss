@@ -430,6 +430,14 @@ def _log_result(r: WorkerResult) -> None:
             + (", cloud escalated" if r.cloud_escalated else "")
             + ")"
         )
+    elif r.status == "taint_only":
+        info(
+            f"[active] DOM taint confirmed, but no execution — {r.url} "
+            f"({len(r.confirmed_findings)} sink hit(s))"
+        )
+        for f in r.confirmed_findings:
+            display_url = _up.unquote(f.fired_url)
+            info(f"  ↳ [{f.param_name}] {display_url}")
     elif r.status == "error":
         warn(f"[active] error — {r.url}: {r.error}")
 
@@ -437,7 +445,9 @@ def _log_result(r: WorkerResult) -> None:
 def _print_summary(results: list[WorkerResult]) -> None:
     import urllib.parse as _up
     confirmed = [r for r in results if r.status == "confirmed"]
+    taint_only = [r for r in results if r.status == "taint_only"]
     all_findings = [f for r in confirmed for f in r.confirmed_findings]
+    taint_findings = [f for r in taint_only for f in r.confirmed_findings]
     errors = [r for r in results if r.status == "error"]
 
     info(f"\n{'─'*60}")
@@ -453,6 +463,8 @@ def _print_summary(results: list[WorkerResult]) -> None:
                 info(f"  {'─'*56}")
     else:
         info("  ➖ No confirmed XSS execution detected")
+    if taint_findings:
+        info(f"  • DOM taint reached a sink, but no payload executed: {len(taint_findings)} finding(s)")
     if errors:
         warn(f"  ⚠️  Errors: {len(errors)} target(s) failed")
     info(f"{'─'*60}\n")

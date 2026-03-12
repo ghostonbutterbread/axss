@@ -42,20 +42,22 @@ class ConfirmedFinding:
     sink_context: str
     payload: str
     transform_name: str
-    execution_method: str    # "dialog" | "console" | "network"
+    execution_method: str    # "dialog" | "console" | "network" | "dom_xss" | "dom_taint"
     execution_detail: str
     waf: str | None
     surviving_chars: str
     fired_url: str
-    source: str             # "phase1_transform" | "local_model" | "cloud_model"
+    source: str             # "phase1_transform" | "local_model" | "cloud_model" | "dom_xss_runtime"
     cloud_escalated: bool
+    code_location: str = ""
+    """JS call stack or script location where the sink was reached (DOM XSS only)."""
 
 
 @dataclass
 class WorkerResult:
     """Returned by a worker to the orchestrator via the result queue."""
     url: str
-    status: str             # "confirmed" | "no_execution" | "no_reflection" | "no_params" | "error"
+    status: str             # "confirmed" | "taint_only" | "no_execution" | "no_reflection" | "no_params" | "error"
     confirmed_findings: list[ConfirmedFinding] = field(default_factory=list)
     transforms_tried: int = 0
     cloud_escalated: bool = False
@@ -634,10 +636,16 @@ def _run_dom(
                 fired_url=dr.fired_url,
                 source="dom_xss_runtime",
                 cloud_escalated=False,
+                code_location=dr.code_location,
             )
         )
 
-    status = "confirmed" if findings else "no_execution"
+    if any(dr.confirmed_execution for dr in dom_results):
+        status = "confirmed"
+    elif findings:
+        status = "taint_only"
+    else:
+        status = "no_execution"
     put_result(WorkerResult(
         url=url,
         status=status,
@@ -994,5 +1002,4 @@ def _run_post(
         params_reflected=len(reflected),
         kind="post",
     ))
-
 

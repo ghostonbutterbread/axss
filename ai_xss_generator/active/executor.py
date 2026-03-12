@@ -14,6 +14,12 @@ import logging
 import urllib.parse
 from dataclasses import dataclass, field
 
+from ai_xss_generator.active.console_signals import (
+    console_init_script,
+    is_execution_console_text,
+    strip_execution_console_text,
+)
+
 log = logging.getLogger(__name__)
 
 # Marker hostname embedded in network-beacon payloads so we can detect OOB calls
@@ -142,6 +148,7 @@ class ActiveExecutor:
         )
         try:
             page = context.new_page()
+            page.add_init_script(console_init_script())
 
             # Block heavy resources to keep navigation fast
             page.route(
@@ -167,10 +174,13 @@ class ActiveExecutor:
             # --- Detection hook 2: console output ---
             def _on_console(msg):
                 nonlocal confirmed, method, detail
-                if not confirmed:
+                if not confirmed and is_execution_console_text(msg.text):
                     confirmed = True
                     method = "console"
-                    detail = f"console.{msg.type}() fired — text: {msg.text!r}"
+                    detail = (
+                        f"console.{msg.type}() fired — "
+                        f"text: {strip_execution_console_text(msg.text)!r}"
+                    )
 
             page.on("console", _on_console)
 
@@ -275,6 +285,7 @@ class ActiveExecutor:
         )
         try:
             page = context.new_page()
+            page.add_init_script(console_init_script())
 
             page.route(
                 "**/*",
@@ -298,10 +309,13 @@ class ActiveExecutor:
 
             def _on_console(msg):
                 nonlocal confirmed, method, detail
-                if payload_submitted and not confirmed:
+                if payload_submitted and not confirmed and is_execution_console_text(msg.text):
                     confirmed = True
                     method = "console"
-                    detail = f"console.{msg.type}() fired — text: {msg.text!r}"
+                    detail = (
+                        f"console.{msg.type}() fired — "
+                        f"text: {strip_execution_console_text(msg.text)!r}"
+                    )
 
             page.on("console", _on_console)
 

@@ -206,8 +206,12 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
     parser.add_argument(
         "-v",
         "--verbose",
-        action="store_true",
-        help="--verbose (print detailed sub-step progress), e.g. -v -i sample_target.html",
+        action="count",
+        default=0,
+        help=(
+            "-v for verbose progress output; "
+            "-vv for full debug trace (all pipeline steps, AI reasoning, DOM XSS probes)"
+        ),
     )
     parser.add_argument(
         "--merge-batch",
@@ -1036,10 +1040,23 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser(config.default_model)
     args = parser.parse_args(argv)
 
-    # Scrapling emits INFO-level fetch logs to stderr on every request.
-    # These bypass our status-bar hooks and corrupt the terminal display.
-    # Suppress them unless the user explicitly asked for verbose output.
-    if not getattr(args, "verbose", False):
+    verbose_level: int = getattr(args, "verbose", 0) or 0
+
+    # Configure console verbosity level (inherited by worker subprocesses via fork)
+    from ai_xss_generator.console import set_verbose_level as _set_verbose
+    _set_verbose(verbose_level)
+
+    if verbose_level >= 2:
+        # -vv: full debug trace — enable root logger at DEBUG so all worker
+        # log.debug() calls become visible.  Use stderr to avoid corrupting
+        # the progress panel on stdout.
+        _handler = _logging.StreamHandler()
+        _handler.setFormatter(_logging.Formatter("[%(name)s] %(message)s"))
+        _logging.getLogger().addHandler(_handler)
+        _logging.getLogger().setLevel(_logging.DEBUG)
+    elif verbose_level == 0:
+        # Scrapling emits INFO-level fetch logs to stderr on every request.
+        # These bypass our status-bar hooks and corrupt the terminal display.
         _logging.getLogger("scrapling").setLevel(_logging.WARNING)
 
     has_target = bool(args.url or args.urls or args.input)
