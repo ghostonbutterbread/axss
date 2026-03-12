@@ -8,6 +8,55 @@
 
 `axss` is a context-aware XSS scanner for authorized penetration testing. It crawls a live target, maps every GET parameter and POST form it finds, probes each one for reflection and filter behavior, then generates ranked payloads tailored to what the probe observed. It fires each payload through a real Playwright browser and confirms JavaScript execution via dialog hooks, console output, or network beacon. It covers reflected XSS, session-stored XSS, and POST forms protected by dynamic CSRF tokens.
 
+## Visual flow
+
+```text
+Active scan flow (GET + POST + DOM)
+
+  crawl / parse target
+         |
+         v
+  discover injectable runtime context
+  - GET / POST: probe reflections, context type, surviving chars
+  - DOM: runtime taint paths, source type, sink, code location
+         |
+         v
+  build enriched reasoning context
+  - parsed page state
+  - framework / sink hints
+  - auth notes
+  - probe lessons
+  - curated findings
+         |
+         v
+  ask model per execution context
+  - GET / POST: per reflection context
+  - DOM: per tainted source -> sink path
+  - local model first
+  - cloud model if local is weak or misses
+         |
+         v
+  execute payloads in Playwright
+         |
+         +--> confirmed execution
+         |    - dialog / console / network / DOM runtime
+         |    - write finding + report
+         |
+         +--> no confirmation
+              - deterministic context-aware fallback transforms
+              - then mark no_execution if still nothing lands
+
+
+Payload generation only (`--generate`)
+
+  parse target
+      -> optional probe enrichment
+      -> build reasoning context
+      -> ask model
+      -> merge / rank output
+      -> return payload list
+```
+
 ## Learning Model
 
 - The knowledge store is a single curated tier in SQLite at `~/.axss/knowledge.db`.
@@ -109,14 +158,27 @@ Stops at the first page where the canary appears. The char survival probe and al
 
 ### Payload generation
 
-Three sources, run in order, output merged and ranked:
-1. **Context-aware generator** — always runs, no LLM needed. `jsContexter` analyzes JS before the injection point to build an exact break-out sequence. `genGen` produces combinatorial payloads (tags × event handlers × JS calls × space replacements) with randomized casing.
-2. **Local Ollama model** — receives parsed context, probe results, past logic/filter lessons, and past findings
-3. **Cloud escalation** — OpenRouter or OpenAI if local output is weak and a key is configured
+Two execution modes matter here:
+
+1. **Active scan (`--active`, `--reflected`, `--stored`, `--dom`)**
+   - Probe first
+   - Build enriched reasoning context from parsed page state, probe observations, session lessons, and curated findings
+   - Ask the local model per execution context
+   - GET / POST isolate one reflection context per model call; DOM isolates one tainted source -> sink path per model call
+   - Escalate to cloud only if the local model misses or produces weak output
+   - If model-driven payloads do not confirm execution, fall back to deterministic context-aware transforms
+
+2. **Payload generation only (`--generate`)**
+   - Parse target
+   - Optionally enrich with probe results
+   - Ask the model for tailored payloads
+   - Merge and rank with heuristic/context-aware payload families before printing
+
+The deterministic generator is still present and useful, but in active scanning it now acts as a fallback rather than the primary search strategy.
 
 ### Active execution
 
-Each GET URL and POST form gets an isolated worker process. Worker fires payloads through a real Playwright browser and detects execution via:
+Each GET URL, POST form, and DOM XSS runtime target gets an isolated worker process. Worker fires payloads through a real Playwright browser and detects execution via:
 - `dialog` — `alert()` / `confirm()` / `prompt()` triggered
 - `console` — `console.log()` / `console.error()` fired
 - `network` — outbound request to internal beacon hostname
@@ -132,7 +194,7 @@ and confidence. Retrieval scores candidates by:
 - sink/context type match
 - surviving character overlap
 - WAF match
-- delivery mode (`get`, `post`)
+- delivery mode (`get`, `post`, `dom`)
 - framework hints
 - auth context
 
@@ -172,6 +234,9 @@ axss -u "https://target.com" --active --reflected
 
 # Scan only POST forms / stored XSS
 axss -u "https://target.com" --active --stored
+
+# Scan only DOM XSS
+axss -u "https://target.com" --active --dom
 
 # Skip crawl — test only the provided URL
 axss -u "https://target.com/search?q=test" --active --no-crawl
@@ -273,7 +338,7 @@ axss --help
 | `--active` | off | Fire payloads in Playwright and confirm execution |
 | `--reflected` | off | Test reflected XSS only (GET params); implies `--active` |
 | `--stored` | off | Test stored/POST XSS only; implies `--active` |
-| `--dom` | off | DOM XSS analysis (coming soon) |
+| `--dom` | off | Test DOM-based XSS via runtime source→sink analysis and browser confirmation; implies `--active` |
 | `--generate` | off | Generate AI-ranked payloads without browser execution |
 | `--no-crawl` | off | Skip crawling — test only the provided URL |
 | `--browser-crawl` | off | Use Playwright browser for crawling (required for SPAs) |
@@ -523,7 +588,7 @@ python xssy/learn.py
 
 ## Known limitations
 
-- **DOM XSS (fragment/hash):** Client-side sinks driven by `location.hash` without a server round-trip are not yet covered.
+- **DOM XSS source coverage:** Runtime DOM scanning currently injects URL query parameters and `location.hash`. Other client-side sources such as `postMessage`, `window.name`, and storage-backed flows are not yet covered.
 - **Blind XSS:** No callback server. `--sink-url` covers self-visible stored XSS; payloads rendered only in admin panels or other users' sessions require out-of-band confirmation (planned).
 - **Stored XSS scope:** The post-injection sweep covers all pages visited during the crawl. Payloads stored and rendered outside the crawl boundary require `--sink-url`.
 - **SPA crawl coverage:** `--browser-crawl` discovers routes visible after initial load and user-triggered navigation. Deep lazy-loaded routes may require higher `--depth`.

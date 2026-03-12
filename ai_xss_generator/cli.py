@@ -312,8 +312,9 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
         "--dom",
         action="store_true",
         help=(
-            "--dom  Test for DOM-based XSS (coming soon). Will analyze client-side JS "
-            "for source→sink flows and inject payloads via URL fragments and DOM sources. "
+            "--dom  Test for DOM-based XSS. Analyzes client-side JS for "
+            "source→sink flows and confirms execution/taint in a real browser via "
+            "runtime sink hooking and DOM source payload injection. "
             "Implies active scanning."
         ),
     )
