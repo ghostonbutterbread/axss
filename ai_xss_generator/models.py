@@ -707,7 +707,7 @@ def _generate_with_cli(
     past_lessons: list[Any] | None = None,
 ) -> tuple[list[PayloadCandidate], str]:
     """Generate payloads by calling the CLI backend, with cross-tool failover."""
-    from ai_xss_generator.cli_runner import generate_via_cli_with_tool
+    from ai_xss_generator.cli_runner import _trace_preview, generate_via_cli_with_tool
     prompt = _prompt_for_context(
         context,
         reference_payloads=reference_payloads,
@@ -716,7 +716,18 @@ def _generate_with_cli(
         past_lessons=past_lessons,
     )
     raw, actual_tool = generate_via_cli_with_tool(tool, prompt, cli_model)
-    data = _extract_json_blob(raw)
+    log.debug("CLI backend resolved to %s for %s", actual_tool, context.source)
+    try:
+        data = _extract_json_blob(raw)
+    except Exception as exc:
+        log.debug(
+            "CLI backend (%s) returned non-JSON or malformed JSON for %s: %s\nRaw preview:\n%s",
+            actual_tool,
+            context.source,
+            exc,
+            _trace_preview(raw),
+        )
+        raise
     return _normalize_payloads(data.get("payloads", []), source=f"cli:{actual_tool}"), actual_tool
 
 

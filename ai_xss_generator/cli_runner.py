@@ -15,6 +15,7 @@ output parsing (_extract_json_blob + _normalize_payloads) is shared.
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 import subprocess
 
@@ -23,6 +24,7 @@ log = logging.getLogger(__name__)
 # Per-call timeout in seconds.  Long enough for extended thinking on hard
 # contexts but short enough to not block the scan indefinitely.
 CLI_TIMEOUT = 60
+_TRACE_PREVIEW_CHARS = 4000
 
 _FALLBACK_ERROR_MARKERS = (
     "timed out",
@@ -50,6 +52,16 @@ class CliInvocationError(RuntimeError):
         super().__init__(message)
         self.tool = tool
         self.fallback_recommended = fallback_recommended
+
+
+def _trace_preview(text: str, limit: int = _TRACE_PREVIEW_CHARS) -> str:
+    """Return a terminal-safe preview for -vv tracing."""
+    cleaned = text.replace("\r\n", "\n").replace("\r", "\n")
+    cleaned = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", cleaned)
+    cleaned = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "?", cleaned)
+    if len(cleaned) > limit:
+        return cleaned[:limit] + f"\n... [truncated {len(cleaned) - limit} chars]"
+    return cleaned
 
 
 def is_available(tool: str) -> bool:
@@ -86,6 +98,12 @@ def _run(cmd: list[str], tool: str) -> str:
             "try increasing CLI_TIMEOUT or simplify the prompt",
             fallback_recommended=True,
         )
+    stdout_preview = _trace_preview(result.stdout or "")
+    stderr_preview = _trace_preview(result.stderr or "")
+    if stdout_preview:
+        log.debug("%s CLI stdout preview:\n%s", tool, stdout_preview)
+    if stderr_preview:
+        log.debug("%s CLI stderr preview:\n%s", tool, stderr_preview)
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()[:300]
         raise CliInvocationError(
@@ -108,6 +126,7 @@ def call_claude(prompt: str, model: str | None = None) -> str:
     if model:
         cmd += ["--model", model]
     log.debug("CLI invoke: claude -p <prompt> %s", f"--model {model}" if model else "")
+    log.debug("claude CLI prompt preview:\n%s", _trace_preview(prompt))
     return _run(cmd, "claude")
 
 
@@ -129,6 +148,7 @@ def call_codex(prompt: str, model: str | None = None) -> str:
         )
     cmd = ["codex", "exec", prompt, "--skip-git-repo-check"]
     log.debug("CLI invoke: codex exec <prompt> --skip-git-repo-check")
+    log.debug("codex CLI prompt preview:\n%s", _trace_preview(prompt))
     return _run(cmd, "codex")
 
 

@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import pytest
 
-from ai_xss_generator.cli_runner import CliInvocationError, generate_via_cli_with_tool
+from ai_xss_generator.cli_runner import CliInvocationError, _trace_preview, generate_via_cli_with_tool
 from ai_xss_generator.models import _generate_with_cli, _try_cloud
 from ai_xss_generator.types import ParsedContext
 
@@ -26,6 +26,15 @@ def test_generate_via_cli_falls_back_from_claude_to_codex() -> None:
     assert tool == "codex"
     assert raw == '{"payloads": []}'
     codex.assert_called_once_with("prompt", None)
+
+
+def test_trace_preview_sanitizes_terminal_controls_and_truncates() -> None:
+    preview = _trace_preview("abc\x1b[31mred\x00\n" + ("x" * 5000), limit=12)
+
+    assert "\x1b" not in preview
+    assert "\x00" not in preview
+    assert "?" in preview
+    assert "[truncated" in preview
 
 
 def test_generate_via_cli_falls_back_from_codex_to_claude() -> None:
