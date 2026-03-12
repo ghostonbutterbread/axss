@@ -64,6 +64,7 @@ class ActiveScanConfig:
     ai_backend: str = "api"       # "api" | "cli"
     cli_tool: str = "claude"      # "claude" | "codex" (when ai_backend="cli")
     cli_model: str | None = None  # model passed to CLI (None = CLI default)
+    cloud_attempts: int = 1       # recursive cloud reasoning rounds per context
 
 
 def _auto_workers(rate: float, explicit_workers: int) -> int:
@@ -268,6 +269,7 @@ def run_active_scan(
                 config.timeout_seconds,
                 config.use_cloud,
                 config.ai_backend,
+                config.cloud_attempts,
             )
             if proc.is_alive() and elapsed > worker_budget:
                 warn(f"[worker] timeout after {worker_budget}s → {plabel}")
@@ -333,6 +335,7 @@ def run_active_scan(
                     "ai_backend": config.ai_backend,
                     "cli_tool": config.cli_tool,
                     "cli_model": config.cli_model,
+                    "cloud_attempts": config.cloud_attempts,
                 }
                 while len(active_procs) < n_workers:
                     try:
@@ -428,6 +431,7 @@ def run_active_scan(
             config.timeout_seconds,
             config.use_cloud,
             config.ai_backend,
+            config.cloud_attempts,
         ) + 5
         for proc, _, _, _, _ in active_procs:
             proc.join(timeout=final_join_timeout)

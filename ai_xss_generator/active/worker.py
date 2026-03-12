@@ -38,6 +38,7 @@ def active_worker_timeout_budget(
     timeout_seconds: int,
     use_cloud: bool,
     ai_backend: str = "api",
+    cloud_attempts: int = 1,
 ) -> int:
     """Return the effective per-worker budget for staged local+cloud execution."""
     minimum = _ACTIVE_LOCAL_MODEL_TIMEOUT_SECONDS
@@ -47,7 +48,7 @@ def active_worker_timeout_budget(
             # CLI cloud failover may spend one timeout on the primary tool and
             # a second timeout on the alternate tool before falling back.
             cloud_grace *= 2
-        minimum += cloud_grace
+        minimum += max(1, cloud_attempts) * cloud_grace
     return max(timeout_seconds, minimum)
 
 
@@ -129,6 +130,107 @@ class WorkerResult:
     kind: str = "get"       # "get" | "post"
 
 
+def _join_lessons(*lesson_groups: list[Any] | None) -> list[Any] | None:
+    merged: list[Any] = []
+    for group in lesson_groups:
+        if group:
+            merged.extend(group)
+    return merged or None
+
+
+def _preview_payloads(payloads: list[str], limit: int = 4) -> str:
+    if not payloads:
+        return "none"
+    preview = ", ".join(repr(payload) for payload in payloads[:limit])
+    remaining = len(payloads) - min(len(payloads), limit)
+    if remaining > 0:
+        preview += f", +{remaining} more"
+    return preview
+
+
+def _summarize_failed_execution_results(results: list[Any]) -> str:
+    if not results:
+        return "No dialog, console, or network execution signal fired."
+
+    errors: list[str] = []
+    for result in results:
+        error = str(getattr(result, "error", "") or "").strip()
+        if error and error not in errors:
+            errors.append(error)
+    if errors:
+        preview = "; ".join(errors[:2])
+        if len(errors) > 2:
+            preview += f"; +{len(errors) - 2} more"
+        return f"Observed execution errors: {preview}."
+    return "No dialog, console, or network execution signal fired."
+
+
+def _unique_new_payloads(payloads: list[str], seen: set[str]) -> tuple[list[str], list[str]]:
+    fresh: list[str] = []
+    duplicates: list[str] = []
+    for payload in payloads:
+        if not payload:
+            continue
+        if payload in seen:
+            duplicates.append(payload)
+            continue
+        seen.add(payload)
+        fresh.append(payload)
+    return fresh, duplicates
+
+
+def _cloud_attempt_note(base_note: str, attempt_number: int, total_attempts: int) -> str:
+    parts = [base_note.strip()] if base_note.strip() else []
+    if total_attempts > 1:
+        parts.append(f"Cloud attempt {attempt_number}/{total_attempts}.")
+    return " ".join(parts)
+
+
+def _build_cloud_feedback_lessons(
+    *,
+    attempt_number: int,
+    total_attempts: int,
+    prompt_context: Any,
+    delivery_mode: str,
+    context_type: str,
+    sink_context: str,
+    payloads_tried: list[str],
+    duplicate_payloads: list[str] | None = None,
+    observation: str = "",
+) -> list[Any]:
+    from ai_xss_generator.lessons import Lesson
+
+    summary_parts = [
+        f"Cloud attempt {attempt_number}/{total_attempts} for {delivery_mode or 'active'} "
+        f"{context_type or sink_context or 'xss'} did not confirm execution."
+    ]
+    if payloads_tried:
+        summary_parts.append(f"Payloads already tried: {_preview_payloads(payloads_tried)}.")
+    else:
+        summary_parts.append("The previous cloud response produced no fresh payloads.")
+    if duplicate_payloads:
+        summary_parts.append(f"Repeated payloads to avoid: {_preview_payloads(duplicate_payloads)}.")
+    if observation:
+        summary_parts.append(observation.strip())
+    summary_parts.append("Return a materially different next batch and avoid near-duplicates.")
+
+    return [
+        Lesson(
+            lesson_type="execution_feedback",
+            title=f"Cloud attempt {attempt_number} feedback",
+            summary=" ".join(summary_parts),
+            sink_type=sink_context,
+            context_type=context_type,
+            source_pattern=f"{delivery_mode}:cloud_feedback",
+            waf_name="",
+            delivery_mode=delivery_mode,
+            frameworks=[str(item).lower() for item in getattr(prompt_context, "frameworks", [])[:3]],
+            auth_required=bool(getattr(prompt_context, "auth_notes", [])),
+            confidence=0.83,
+        )
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Deduplication key — includes endpoint + param so different endpoints/params
 # are always treated as new targets even when WAF + filter profile match.
@@ -182,6 +284,7 @@ def run_worker(
     ai_backend: str = "api",
     cli_tool: str = "claude",
     cli_model: str | None = None,
+    cloud_attempts: int = 1,
 ) -> None:
     """Target function for multiprocessing.Process.
 
@@ -215,6 +318,7 @@ def run_worker(
             ai_backend=ai_backend,
             cli_tool=cli_tool,
             cli_model=cli_model,
+            cloud_attempts=cloud_attempts,
         )
     except Exception as exc:
         log.exception("Worker crashed for %s", url)
@@ -241,8 +345,14 @@ def _run(
     ai_backend: str = "api",
     cli_tool: str = "claude",
     cli_model: str | None = None,
+    cloud_attempts: int = 1,
 ) -> None:
-    deadline = start_time + active_worker_timeout_budget(timeout_seconds, use_cloud, ai_backend)
+    deadline = start_time + active_worker_timeout_budget(
+        timeout_seconds,
+        use_cloud,
+        ai_backend,
+        cloud_attempts=cloud_attempts,
+    )
     local_model_timeout_seconds = _ACTIVE_LOCAL_MODEL_TIMEOUT_SECONDS
 
     def _timed_out() -> bool:
@@ -442,55 +552,84 @@ def _run(
                         surviving_chars=surviving_chars,
                         context_type=context_type,
                     )
+                    cloud_feedback_lessons: list[Any] | None = None
+                    seen_cloud_payloads: set[str] = set()
 
-                    cloud_plan = _coerce_cloud_plan(_get_cloud_payloads(
-                        url=url,
-                        probe_result=context_probe_result,
-                        cloud_model=cloud_model,
-                        waf=waf_hint,
-                        ekey=ekey,
-                        dedup_registry=dedup_registry,
-                        dedup_lock=dedup_lock,
-                        base_context=_cached_context,
-                        auth_headers=auth_headers,
-                        ai_backend=ai_backend,
-                        cli_tool=cli_tool,
-                        cli_model=cli_model,
-                        delivery_mode="get",
-                        session_lessons=session_lessons,
-                    ))
-                    cloud_payloads = cloud_plan.payloads
-
-                    if cloud_payloads:
-                        cloud_escalated = True
-
-                    for cp in cloud_payloads:
+                    for attempt_number in range(1, max(1, cloud_attempts) + 1):
                         if _timed_out():
                             break
-                        total_transforms_tried += 1
-                        result = executor.fire(
+
+                        cloud_escalated = True
+                        cloud_plan = _coerce_cloud_plan(_get_cloud_payloads(
                             url=url,
-                            param_name=param_name,
-                            payload=cp,
-                            all_params=flat_params,
-                            transform_name="cloud_model",
-                            sink_url=sink_url,
+                            probe_result=context_probe_result,
+                            cloud_model=cloud_model,
+                            waf=waf_hint,
+                            ekey=ekey,
+                            dedup_registry=dedup_registry,
+                            dedup_lock=dedup_lock,
+                            base_context=_cached_context,
+                            auth_headers=auth_headers,
+                            ai_backend=ai_backend,
+                            cli_tool=cli_tool,
+                            cli_model=cli_model,
+                            delivery_mode="get",
+                            session_lessons=session_lessons,
+                            feedback_lessons=cloud_feedback_lessons,
+                        ))
+                        cloud_payloads, duplicate_payloads = _unique_new_payloads(
+                            cloud_plan.payloads,
+                            seen_cloud_payloads,
                         )
-                        if result.confirmed:
-                            finding = _make_finding(
+
+                        failed_results: list[Any] = []
+                        for cp in cloud_payloads:
+                            if _timed_out():
+                                break
+                            total_transforms_tried += 1
+                            result = executor.fire(
                                 url=url,
-                                probe_result=context_probe_result,
-                                context_type=context_type,
-                                result=result,
-                                waf=waf_hint,
-                                source="cloud_model",
-                                cloud_escalated=True,
-                                ai_engine=cloud_plan.engine,
-                                ai_note=cloud_plan.note,
+                                param_name=param_name,
+                                payload=cp,
+                                all_params=flat_params,
+                                transform_name="cloud_model",
+                                sink_url=sink_url,
                             )
-                            confirmed_findings.append(finding)
-                            context_confirmed = True
+                            if result.confirmed:
+                                finding = _make_finding(
+                                    url=url,
+                                    probe_result=context_probe_result,
+                                    context_type=context_type,
+                                    result=result,
+                                    waf=waf_hint,
+                                    source="cloud_model",
+                                    cloud_escalated=True,
+                                    ai_engine=cloud_plan.engine,
+                                    ai_note=_cloud_attempt_note(
+                                        cloud_plan.note,
+                                        attempt_number,
+                                        max(1, cloud_attempts),
+                                    ),
+                                )
+                                confirmed_findings.append(finding)
+                                context_confirmed = True
+                                break
+                            failed_results.append(result)
+
+                        if context_confirmed or attempt_number >= max(1, cloud_attempts):
                             break
+
+                        cloud_feedback_lessons = _build_cloud_feedback_lessons(
+                            attempt_number=attempt_number,
+                            total_attempts=max(1, cloud_attempts),
+                            prompt_context=_cached_context,
+                            delivery_mode="get",
+                            context_type=context_type,
+                            sink_context=context_type,
+                            payloads_tried=cloud_payloads,
+                            duplicate_payloads=duplicate_payloads,
+                            observation=_summarize_failed_execution_results(failed_results),
+                        )
 
                 # Deterministic transforms are now a fallback stage instead of
                 # the primary search strategy.
@@ -799,17 +938,20 @@ def _get_dom_cloud_payloads(
     cli_tool: str = "claude",
     cli_model: str | None = None,
     session_lessons: list[Any] | None = None,
+    feedback_lessons: list[Any] | None = None,
 ) -> CloudPayloadPlan:
     """Call the cloud model once per unique DOM source → sink fingerprint."""
-    with dedup_lock:
-        if ekey in dedup_registry:
-            log.debug("DOM dedup hit — reusing cloud result for key %s", ekey[:12])
-            cached = dict(dedup_registry[ekey])
-            return CloudPayloadPlan(
-                payloads=list(cached.get("payloads", [])),
-                engine=str(cached.get("engine", "")),
-                note=str(cached.get("note", "")),
-            )
+    use_dedup = not feedback_lessons
+    if use_dedup:
+        with dedup_lock:
+            if ekey in dedup_registry:
+                log.debug("DOM dedup hit — reusing cloud result for key %s", ekey[:12])
+                cached = dict(dedup_registry[ekey])
+                return CloudPayloadPlan(
+                    payloads=list(cached.get("payloads", [])),
+                    engine=str(cached.get("engine", "")),
+                    note=str(cached.get("note", "")),
+                )
 
     try:
         from ai_xss_generator.models import generate_cloud_payloads
@@ -824,7 +966,7 @@ def _get_dom_cloud_payloads(
             context=context,
             cloud_model=cloud_model,
             waf=waf,
-            past_lessons=session_lessons,
+            past_lessons=_join_lessons(session_lessons, feedback_lessons),
             ai_backend=ai_backend,
             cli_tool=cli_tool,
             cli_model=cli_model,
@@ -843,12 +985,13 @@ def _get_dom_cloud_payloads(
         log.debug("DOM cloud model failed for %s: %s", getattr(context, "source", "?"), exc)
         result_plan = CloudPayloadPlan()
 
-    with dedup_lock:
-        dedup_registry[ekey] = {
-            "payloads": list(result_plan.payloads),
-            "engine": result_plan.engine,
-            "note": result_plan.note,
-        }
+    if use_dedup:
+        with dedup_lock:
+            dedup_registry[ekey] = {
+                "payloads": list(result_plan.payloads),
+                "engine": result_plan.engine,
+                "note": result_plan.note,
+            }
     return result_plan
 
 
@@ -870,6 +1013,7 @@ def run_dom_worker(
     ai_backend: str = "api",
     cli_tool: str = "claude",
     cli_model: str | None = None,
+    cloud_attempts: int = 1,
 ) -> None:
     """Worker entry point for DOM XSS runtime scanning.
 
@@ -898,6 +1042,7 @@ def run_dom_worker(
             ai_backend=ai_backend,
             cli_tool=cli_tool,
             cli_model=cli_model,
+            cloud_attempts=cloud_attempts,
         )
     except Exception as exc:
         log.exception("DOM worker crashed for %s", url)
@@ -919,6 +1064,7 @@ def _run_dom(
     ai_backend: str = "api",
     cli_tool: str = "claude",
     cli_model: str | None = None,
+    cloud_attempts: int = 1,
 ) -> None:
     from playwright.sync_api import sync_playwright
     from ai_xss_generator.active.dom_xss import (
@@ -929,7 +1075,12 @@ def _run_dom(
     from ai_xss_generator.parser import parse_target as _parse_target
 
     started_at = time.monotonic()
-    deadline = started_at + active_worker_timeout_budget(timeout_seconds, use_cloud, ai_backend)
+    deadline = started_at + active_worker_timeout_budget(
+        timeout_seconds,
+        use_cloud,
+        ai_backend,
+        cloud_attempts=cloud_attempts,
+    )
 
     def _timed_out() -> bool:
         return time.monotonic() > deadline
@@ -1026,9 +1177,12 @@ def _run_dom(
                 local_payloads: list[str] = []
                 local_payloads_tried = False
                 cloud_stage = None
-                cloud_done = False
+                cloud_rounds_started = 0
+                cloud_rounds_exhausted = False
                 cloud_plan = CloudPayloadPlan()
                 cloud_payloads: list[str] = []
+                cloud_feedback_lessons: list[Any] | None = None
+                seen_cloud_payloads: set[str] = set()
                 cloud_delay_deadline = time.monotonic() + _DOM_CLOUD_START_AFTER_SECONDS
                 cloud_ekey = _escalation_key(
                     url=url,
@@ -1069,7 +1223,11 @@ def _run_dom(
                         cloud_used_for_hit = True
                         cloud_escalated = True
                         ai_engine = cloud_plan.engine
-                        ai_note = cloud_plan.note
+                        ai_note = _cloud_attempt_note(
+                            cloud_plan.note,
+                            cloud_rounds_started,
+                            max(1, cloud_attempts),
+                        )
                     if exec_ok:
                         confirmed = True
                         fired_payload = exec_payload
@@ -1089,11 +1247,13 @@ def _run_dom(
                             if _try_dom_payloads(local_payloads, "local_model"):
                                 break
 
-                    if use_cloud and cloud_stage is None:
+                    if use_cloud and cloud_stage is None and not cloud_rounds_exhausted:
                         should_start_cloud = (
                             local_done
                         ) or (not local_done and time.monotonic() >= cloud_delay_deadline)
                         if should_start_cloud:
+                            cloud_rounds_started += 1
+                            cloud_escalated = True
                             cloud_stage = _start_async_payload_stage(lambda: _get_dom_cloud_payloads(
                                 context=dom_context,
                                 cloud_model=cloud_model,
@@ -1105,20 +1265,39 @@ def _run_dom(
                                 cli_tool=cli_tool,
                                 cli_model=cli_model,
                                 session_lessons=dom_session_lessons,
+                                feedback_lessons=cloud_feedback_lessons,
                             ))
 
-                    if cloud_stage is not None and not cloud_done:
+                    if cloud_stage is not None:
                         cloud_ready, plan = _poll_async_payloads(cloud_stage[1])
                         if cloud_ready:
-                            cloud_done = True
+                            cloud_stage = None
                             cloud_plan = _coerce_cloud_plan(plan)
-                            cloud_payloads = cloud_plan.payloads
+                            cloud_payloads, duplicate_payloads = _unique_new_payloads(
+                                cloud_plan.payloads,
+                                seen_cloud_payloads,
+                            )
                             if _try_dom_payloads(cloud_payloads, "cloud_model"):
                                 break
+                            if cloud_rounds_started >= max(1, cloud_attempts):
+                                cloud_rounds_exhausted = True
+                            else:
+                                cloud_feedback_lessons = _build_cloud_feedback_lessons(
+                                    attempt_number=cloud_rounds_started,
+                                    total_attempts=max(1, cloud_attempts),
+                                    prompt_context=dom_context,
+                                    delivery_mode="dom",
+                                    context_type="dom_xss",
+                                    sink_context=hit.sink,
+                                    payloads_tried=cloud_payloads,
+                                    duplicate_payloads=duplicate_payloads,
+                                    observation="DOM sink stayed taint-only; no execution signal fired.",
+                                )
+                                cloud_delay_deadline = time.monotonic()
 
-                    if local_done and cloud_done:
+                    if local_done and (not use_cloud or cloud_rounds_exhausted) and cloud_stage is None:
                         break
-                    if local_done and local_payloads_tried and (not use_cloud or cloud_done):
+                    if local_done and local_payloads_tried and (not use_cloud or (cloud_rounds_exhausted and cloud_stage is None)):
                         break
                     if local_done and not local_payloads and not use_cloud:
                         break
@@ -1143,7 +1322,11 @@ def _run_dom(
                         detail = exec_detail
                         source = "phase1_transform"
                         transform_name = "dom_static_fallback"
-                        ai_note = cloud_plan.note
+                        ai_note = _cloud_attempt_note(
+                            cloud_plan.note,
+                            cloud_rounds_started,
+                            max(1, cloud_attempts),
+                        ) if cloud_rounds_started else cloud_plan.note
 
                 findings.append(
                     ConfirmedFinding(
@@ -1205,21 +1388,24 @@ def _get_cloud_payloads(
     cli_model: str | None = None,
     delivery_mode: str = "get",
     session_lessons: list[Any] | None = None,
+    feedback_lessons: list[Any] | None = None,
 ) -> CloudPayloadPlan:
     """Check dedup registry; call cloud model if this is a novel fingerprint.
 
     *base_context* is a pre-parsed ParsedContext for *url*. When provided it
     avoids a redundant HTTP fetch.
     """
-    with dedup_lock:
-        if ekey in dedup_registry:
-            log.debug("Dedup hit — reusing cloud result for key %s", ekey[:12])
-            cached = dict(dedup_registry[ekey])
-            return CloudPayloadPlan(
-                payloads=list(cached.get("payloads", [])),
-                engine=str(cached.get("engine", "")),
-                note=str(cached.get("note", "")),
-            )
+    use_dedup = not feedback_lessons
+    if use_dedup:
+        with dedup_lock:
+            if ekey in dedup_registry:
+                log.debug("Dedup hit — reusing cloud result for key %s", ekey[:12])
+                cached = dict(dedup_registry[ekey])
+                return CloudPayloadPlan(
+                    payloads=list(cached.get("payloads", [])),
+                    engine=str(cached.get("engine", "")),
+                    note=str(cached.get("note", "")),
+                )
 
     try:
         from ai_xss_generator.probe import enrich_context
@@ -1240,7 +1426,7 @@ def _get_cloud_payloads(
             context=context,
             cloud_model=cloud_model,
             waf=waf,
-            past_lessons=session_lessons,
+            past_lessons=_join_lessons(session_lessons, feedback_lessons),
             ai_backend=ai_backend,
             cli_tool=cli_tool,
             cli_model=cli_model,
@@ -1259,12 +1445,13 @@ def _get_cloud_payloads(
         log.debug("Cloud escalation failed for %s: %s", url, exc)
         result_plan = CloudPayloadPlan()
 
-    with dedup_lock:
-        dedup_registry[ekey] = {
-            "payloads": list(result_plan.payloads),
-            "engine": result_plan.engine,
-            "note": result_plan.note,
-        }
+    if use_dedup:
+        with dedup_lock:
+            dedup_registry[ekey] = {
+                "payloads": list(result_plan.payloads),
+                "engine": result_plan.engine,
+                "note": result_plan.note,
+            }
 
     return result_plan
 
@@ -1291,6 +1478,7 @@ def run_post_worker(
     ai_backend: str = "api",
     cli_tool: str = "claude",
     cli_model: str | None = None,
+    cloud_attempts: int = 1,
 ) -> None:
     """Worker entry point for POST form targets. Mirrors run_worker() for GET URLs."""
     start_time = time.monotonic()
@@ -1319,6 +1507,7 @@ def run_post_worker(
             ai_backend=ai_backend,
             cli_tool=cli_tool,
             cli_model=cli_model,
+            cloud_attempts=cloud_attempts,
         )
     except Exception as exc:
         log.exception("POST worker crashed for %s", post_form.action_url)
@@ -1347,13 +1536,19 @@ def _run_post(
     ai_backend: str = "api",
     cli_tool: str = "claude",
     cli_model: str | None = None,
+    cloud_attempts: int = 1,
 ) -> None:
     from ai_xss_generator.probe import probe_post_form
     from ai_xss_generator.active.executor import ActiveExecutor
     from ai_xss_generator.active.transforms import all_variants_for_probe
     from ai_xss_generator.parser import parse_target as _parse_target
 
-    deadline = start_time + active_worker_timeout_budget(timeout_seconds, use_cloud, ai_backend)
+    deadline = start_time + active_worker_timeout_budget(
+        timeout_seconds,
+        use_cloud,
+        ai_backend,
+        cloud_attempts=cloud_attempts,
+    )
     local_model_timeout_seconds = _ACTIVE_LOCAL_MODEL_TIMEOUT_SECONDS
 
     def _timed_out() -> bool:
@@ -1520,55 +1715,86 @@ def _run_post(
                         surviving_chars=surviving_chars,
                         context_type=context_type,
                     )
-                    cloud_plan = _coerce_cloud_plan(_get_cloud_payloads(
-                        url=post_form.source_page_url,
-                        probe_result=context_probe_result,
-                        cloud_model=cloud_model,
-                        waf=waf_hint,
-                        ekey=ekey,
-                        dedup_registry=dedup_registry,
-                        dedup_lock=dedup_lock,
-                        base_context=_cached_context,
-                        auth_headers=auth_headers,
-                        ai_backend=ai_backend,
-                        cli_tool=cli_tool,
-                        cli_model=cli_model,
-                        delivery_mode="post",
-                        session_lessons=post_session_lessons,
-                    ))
-                    cloud_payloads = cloud_plan.payloads
-                    if cloud_payloads:
-                        cloud_escalated = True
+                    cloud_feedback_lessons: list[Any] | None = None
+                    seen_cloud_payloads: set[str] = set()
 
-                    for cp in cloud_payloads:
+                    for attempt_number in range(1, max(1, cloud_attempts) + 1):
                         if _timed_out():
                             break
-                        total_transforms_tried += 1
-                        result = executor.fire_post(
-                            source_page_url=post_form.source_page_url,
-                            action_url=post_form.action_url,
-                            param_name=param_name,
-                            payload=cp,
-                            all_param_names=post_form.param_names,
-                            csrf_field=post_form.csrf_field,
-                            transform_name="cloud_model",
-                            sink_url=sink_url,
+
+                        cloud_escalated = True
+                        cloud_plan = _coerce_cloud_plan(_get_cloud_payloads(
+                            url=post_form.source_page_url,
+                            probe_result=context_probe_result,
+                            cloud_model=cloud_model,
+                            waf=waf_hint,
+                            ekey=ekey,
+                            dedup_registry=dedup_registry,
+                            dedup_lock=dedup_lock,
+                            base_context=_cached_context,
+                            auth_headers=auth_headers,
+                            ai_backend=ai_backend,
+                            cli_tool=cli_tool,
+                            cli_model=cli_model,
+                            delivery_mode="post",
+                            session_lessons=post_session_lessons,
+                            feedback_lessons=cloud_feedback_lessons,
+                        ))
+                        cloud_payloads, duplicate_payloads = _unique_new_payloads(
+                            cloud_plan.payloads,
+                            seen_cloud_payloads,
                         )
-                        if result.confirmed:
-                            finding = _make_finding(
-                                url=post_form.action_url,
-                                probe_result=context_probe_result,
-                                context_type=context_type,
-                                result=result,
-                                waf=waf_hint,
-                                source="cloud_model",
-                                cloud_escalated=True,
-                                ai_engine=cloud_plan.engine,
-                                ai_note=cloud_plan.note,
+
+                        failed_results: list[Any] = []
+                        for cp in cloud_payloads:
+                            if _timed_out():
+                                break
+                            total_transforms_tried += 1
+                            result = executor.fire_post(
+                                source_page_url=post_form.source_page_url,
+                                action_url=post_form.action_url,
+                                param_name=param_name,
+                                payload=cp,
+                                all_param_names=post_form.param_names,
+                                csrf_field=post_form.csrf_field,
+                                transform_name="cloud_model",
+                                sink_url=sink_url,
                             )
-                            confirmed_findings.append(finding)
-                            context_confirmed = True
+                            if result.confirmed:
+                                finding = _make_finding(
+                                    url=post_form.action_url,
+                                    probe_result=context_probe_result,
+                                    context_type=context_type,
+                                    result=result,
+                                    waf=waf_hint,
+                                    source="cloud_model",
+                                    cloud_escalated=True,
+                                    ai_engine=cloud_plan.engine,
+                                    ai_note=_cloud_attempt_note(
+                                        cloud_plan.note,
+                                        attempt_number,
+                                        max(1, cloud_attempts),
+                                    ),
+                                )
+                                confirmed_findings.append(finding)
+                                context_confirmed = True
+                                break
+                            failed_results.append(result)
+
+                        if context_confirmed or attempt_number >= max(1, cloud_attempts):
                             break
+
+                        cloud_feedback_lessons = _build_cloud_feedback_lessons(
+                            attempt_number=attempt_number,
+                            total_attempts=max(1, cloud_attempts),
+                            prompt_context=_cached_context,
+                            delivery_mode="post",
+                            context_type=context_type,
+                            sink_context=context_type,
+                            payloads_tried=cloud_payloads,
+                            duplicate_payloads=duplicate_payloads,
+                            observation=_summarize_failed_execution_results(failed_results),
+                        )
 
                 if not context_confirmed and not _timed_out():
                     for variant in variants:

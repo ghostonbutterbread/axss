@@ -401,6 +401,18 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--attempts",
+        metavar="N",
+        type=int,
+        default=1,
+        help=(
+            "--attempts N  Cloud reasoning rounds per reflection/source->sink context "
+            "(default: 1). After each cloud round, axss tests the returned payloads "
+            "and feeds the execution outcome into the next cloud prompt before "
+            "falling back to deterministic transforms."
+        ),
+    )
+    parser.add_argument(
         "--no-crawl",
         action="store_true",
         default=False,
@@ -985,6 +997,7 @@ def _run_active_scan(
         ai_backend=ai_backend,
         cli_tool=cli_tool,
         cli_model=cli_model,
+        cloud_attempts=getattr(args, "attempts", 1),
     )
 
     results = run_active_scan(
@@ -996,7 +1009,8 @@ def _run_active_scan(
 
     config_summary = (
         f"rate={args.rate:g} req/s | workers={scan_config.workers} | "
-        f"model={scan_config.model} | waf={waf or 'none'}"
+        f"model={scan_config.model} | waf={waf or 'none'} | "
+        f"cloud_attempts={scan_config.cloud_attempts}"
     )
     report_path = write_report(results, config_summary=config_summary)
     success(f"Report written to: {report_path}")
@@ -1085,6 +1099,8 @@ def main(argv: list[str] | None = None) -> int:
     config = load_config()
     parser = build_parser(config.default_model)
     args = parser.parse_args(argv)
+    if getattr(args, "attempts", 1) < 1:
+        parser.error("--attempts must be >= 1")
 
     verbose_level: int = getattr(args, "verbose", 0) or 0
 

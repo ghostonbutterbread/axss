@@ -20,6 +20,7 @@ class CliHelpTest(unittest.TestCase):
         self.assertIn("-j PATH, --json-out PATH", help_text)
         self.assertIn("-v, --verbose", help_text)
         self.assertIn("--merge-batch", help_text)
+        self.assertIn("--attempts N", help_text)
         self.assertIn("--memory-list", help_text)
         self.assertIn("--memory-stats", help_text)
         self.assertIn("--memory-export", help_text)

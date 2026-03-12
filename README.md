@@ -34,6 +34,7 @@ Active scan flow (GET + POST + DOM)
   - DOM: per tainted source -> sink path
   - local model first
   - cloud model if local is weak or misses
+  - optional recursive cloud rounds (`--attempts N`) with execution feedback
          |
          v
   execute payloads in Playwright
@@ -166,6 +167,7 @@ Two execution modes matter here:
    - Ask the local model per execution context
    - GET / POST isolate one reflection context per model call; DOM isolates one tainted source -> sink path per model call
    - Escalate to cloud only if the local model misses or produces weak output
+   - If `--attempts N` is greater than `1`, each cloud round tests its payload batch and feeds the failure outcome into the next cloud prompt
    - If model-driven payloads do not confirm execution, fall back to deterministic context-aware transforms
 
 2. **Payload generation only (`--generate`)**
@@ -346,6 +348,7 @@ axss --help
 | `--sink-url URL` | — | Check this page after each injection for stored XSS reflection |
 | `--workers N` | 1 | Parallel active-scan worker processes |
 | `--timeout N` | 300 | Per-URL worker timeout in seconds |
+| `--attempts N` | 1 | Cloud reasoning rounds per execution context before deterministic fallback |
 | `--waf NAME` | auto | Set WAF context (auto-detected if omitted) |
 | `--header 'Name: Value'` | — | Add a request header (repeatable) |
 | `--cookies FILE` | — | Load session cookies from Netscape cookies.txt |
