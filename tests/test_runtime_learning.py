@@ -4,7 +4,11 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from ai_xss_generator.active.worker import _get_dom_local_payloads, _get_local_payloads
-from ai_xss_generator.models import _cloud_prompt_for_context, _compact_dom_prompt_for_local
+from ai_xss_generator.models import (
+    _cloud_prompt_for_context,
+    _compact_dom_prompt_for_local,
+    _document_write_subcontext,
+)
 from ai_xss_generator.probe import ProbeResult, ReflectionContext
 from ai_xss_generator.types import FormContext, FormField, ParsedContext
 from xssy.learn import _runtime_learning_context
@@ -107,10 +111,33 @@ def test_cloud_prompt_keeps_rich_shape_for_document_write_dom_sinks():
 
     prompt = _cloud_prompt_for_context(context)
 
-    assert "Produce 15-25 payloads." in prompt
-    assert "Full parsed context:" in prompt
-    assert "DOM SINK PROFILE:" in prompt
-    assert "profile: document_write" in prompt
+    assert "Produce 6-10 payloads only." in prompt
+    assert "Document.write subcontext:" in prompt
+    assert "same-tag attribute pivots" in prompt
+    assert "Targeted examples:" in prompt
+
+
+def test_document_write_subcontext_infers_iframe_src_attribute_shape():
+    context = ParsedContext(
+        source="https://example.test/#x",
+        source_type="url",
+        notes=[
+            '[dom:TAINT] {"code_location": "bundle.js:42", "sink": "document.write", "source_name": "hash", "source_type": "fragment"}'
+        ],
+        inline_scripts=[
+            "document.write(\"<iframe src='https://example.test/logging.html?\"+window.location.hash+\"' width='950'></iframe>\")"
+        ],
+    )
+
+    subcontext = _document_write_subcontext(context)
+
+    assert subcontext["html_subcontext"] == "single_quoted_html_attr"
+    assert subcontext["tag"] == "iframe"
+    assert subcontext["attribute"] == "src"
+    assert subcontext["payload_shape"] == "same_tag_attribute_breakout"
+    assert "Fragment payloads often arrive URL-encoded" in subcontext["source_behavior"]
+
+
 
 
 def test_xssy_learning_prefers_probe_enriched_runtime_context():

