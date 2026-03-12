@@ -214,13 +214,7 @@ init_axss_dir() {
   mkdir -p "$CONFIG_DIR"
   chmod 700 "$CONFIG_DIR"
 
-  # 2. Findings store directory
-  mkdir -p "$CONFIG_DIR/findings"
-
-  # 2b. Lesson store directory
-  mkdir -p "$CONFIG_DIR/lessons"
-
-  # 3. config.json — create with defaults on first run; on subsequent runs only
+  # 2. config.json — create with defaults on first run; on subsequent runs only
   #    update default_model + detected CLI backend so user edits to other fields
   #    (use_cloud, cloud_model, cli_model, etc.) are preserved.
   "$PYTHON" - "$CONFIG_PATH" "$SELECTED_MODEL" "$DETECTED_CLI_BACKEND" "$DETECTED_CLI_TOOL" <<'PYEOF'

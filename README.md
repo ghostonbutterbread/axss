@@ -12,9 +12,13 @@
 
 - The knowledge store is a single curated tier in SQLite at `~/.axss/knowledge.db`.
 - All findings are globally scoped — no per-host partitioning.
-- `xssy/learn.py` generates candidate payloads against xssy.uk labs, then asks the
+- `xssy/learn.py` generates candidate payloads against xssy.uk labs, then pipes the
+  results through `xssy/curate.py` — the LLM curation pipeline — which asks the
   configured AI backend to extract a structured finding (bypass family, context type,
   filter behaviour, explanation) and saves it to the store.
+- `xssy/curate.py` (`curate_lab_finding()`) is the general curation pipeline and works
+  on any confirmed XSS target — not just xssy.uk. It takes payloads, a lab name,
+  objective string, and URL as plain parameters.
 - Active probe observations (surviving chars, reflection context) are kept as ephemeral
   session lessons passed directly into the generation prompt — nothing is written to disk.
 - Confirmed XSS findings go to the scan report, not the knowledge base.
@@ -244,11 +248,14 @@ axss --memory-list
 # Show finding counts by context type
 axss --memory-stats
 
-# Export knowledge base to a portable JSON file
-axss --memory-export ~/axss-knowledge.json
+# Export knowledge base to a portable YAML file
+axss --memory-export ~/axss-knowledge.yaml
 
-# Import findings from a JSON file (e.g. shared knowledge base)
-axss --memory-import ~/axss-knowledge.json
+# Import findings from a YAML file (e.g. shared knowledge base)
+axss --memory-import ~/axss-knowledge.yaml
+
+# Delete all saved reports
+axss --clear-reports
 
 # Show full flag reference
 axss --help
@@ -297,8 +304,9 @@ axss --help
 | `--check-keys` | — | Validate all configured API keys |
 | `--memory-list` | — | List all curated findings in the knowledge base |
 | `--memory-stats` | — | Show finding counts by context type |
-| `--memory-export PATH` | — | Export all curated findings to a JSON file |
-| `--memory-import PATH` | — | Import curated findings from a JSON file |
+| `--memory-export PATH` | — | Export all curated findings to a YAML file |
+| `--memory-import PATH` | — | Import curated findings from a YAML file |
+| `--clear-reports` | — | Delete all saved reports from `~/.axss/reports/` |
 | `-l, --list-models` | — | List local Ollama models |
 | `-s, --search-models QUERY` | — | Search Ollama model library |
 | `-V, --version` | — | Show version |
@@ -498,14 +506,16 @@ axss --memory-list
 axss --memory-stats
 
 # Share / back up / restore
-axss --memory-export ~/axss-knowledge.json
-axss --memory-import ~/axss-knowledge.json
+axss --memory-export ~/axss-knowledge.yaml
+axss --memory-import ~/axss-knowledge.yaml
 
 # Populate with hand-curated lab knowledge
 python xssy/seed_expert.py
 python xssy/seed_adept.py
+python xssy/seed_master.py
 
 # Extract findings from xssy.uk labs via the curation pipeline
+# (requires xssy.uk access; see xssy_jwt in ~/.axss/keys)
 python xssy/learn.py
 ```
 
