@@ -24,10 +24,50 @@ log = logging.getLogger(__name__)
 # contexts but short enough to not block the scan indefinitely.
 CLI_TIMEOUT = 60
 
+_FALLBACK_ERROR_MARKERS = (
+    "timed out",
+    "timeout",
+    "rate limit",
+    "too many requests",
+    "quota",
+    "usage limit",
+    "usage exhausted",
+    "usage cap",
+    "usage is at 100%",
+    "limit reached",
+    "credit balance",
+    "billing",
+    "overloaded",
+    "capacity",
+    "try again later",
+)
+
+
+class CliInvocationError(RuntimeError):
+    """CLI invocation failure with enough metadata to decide on failover."""
+
+    def __init__(self, tool: str, message: str, *, fallback_recommended: bool = False) -> None:
+        super().__init__(message)
+        self.tool = tool
+        self.fallback_recommended = fallback_recommended
+
 
 def is_available(tool: str) -> bool:
     """Return True if *tool* is on PATH."""
     return shutil.which(tool) is not None
+
+
+def _alternate_tool(tool: str) -> str:
+    if tool == "claude":
+        return "codex"
+    if tool == "codex":
+        return "claude"
+    raise ValueError(f"Unknown CLI tool: {tool!r} — expected 'claude' or 'codex'")
+
+
+def _is_fallback_worthy_error(message: str) -> bool:
+    lowered = message.lower()
+    return any(marker in lowered for marker in _FALLBACK_ERROR_MARKERS)
 
 
 def _run(cmd: list[str], tool: str) -> str:
@@ -40,21 +80,29 @@ def _run(cmd: list[str], tool: str) -> str:
             timeout=CLI_TIMEOUT,
         )
     except subprocess.TimeoutExpired:
-        raise RuntimeError(
+        raise CliInvocationError(
+            tool,
             f"{tool} CLI timed out after {CLI_TIMEOUT}s — "
-            "try increasing CLI_TIMEOUT or simplify the prompt"
+            "try increasing CLI_TIMEOUT or simplify the prompt",
+            fallback_recommended=True,
         )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()[:300]
-        raise RuntimeError(f"{tool} CLI exited {result.returncode}: {detail}")
+        raise CliInvocationError(
+            tool,
+            f"{tool} CLI exited {result.returncode}: {detail}",
+            fallback_recommended=_is_fallback_worthy_error(detail),
+        )
     return result.stdout
 
 
 def call_claude(prompt: str, model: str | None = None) -> str:
     """Run 'claude -p PROMPT [--model MODEL]' and return stdout."""
     if not is_available("claude"):
-        raise RuntimeError(
-            "claude CLI not found — install Claude Code: https://claude.ai/code"
+        raise CliInvocationError(
+            "claude",
+            "claude CLI not found — install Claude Code: https://claude.ai/code",
+            fallback_recommended=True,
         )
     cmd = ["claude", "-p", prompt]
     if model:
@@ -70,8 +118,10 @@ def call_codex(prompt: str, model: str | None = None) -> str:
     *model* argument is accepted but silently ignored.
     """
     if not is_available("codex"):
-        raise RuntimeError(
-            "codex CLI not found — install from: https://github.com/openai/codex"
+        raise CliInvocationError(
+            "codex",
+            "codex CLI not found — install from: https://github.com/openai/codex",
+            fallback_recommended=True,
         )
     if model:
         log.warning(
@@ -80,6 +130,37 @@ def call_codex(prompt: str, model: str | None = None) -> str:
     cmd = ["codex", "exec", prompt, "--skip-git-repo-check"]
     log.debug("CLI invoke: codex exec <prompt> --skip-git-repo-check")
     return _run(cmd, "codex")
+
+
+def generate_via_cli_with_tool(tool: str, prompt: str, model: str | None = None) -> tuple[str, str]:
+    """Dispatch to the correct CLI tool with automatic failover to the alternate CLI."""
+    try:
+        return generate_via_cli_no_fallback(tool, prompt, model), tool
+    except CliInvocationError as exc:
+        alt = _alternate_tool(tool)
+        if not exc.fallback_recommended:
+            raise
+        log.warning(
+            "CLI backend %s failed in a fallback-worthy way; trying %s instead: %s",
+            tool,
+            alt,
+            exc,
+        )
+        try:
+            return generate_via_cli_no_fallback(alt, prompt, model), alt
+        except CliInvocationError as alt_exc:
+            raise RuntimeError(
+                f"{tool} CLI failed ({exc}); fallback {alt} CLI also failed ({alt_exc})"
+            ) from alt_exc
+
+
+def generate_via_cli_no_fallback(tool: str, prompt: str, model: str | None = None) -> str:
+    """Dispatch to the requested CLI tool only, without cross-tool failover."""
+    if tool == "claude":
+        return call_claude(prompt, model)
+    if tool == "codex":
+        return call_codex(prompt, model)
+    raise ValueError(f"Unknown CLI tool: {tool!r} — expected 'claude' or 'codex'")
 
 
 def generate_via_cli(tool: str, prompt: str, model: str | None = None) -> str:
@@ -98,11 +179,8 @@ def generate_via_cli(tool: str, prompt: str, model: str | None = None) -> str:
         RuntimeError: if the CLI tool is not found, times out, or exits non-zero.
         ValueError:   if *tool* is not a recognised CLI tool name.
     """
-    if tool == "claude":
-        return call_claude(prompt, model)
-    if tool == "codex":
-        return call_codex(prompt, model)
-    raise ValueError(f"Unknown CLI tool: {tool!r} — expected 'claude' or 'codex'")
+    raw, _ = generate_via_cli_with_tool(tool, prompt, model)
+    return raw
 
 
 def check_cli_tool(tool: str) -> dict[str, str]:

@@ -705,9 +705,9 @@ def _generate_with_cli(
     waf: str | None = None,
     past_findings: list[Finding] | None = None,
     past_lessons: list[Any] | None = None,
-) -> list[PayloadCandidate]:
-    """Generate payloads by calling the claude or codex CLI subprocess."""
-    from ai_xss_generator.cli_runner import generate_via_cli
+) -> tuple[list[PayloadCandidate], str]:
+    """Generate payloads by calling the CLI backend, with cross-tool failover."""
+    from ai_xss_generator.cli_runner import generate_via_cli_with_tool
     prompt = _prompt_for_context(
         context,
         reference_payloads=reference_payloads,
@@ -715,9 +715,9 @@ def _generate_with_cli(
         past_findings=past_findings,
         past_lessons=past_lessons,
     )
-    raw = generate_via_cli(tool, prompt, cli_model)
+    raw, actual_tool = generate_via_cli_with_tool(tool, prompt, cli_model)
     data = _extract_json_blob(raw)
-    return _normalize_payloads(data.get("payloads", []), source=f"cli:{tool}")
+    return _normalize_payloads(data.get("payloads", []), source=f"cli:{actual_tool}"), actual_tool
 
 
 def _try_cloud(
@@ -747,8 +747,8 @@ def _try_cloud(
     # ── CLI backend ──────────────────────────────────────────────────────────
     if ai_backend == "cli":
         try:
-            payloads = _generate_with_cli(context, cli_tool, cli_model, **kwargs)
-            return payloads, f"cli:{cli_tool}"
+            payloads, actual_tool = _generate_with_cli(context, cli_tool, cli_model, **kwargs)
+            return payloads, f"cli:{actual_tool}"
         except Exception as exc:
             log.debug("CLI backend (%s) failed: %s", cli_tool, exc)
             return [], ""
