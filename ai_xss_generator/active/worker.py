@@ -548,6 +548,105 @@ def _get_local_payloads(
         return []
 
 
+# ---------------------------------------------------------------------------
+# DOM XSS worker entry point
+# ---------------------------------------------------------------------------
+
+def run_dom_worker(
+    url: str,
+    waf_hint: str | None,
+    timeout_seconds: int,
+    result_queue: "multiprocessing.Queue",
+    auth_headers: dict[str, str] | None = None,
+) -> None:
+    """Worker entry point for DOM XSS runtime scanning.
+
+    Runs as an isolated multiprocessing.Process.  Launches its own Playwright
+    browser, calls scan_dom_xss(), converts results to ConfirmedFinding objects,
+    and puts a WorkerResult onto result_queue.
+    """
+    start_time = time.monotonic()
+
+    def _put_result(result: WorkerResult) -> None:
+        result.duration_seconds = time.monotonic() - start_time
+        result_queue.put(result)
+
+    try:
+        _run_dom(
+            url=url,
+            waf_hint=waf_hint,
+            timeout_seconds=timeout_seconds,
+            put_result=_put_result,
+            auth_headers=auth_headers,
+        )
+    except Exception as exc:
+        log.exception("DOM worker crashed for %s", url)
+        _put_result(WorkerResult(url=url, status="error", error=str(exc), kind="dom"))
+
+
+def _run_dom(
+    *,
+    url: str,
+    waf_hint: str | None,
+    timeout_seconds: int,
+    put_result: Any,
+    auth_headers: dict[str, str] | None = None,
+) -> None:
+    from playwright.sync_api import sync_playwright
+    from ai_xss_generator.active.dom_xss import scan_dom_xss
+
+    # Cap per-navigation timeout to 15 s regardless of the overall worker timeout
+    nav_timeout_ms = min(timeout_seconds * 1_000, 15_000)
+
+    try:
+        pw = sync_playwright().start()
+        browser = pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+        )
+        try:
+            dom_results = scan_dom_xss(url, browser, auth_headers, timeout_ms=nav_timeout_ms)
+        finally:
+            browser.close()
+            pw.stop()
+    except Exception as exc:
+        put_result(WorkerResult(
+            url=url, status="error", error=f"DOM XSS scan failed: {exc}", kind="dom",
+        ))
+        return
+
+    findings: list[ConfirmedFinding] = []
+    for dr in dom_results:
+        findings.append(
+            ConfirmedFinding(
+                url=url,
+                param_name=dr.source_name,
+                context_type="dom_xss",
+                sink_context=dr.sink,
+                payload=dr.payload_fired or "",
+                transform_name="dom_xss_runtime",
+                # "dom_xss" = JS execution confirmed; "dom_taint" = taint proven but
+                # real payload blocked (CSP etc.) — still a high-confidence finding.
+                execution_method="dom_xss" if dr.confirmed_execution else "dom_taint",
+                execution_detail=dr.detail,
+                waf=waf_hint,
+                surviving_chars="",
+                fired_url=dr.fired_url,
+                source="dom_xss_runtime",
+                cloud_escalated=False,
+            )
+        )
+
+    status = "confirmed" if findings else "no_execution"
+    put_result(WorkerResult(
+        url=url,
+        status=status,
+        confirmed_findings=findings,
+        waf=waf_hint,
+        kind="dom",
+    ))
+
+
 def _get_cloud_payloads(
     url: str,
     probe_result: Any,

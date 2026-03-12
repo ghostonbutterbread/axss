@@ -29,7 +29,7 @@ from typing import Any, Sequence, TYPE_CHECKING
 if TYPE_CHECKING:
     from ai_xss_generator.types import PostFormTarget
 
-from ai_xss_generator.active.worker import WorkerResult, run_worker
+from ai_xss_generator.active.worker import WorkerResult, run_worker, run_dom_worker
 from ai_xss_generator.console import (
     fmt_duration, info, setup_panel, step, success,
     teardown_panel, update_panel, warn,
@@ -97,14 +97,8 @@ def run_active_scan(
     if config.scan_stored:
         work_items += [("post", pf) for pf in post_form_list]
 
-    # DOM XSS: not yet implemented — always notify when requested
     if config.scan_dom:
-        other_types_enabled = config.scan_reflected or config.scan_stored
-        if not other_types_enabled:
-            info("DOM XSS scanning is not yet implemented — coming soon.")
-            return []
-        else:
-            info("DOM XSS scanning is not yet implemented — skipping; reflected/stored will still run.")
+        work_items += [("dom", u) for u in url_list]
 
     # Session resume: filter out already-completed work items and restore
     # prior results so _print_summary / write_report include all findings.
@@ -139,10 +133,10 @@ def run_active_scan(
             info(f"Active scan: nothing to test — {'; '.join(_reasons)}")
         return []
 
-    # Human-readable list of types that will actually run (dom excluded — not yet implemented)
     _active_types = " + ".join(filter(None, [
         "reflected" if config.scan_reflected else None,
         "stored" if config.scan_stored else None,
+        "dom" if config.scan_dom else None,
     ]))
     n_get = sum(1 for kind, _ in work_items if kind == "get")
     n_post = sum(1 for kind, _ in work_items if kind == "post")
@@ -209,11 +203,14 @@ def run_active_scan(
 
         # ── Workers + confirmed + active label ─────────────────────────────
         pills: list[str] = []
+        _MAGENTA = "\033[35m"
         for _, _lbl, _kind in active_procs:
             if _kind == "get":
                 pills.append(f"{GREEN}GET●{RESET}")
-            else:
+            elif _kind == "post":
                 pills.append(f"{CYAN}POST●{RESET}")
+            else:
+                pills.append(f"{_MAGENTA}DOM●{RESET}")
         for _ in range(max(0, n_workers - len(active_procs))):
             pills.append(f"{DIM}idle○{RESET}")
         pills_str = "  ".join(pills)
@@ -340,6 +337,20 @@ def run_active_scan(
                             daemon=True,
                         )
                         log_label = next_url
+                    elif kind == "dom":
+                        next_url = item
+                        proc = multiprocessing.Process(
+                            target=run_dom_worker,
+                            kwargs={
+                                "url": next_url,
+                                "waf_hint": config.waf,
+                                "timeout_seconds": config.timeout_seconds,
+                                "result_queue": result_queue,
+                                "auth_headers": config.auth_headers,
+                            },
+                            daemon=True,
+                        )
+                        log_label = f"[DOM] {next_url}"
                     else:
                         pf = item
                         proc = multiprocessing.Process(
