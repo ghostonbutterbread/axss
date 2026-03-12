@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from ai_xss_generator.active.worker import _get_dom_local_payloads, _get_local_payloads
-from ai_xss_generator.models import _compact_dom_prompt_for_local
+from ai_xss_generator.models import _cloud_prompt_for_context, _compact_dom_prompt_for_local
 from ai_xss_generator.probe import ProbeResult, ReflectionContext
 from ai_xss_generator.types import FormContext, FormField, ParsedContext
 from xssy.learn import _runtime_learning_context
@@ -76,6 +76,41 @@ def test_compact_dom_prompt_uses_sink_specific_profile():
     assert "Sink profile: document_write" in prompt
     assert "URL-attribute breakout" in prompt
     assert "Produce 3-6 payloads only." in prompt
+
+
+def test_cloud_prompt_uses_compact_seeded_shape_for_simple_dom_sinks():
+    context = ParsedContext(
+        source="https://example.test/?name=x",
+        source_type="url",
+        notes=[
+            '[dom:TAINT] {"code_location": "bundle.js:12", "sink": "innerHTML", "source_name": "name", "source_type": "query_param"}'
+        ],
+    )
+
+    prompt = _cloud_prompt_for_context(context)
+
+    assert "Produce 4-8 payloads only." in prompt
+    assert "Do not return an empty payload list." in prompt
+    assert "Seed technique examples:" in prompt
+    assert '"payload": "<img src=x onerror=alert(1)>"' in prompt
+    assert "Context summary:" in prompt
+
+
+def test_cloud_prompt_keeps_rich_shape_for_document_write_dom_sinks():
+    context = ParsedContext(
+        source="https://example.test/#x",
+        source_type="url",
+        notes=[
+            '[dom:TAINT] {"code_location": "bundle.js:42", "sink": "document.write", "source_name": "hash", "source_type": "fragment"}'
+        ],
+    )
+
+    prompt = _cloud_prompt_for_context(context)
+
+    assert "Produce 15-25 payloads." in prompt
+    assert "Full parsed context:" in prompt
+    assert "DOM SINK PROFILE:" in prompt
+    assert "profile: document_write" in prompt
 
 
 def test_xssy_learning_prefers_probe_enriched_runtime_context():
