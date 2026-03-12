@@ -60,6 +60,32 @@ def test_generate_via_cli_does_not_fallback_for_non_retryable_failure() -> None:
             generate_via_cli_with_tool("claude", "prompt")
 
 
+def test_generate_via_cli_tries_each_tool_once_when_both_fail() -> None:
+    with (
+        patch(
+            "ai_xss_generator.cli_runner.call_claude",
+            side_effect=CliInvocationError(
+                "claude",
+                "claude CLI exited 1: usage limit reached",
+                fallback_recommended=True,
+            ),
+        ) as claude,
+        patch(
+            "ai_xss_generator.cli_runner.call_codex",
+            side_effect=CliInvocationError(
+                "codex",
+                "codex CLI exited 1: usage exhausted",
+                fallback_recommended=True,
+            ),
+        ) as codex,
+    ):
+        with pytest.raises(RuntimeError):
+            generate_via_cli_with_tool("claude", "prompt")
+
+    claude.assert_called_once_with("prompt", None)
+    codex.assert_called_once_with("prompt", None)
+
+
 def test_generate_with_cli_labels_payloads_with_actual_fallback_tool() -> None:
     context = ParsedContext(source="https://example.test/?q=x", source_type="url")
 

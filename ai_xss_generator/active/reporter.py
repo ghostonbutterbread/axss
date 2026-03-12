@@ -177,6 +177,11 @@ def _format_finding(index: int, f: ConfirmedFinding) -> list[str]:
         f"| **Source** | {source_label} |",
     ]
 
+    if f.ai_engine:
+        lines.append(f"| **AI engine** | `{f.ai_engine}` |")
+    if f.ai_note:
+        lines.append(f"| **AI note** | {f.ai_note} |")
+
     if not is_dom:
         lines += [
             f"| **Transform** | `{f.transform_name}` |",

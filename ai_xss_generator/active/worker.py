@@ -42,9 +42,9 @@ def active_worker_timeout_budget(timeout_seconds: int, use_cloud: bool) -> int:
     return max(timeout_seconds, minimum)
 
 
-def _start_async_payload_stage(fn: Any) -> tuple[threading.Thread, "queue.Queue[list[str]]"]:
+def _start_async_payload_stage(fn: Any) -> tuple[threading.Thread, "queue.Queue[Any]"]:
     """Run a payload-generation callable in a daemon thread and capture its result."""
-    out: "queue.Queue[list[str]]" = queue.Queue(maxsize=1)
+    out: "queue.Queue[Any]" = queue.Queue(maxsize=1)
 
     def _runner() -> None:
         try:
@@ -61,7 +61,7 @@ def _start_async_payload_stage(fn: Any) -> tuple[threading.Thread, "queue.Queue[
     return thread, out
 
 
-def _poll_async_payloads(out: "queue.Queue[list[str]]") -> tuple[bool, list[str]]:
+def _poll_async_payloads(out: "queue.Queue[Any]") -> tuple[bool, Any]:
     try:
         return True, out.get_nowait()
     except queue.Empty:
@@ -90,6 +90,16 @@ class ConfirmedFinding:
     cloud_escalated: bool
     code_location: str = ""
     """JS call stack or script location where the sink was reached (DOM XSS only)."""
+    ai_engine: str = ""
+    ai_note: str = ""
+
+
+@dataclass
+class CloudPayloadPlan:
+    """Cloud-model payload batch plus engine metadata for reporting."""
+    payloads: list[str] = field(default_factory=list)
+    engine: str = ""
+    note: str = ""
 
 
 @dataclass
@@ -360,6 +370,7 @@ def _run(
                     break
 
                 context_probe_result = _probe_result_for_context(probe_result, context_type)
+                cloud_plan = CloudPayloadPlan()
                 # Track confirmation per context — a confirmed finding on one
                 # param must not suppress escalation on a different param.
                 context_confirmed = False
@@ -423,7 +434,7 @@ def _run(
                         context_type=context_type,
                     )
 
-                    cloud_payloads = _get_cloud_payloads(
+                    cloud_plan = _coerce_cloud_plan(_get_cloud_payloads(
                         url=url,
                         probe_result=context_probe_result,
                         cloud_model=cloud_model,
@@ -438,7 +449,8 @@ def _run(
                         cli_model=cli_model,
                         delivery_mode="get",
                         session_lessons=session_lessons,
-                    )
+                    ))
+                    cloud_payloads = cloud_plan.payloads
 
                     if cloud_payloads:
                         cloud_escalated = True
@@ -464,6 +476,8 @@ def _run(
                                 waf=waf_hint,
                                 source="cloud_model",
                                 cloud_escalated=True,
+                                ai_engine=cloud_plan.engine,
+                                ai_note=cloud_plan.note,
                             )
                             confirmed_findings.append(finding)
                             context_confirmed = True
@@ -495,6 +509,7 @@ def _run(
                                 waf=waf_hint,
                                 source="phase1_transform",
                                 cloud_escalated=False,
+                                ai_note=cloud_plan.note if use_cloud else "",
                             )
                             confirmed_findings.append(finding)
                             context_confirmed = True
@@ -529,6 +544,8 @@ def _make_finding(
     waf: str | None,
     source: str,
     cloud_escalated: bool,
+    ai_engine: str = "",
+    ai_note: str = "",
 ) -> ConfirmedFinding:
     surviving = "".join(sorted(
         c for ctx in probe_result.reflections for c in ctx.surviving_chars
@@ -547,6 +564,8 @@ def _make_finding(
         fired_url=result.fired_url,
         source=source,
         cloud_escalated=cloud_escalated,
+        ai_engine=ai_engine,
+        ai_note=ai_note,
     )
 
 
@@ -623,6 +642,36 @@ def _inject_dom_source(url: str, source_type: str, source_name: str, value: str)
     """Return *url* with *value* injected into the specified DOM-controlled source."""
     from ai_xss_generator.active.dom_xss import _inject_source
     return _inject_source(url, source_type, source_name, value)
+
+
+def _cloud_note_for_engine(
+    *,
+    ai_backend: str,
+    requested_cli_tool: str,
+    engine: str,
+) -> str:
+    """Return a human-readable note when CLI cloud execution used failover."""
+    if ai_backend != "cli":
+        return ""
+    actual_tool = engine.removeprefix("cli:")
+    if not engine.startswith("cli:") or actual_tool == requested_cli_tool:
+        return ""
+    return f"CLI failover: requested {requested_cli_tool}, used {actual_tool}."
+
+
+def _coerce_cloud_plan(value: Any) -> CloudPayloadPlan:
+    """Normalize legacy/raw mocked cloud responses into CloudPayloadPlan."""
+    if isinstance(value, CloudPayloadPlan):
+        return value
+    if isinstance(value, dict):
+        return CloudPayloadPlan(
+            payloads=list(value.get("payloads", [])),
+            engine=str(value.get("engine", "")),
+            note=str(value.get("note", "")),
+        )
+    if isinstance(value, list):
+        return CloudPayloadPlan(payloads=list(value))
+    return CloudPayloadPlan()
 
 
 def _build_dom_context(
@@ -727,12 +776,17 @@ def _get_dom_cloud_payloads(
     cli_tool: str = "claude",
     cli_model: str | None = None,
     session_lessons: list[Any] | None = None,
-) -> list[str]:
+) -> CloudPayloadPlan:
     """Call the cloud model once per unique DOM source → sink fingerprint."""
     with dedup_lock:
         if ekey in dedup_registry:
             log.debug("DOM dedup hit — reusing cloud result for key %s", ekey[:12])
-            return dedup_registry[ekey]
+            cached = dict(dedup_registry[ekey])
+            return CloudPayloadPlan(
+                payloads=list(cached.get("payloads", [])),
+                engine=str(cached.get("engine", "")),
+                note=str(cached.get("note", "")),
+            )
 
     try:
         from ai_xss_generator.models import generate_cloud_payloads
@@ -743,7 +797,7 @@ def _get_dom_cloud_payloads(
             waf_name=waf,
             delivery_mode="dom",
         )
-        payloads, _ = generate_cloud_payloads(
+        payloads, engine = generate_cloud_payloads(
             context=context,
             cloud_model=cloud_model,
             waf=waf,
@@ -753,14 +807,26 @@ def _get_dom_cloud_payloads(
             cli_model=cli_model,
             memory_profile=memory_profile,
         )
-        result_strings = [p.payload for p in payloads if p.payload]
+        result_plan = CloudPayloadPlan(
+            payloads=[p.payload for p in payloads if p.payload],
+            engine=engine,
+            note=_cloud_note_for_engine(
+                ai_backend=ai_backend,
+                requested_cli_tool=cli_tool,
+                engine=engine,
+            ),
+        )
     except Exception as exc:
         log.debug("DOM cloud model failed for %s: %s", getattr(context, "source", "?"), exc)
-        result_strings = []
+        result_plan = CloudPayloadPlan()
 
     with dedup_lock:
-        dedup_registry[ekey] = result_strings
-    return result_strings
+        dedup_registry[ekey] = {
+            "payloads": list(result_plan.payloads),
+            "engine": result_plan.engine,
+            "note": result_plan.note,
+        }
+    return result_plan
 
 
 # ---------------------------------------------------------------------------
@@ -929,12 +995,15 @@ def _run_dom(
                 source = "dom_xss_runtime"
                 transform_name = "dom_xss_runtime"
                 cloud_used_for_hit = False
+                ai_engine = ""
+                ai_note = ""
                 local_stage = None
                 local_done = False
                 local_payloads: list[str] = []
                 local_payloads_tried = False
                 cloud_stage = None
                 cloud_done = False
+                cloud_plan = CloudPayloadPlan()
                 cloud_payloads: list[str] = []
                 cloud_delay_deadline = time.monotonic() + _DOM_CLOUD_START_AFTER_SECONDS
                 cloud_ekey = _escalation_key(
@@ -957,6 +1026,7 @@ def _run_dom(
                 def _try_dom_payloads(payloads: list[str], stage_name: str) -> bool:
                     nonlocal confirmed, fired_payload, fired_url, detail
                     nonlocal source, transform_name, local_payloads_tried, cloud_used_for_hit, cloud_escalated
+                    nonlocal ai_engine, ai_note
                     if not payloads or _timed_out():
                         return False
                     exec_ok, exec_payload, exec_detail = attempt_dom_payloads(
@@ -974,6 +1044,8 @@ def _run_dom(
                     if stage_name == "cloud_model":
                         cloud_used_for_hit = True
                         cloud_escalated = True
+                        ai_engine = cloud_plan.engine
+                        ai_note = cloud_plan.note
                     if exec_ok:
                         confirmed = True
                         fired_payload = exec_payload
@@ -1012,10 +1084,11 @@ def _run_dom(
                             ))
 
                     if cloud_stage is not None and not cloud_done:
-                        cloud_ready, payloads = _poll_async_payloads(cloud_stage[1])
+                        cloud_ready, plan = _poll_async_payloads(cloud_stage[1])
                         if cloud_ready:
                             cloud_done = True
-                            cloud_payloads = payloads
+                            cloud_plan = _coerce_cloud_plan(plan)
+                            cloud_payloads = cloud_plan.payloads
                             if _try_dom_payloads(cloud_payloads, "cloud_model"):
                                 break
 
@@ -1046,6 +1119,7 @@ def _run_dom(
                         detail = exec_detail
                         source = "phase1_transform"
                         transform_name = "dom_static_fallback"
+                        ai_note = cloud_plan.note
 
                 findings.append(
                     ConfirmedFinding(
@@ -1063,6 +1137,8 @@ def _run_dom(
                         source=source,
                         cloud_escalated=cloud_used_for_hit,
                         code_location=hit.code_location,
+                        ai_engine=ai_engine,
+                        ai_note=ai_note,
                     )
                 )
         finally:
@@ -1105,7 +1181,7 @@ def _get_cloud_payloads(
     cli_model: str | None = None,
     delivery_mode: str = "get",
     session_lessons: list[Any] | None = None,
-) -> list[str]:
+) -> CloudPayloadPlan:
     """Check dedup registry; call cloud model if this is a novel fingerprint.
 
     *base_context* is a pre-parsed ParsedContext for *url*. When provided it
@@ -1114,7 +1190,12 @@ def _get_cloud_payloads(
     with dedup_lock:
         if ekey in dedup_registry:
             log.debug("Dedup hit — reusing cloud result for key %s", ekey[:12])
-            return dedup_registry[ekey]
+            cached = dict(dedup_registry[ekey])
+            return CloudPayloadPlan(
+                payloads=list(cached.get("payloads", [])),
+                engine=str(cached.get("engine", "")),
+                note=str(cached.get("note", "")),
+            )
 
     try:
         from ai_xss_generator.probe import enrich_context
@@ -1131,7 +1212,7 @@ def _get_cloud_payloads(
             waf_name=waf,
             delivery_mode=delivery_mode,
         )
-        payloads, _ = generate_cloud_payloads(
+        payloads, engine = generate_cloud_payloads(
             context=context,
             cloud_model=cloud_model,
             waf=waf,
@@ -1141,15 +1222,27 @@ def _get_cloud_payloads(
             cli_model=cli_model,
             memory_profile=memory_profile,
         )
-        result_strings = [p.payload for p in payloads if p.payload]
+        result_plan = CloudPayloadPlan(
+            payloads=[p.payload for p in payloads if p.payload],
+            engine=engine,
+            note=_cloud_note_for_engine(
+                ai_backend=ai_backend,
+                requested_cli_tool=cli_tool,
+                engine=engine,
+            ),
+        )
     except Exception as exc:
         log.debug("Cloud escalation failed for %s: %s", url, exc)
-        result_strings = []
+        result_plan = CloudPayloadPlan()
 
     with dedup_lock:
-        dedup_registry[ekey] = result_strings
+        dedup_registry[ekey] = {
+            "payloads": list(result_plan.payloads),
+            "engine": result_plan.engine,
+            "note": result_plan.note,
+        }
 
-    return result_strings
+    return result_plan
 
 
 # ---------------------------------------------------------------------------
@@ -1348,6 +1441,7 @@ def _run_post(
                     break
 
                 context_probe_result = _probe_result_for_context(probe_result, context_type)
+                cloud_plan = CloudPayloadPlan()
                 context_confirmed = False
 
                 if not context_confirmed and not _timed_out():
@@ -1402,7 +1496,7 @@ def _run_post(
                         surviving_chars=surviving_chars,
                         context_type=context_type,
                     )
-                    cloud_payloads = _get_cloud_payloads(
+                    cloud_plan = _coerce_cloud_plan(_get_cloud_payloads(
                         url=post_form.source_page_url,
                         probe_result=context_probe_result,
                         cloud_model=cloud_model,
@@ -1417,7 +1511,8 @@ def _run_post(
                         cli_model=cli_model,
                         delivery_mode="post",
                         session_lessons=post_session_lessons,
-                    )
+                    ))
+                    cloud_payloads = cloud_plan.payloads
                     if cloud_payloads:
                         cloud_escalated = True
 
@@ -1444,6 +1539,8 @@ def _run_post(
                                 waf=waf_hint,
                                 source="cloud_model",
                                 cloud_escalated=True,
+                                ai_engine=cloud_plan.engine,
+                                ai_note=cloud_plan.note,
                             )
                             confirmed_findings.append(finding)
                             context_confirmed = True
@@ -1475,6 +1572,7 @@ def _run_post(
                                 waf=waf_hint,
                                 source="phase1_transform",
                                 cloud_escalated=False,
+                                ai_note=cloud_plan.note if use_cloud else "",
                             )
                             confirmed_findings.append(finding)
                             context_confirmed = True

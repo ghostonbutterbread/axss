@@ -445,14 +445,26 @@ def run_active_scan(
 def _log_result(r: WorkerResult) -> None:
     import urllib.parse as _up
     if r.status == "confirmed":
+        sources = {f.source for f in r.confirmed_findings}
+        if len(sources) == 1:
+            source_label = {
+                "local_model": "local",
+                "cloud_model": "cloud",
+                "phase1_transform": "fallback",
+                "dom_xss_runtime": "runtime",
+            }.get(next(iter(sources)), "mixed")
+        else:
+            source_label = "mixed"
         success(
             f"[active] CONFIRMED {len(r.confirmed_findings)} finding(s) — {r.url} "
-            f"({'cloud' if r.cloud_escalated else 'local'})"
+            f"({source_label})"
         )
         for f in r.confirmed_findings:
             # Unquote so full-width / half-width chars display as-is, not percent-encoded
             display_url = _up.unquote(f.fired_url)
             success(f"  ↳ [{f.param_name}] {display_url}")
+            if f.ai_note:
+                info(f"    {f.ai_note}")
     elif r.status == "no_execution":
         info(
             f"[active] no execution confirmed — {r.url} "
