@@ -35,6 +35,52 @@ class _HelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescrip
         return super()._get_help_string(action)
 
 
+_TRACE_HANDLER_NAME = "axss-trace-handler"
+
+
+def _remove_trace_handlers(logger: object) -> None:
+    import logging as _logging
+
+    if not isinstance(logger, _logging.Logger):
+        return
+    for handler in list(logger.handlers):
+        if handler.get_name() == _TRACE_HANDLER_NAME:
+            logger.removeHandler(handler)
+            handler.close()
+
+
+def _configure_logging(verbose_level: int) -> None:
+    import logging as _logging
+
+    app_loggers = (
+        _logging.getLogger("ai_xss_generator"),
+        _logging.getLogger("xssy"),
+    )
+    noisy_loggers = (
+        "scrapling",
+        "urllib3",
+        "playwright",
+        "asyncio",
+    )
+
+    for logger in app_loggers:
+        _remove_trace_handlers(logger)
+        logger.propagate = True
+        logger.setLevel(_logging.NOTSET)
+
+    if verbose_level >= 2:
+        for logger in app_loggers:
+            handler = _logging.StreamHandler()
+            handler.set_name(_TRACE_HANDLER_NAME)
+            handler.setFormatter(_logging.Formatter("[%(name)s] %(message)s"))
+            logger.addHandler(handler)
+            logger.setLevel(_logging.DEBUG)
+            logger.propagate = False
+
+    for name in noisy_loggers:
+        _logging.getLogger(name).setLevel(_logging.WARNING)
+
+
 def _positive_int(value: str) -> int:
     try:
         parsed = int(value)
@@ -1036,7 +1082,6 @@ def _resolve_session(
 # ---------------------------------------------------------------------------
 
 def main(argv: list[str] | None = None) -> int:
-    import logging as _logging
     config = load_config()
     parser = build_parser(config.default_model)
     args = parser.parse_args(argv)
@@ -1046,19 +1091,7 @@ def main(argv: list[str] | None = None) -> int:
     # Configure console verbosity level (inherited by worker subprocesses via fork)
     from ai_xss_generator.console import set_verbose_level as _set_verbose
     _set_verbose(verbose_level)
-
-    if verbose_level >= 2:
-        # -vv: full debug trace — enable root logger at DEBUG so all worker
-        # log.debug() calls become visible.  Use stderr to avoid corrupting
-        # the progress panel on stdout.
-        _handler = _logging.StreamHandler()
-        _handler.setFormatter(_logging.Formatter("[%(name)s] %(message)s"))
-        _logging.getLogger().addHandler(_handler)
-        _logging.getLogger().setLevel(_logging.DEBUG)
-    elif verbose_level == 0:
-        # Scrapling emits INFO-level fetch logs to stderr on every request.
-        # These bypass our status-bar hooks and corrupt the terminal display.
-        _logging.getLogger("scrapling").setLevel(_logging.WARNING)
+    _configure_logging(verbose_level)
 
     has_target = bool(args.url or args.urls or args.input)
     is_utility = (
