@@ -2,8 +2,15 @@
 
 Injects a JavaScript sink-hook init script *before* page navigation via
 Playwright's add_init_script(), then drives the browser with canary strings
-in every attacker-controllable source.  When a hooked sink receives the canary,
-taint flow is confirmed and a real XSS payload is attempted in that same source.
+in every attacker-controllable source. When a hooked sink receives the canary,
+taint flow is confirmed.
+
+The module exposes two stages:
+  1. `discover_dom_taint_paths()` — finds source → sink taint pairs
+  2. `attempt_dom_payloads()`     — tries payloads for one tainted pair
+
+`scan_dom_xss()` remains as a convenience wrapper that uses the static sink
+payload inventory for execution attempts.
 
 Sources tested:
   - URL query parameters (each individually replaced with the canary)
@@ -192,6 +199,19 @@ class DomXssResult:
     code_location: str = ""   # JS call stack frames showing where the sink was reached
 
 
+@dataclass
+class DomTaintHit:
+    """One tainted DOM source → sink path discovered at runtime."""
+
+    url: str
+    source_type: str          # "query_param" | "fragment"
+    source_name: str          # param name, or "hash" for the fragment source
+    sink: str                 # hooked sink name: "innerHTML" | "eval" | ...
+    canary: str
+    canary_url: str
+    code_location: str = ""
+
+
 def _make_canary() -> str:
     return "axss_" + os.urandom(4).hex()
 
@@ -212,7 +232,12 @@ def _inject_source(url: str, source_type: str, source_name: str, value: str) -> 
     return urllib.parse.urlunparse(parsed._replace(query=new_query))
 
 
-def _attempt_execution(
+def fallback_payloads_for_sink(sink: str) -> list[str]:
+    """Return static fallback payloads for a tainted DOM sink."""
+    return list(_SINK_PAYLOADS.get(sink, _DEFAULT_PAYLOADS))
+
+
+def attempt_dom_payloads(
     browser,
     url: str,
     source_type: str,
@@ -289,24 +314,21 @@ def _attempt_execution(
     return False, "", ""
 
 
-def scan_dom_xss(
+def discover_dom_taint_paths(
     url: str,
     browser,
     auth_headers: dict[str, str] | None = None,
     timeout_ms: int = _NAV_TIMEOUT_MS,
-) -> list[DomXssResult]:
-    """Scan *url* for DOM XSS via runtime Playwright sink hooking.
+) -> list[DomTaintHit]:
+    """Return tainted DOM source → sink paths discovered via runtime sink hooking.
 
     For each attacker-controllable source (query params + URL fragment):
       1. Create a fresh browser context with the sink-hook init script loaded.
       2. Navigate with the canary value injected into that source.
       3. Wait for SPA stabilization (catches Angular's async rendering).
       4. Inspect window.__axss_dom_hits for any sink that received the canary.
-      5. For each tainted sink: attempt real XSS payloads in a separate page.
-
-    Returns one DomXssResult per unique source → sink taint path found.
     """
-    results: list[DomXssResult] = []
+    hits_out: list[DomTaintHit] = []
     canary = _make_canary()
     hook_js = _build_hook_js(canary)
     _auth = auth_headers or {}
@@ -376,43 +398,14 @@ def scan_dom_xss(
                 if code_loc:
                     _debug(f"    JS location: {code_loc}")
 
-                payloads = _SINK_PAYLOADS.get(sink_name, _DEFAULT_PAYLOADS)
-                _debug(f"    trying {len(payloads)} payload(s) for sink '{sink_name}'")
-                exec_ok, exec_payload, exec_detail = _attempt_execution(
-                    browser=browser,
-                    url=url,
-                    source_type=source_type,
-                    source_name=source_name,
-                    sink=sink_name,
-                    payloads=payloads,
-                    auth_headers=_auth,
-                    timeout_ms=timeout_ms,
-                )
-
-                if exec_ok:
-                    _debug(f"    CONFIRMED execution via payload: {exec_payload!r}")
-                    fired_url = _inject_source(url, source_type, source_name, exec_payload)
-                    detail = exec_detail
-                else:
-                    _debug(f"    taint confirmed but no payload executed (CSP or mismatch)")
-                    fired_url = canary_url
-                    detail = (
-                        f"DOM taint confirmed — canary reached sink '{sink_name}' via "
-                        f"{source_type}:{source_name!r}. "
-                        f"Real payload did not execute (possible CSP or payload mismatch)."
-                    )
-
-                results.append(
-                    DomXssResult(
+                hits_out.append(
+                    DomTaintHit(
                         url=url,
                         source_type=source_type,
                         source_name=source_name,
                         sink=sink_name,
                         canary=canary,
-                        confirmed_execution=exec_ok,
-                        payload_fired=exec_payload if exec_ok else None,
-                        detail=detail,
-                        fired_url=fired_url,
+                        canary_url=canary_url,
                         code_location=code_loc,
                     )
                 )
@@ -427,5 +420,65 @@ def scan_dom_xss(
                 ctx.close()
             except Exception:
                 pass
+
+    return hits_out
+
+
+def scan_dom_xss(
+    url: str,
+    browser,
+    auth_headers: dict[str, str] | None = None,
+    timeout_ms: int = _NAV_TIMEOUT_MS,
+) -> list[DomXssResult]:
+    """Scan *url* for DOM XSS using runtime taint discovery + static fallback payloads."""
+    results: list[DomXssResult] = []
+    _auth = auth_headers or {}
+
+    for hit in discover_dom_taint_paths(
+        url=url,
+        browser=browser,
+        auth_headers=auth_headers,
+        timeout_ms=timeout_ms,
+    ):
+        payloads = fallback_payloads_for_sink(hit.sink)
+        _debug(f"    trying {len(payloads)} payload(s) for sink '{hit.sink}'")
+        exec_ok, exec_payload, exec_detail = attempt_dom_payloads(
+            browser=browser,
+            url=url,
+            source_type=hit.source_type,
+            source_name=hit.source_name,
+            sink=hit.sink,
+            payloads=payloads,
+            auth_headers=_auth,
+            timeout_ms=timeout_ms,
+        )
+
+        if exec_ok:
+            _debug(f"    CONFIRMED execution via payload: {exec_payload!r}")
+            fired_url = _inject_source(url, hit.source_type, hit.source_name, exec_payload)
+            detail = exec_detail
+        else:
+            _debug("    taint confirmed but no payload executed (CSP or mismatch)")
+            fired_url = hit.canary_url
+            detail = (
+                f"DOM taint confirmed — canary reached sink '{hit.sink}' via "
+                f"{hit.source_type}:{hit.source_name!r}. "
+                f"Real payload did not execute (possible CSP or payload mismatch)."
+            )
+
+        results.append(
+            DomXssResult(
+                url=url,
+                source_type=hit.source_type,
+                source_name=hit.source_name,
+                sink=hit.sink,
+                canary=hit.canary,
+                confirmed_execution=exec_ok,
+                payload_fired=exec_payload if exec_ok else None,
+                detail=detail,
+                fired_url=fired_url,
+                code_location=hit.code_location,
+            )
+        )
 
     return results

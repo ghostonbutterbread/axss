@@ -575,6 +575,151 @@ def _get_local_payloads(
         return []
 
 
+def _inject_dom_source(url: str, source_type: str, source_name: str, value: str) -> str:
+    """Return *url* with *value* injected into the specified DOM-controlled source."""
+    from ai_xss_generator.active.dom_xss import _inject_source
+    return _inject_source(url, source_type, source_name, value)
+
+
+def _build_dom_context(
+    *,
+    base_context: Any,
+    url: str,
+    source_type: str,
+    source_name: str,
+    sink: str,
+    code_location: str = "",
+    auth_headers: dict[str, str] | None = None,
+) -> Any:
+    """Build a ParsedContext focused on one DOM source → sink taint path."""
+    from dataclasses import replace as dc_replace
+    from ai_xss_generator.types import DomSink, ParsedContext
+
+    if base_context is None:
+        base_context = ParsedContext(source=url, source_type="url")
+
+    source_sink = "location.hash" if source_type == "fragment" else "location.search"
+    dom_note = (
+        "[dom:TAINT] "
+        + json.dumps({
+            "source_type": source_type,
+            "source_name": source_name,
+            "sink": sink,
+            "code_location": code_location,
+        }, sort_keys=True)
+    )
+    extra_sinks = [
+        DomSink(
+            sink=sink,
+            source=f"dom_runtime_taint:{source_type}:{source_name}",
+            location=code_location or f"dom_runtime:{source_type}:{source_name}",
+            confidence=0.99,
+        ),
+        DomSink(
+            sink=f"dom_source:{source_sink}",
+            source=f"dom_runtime_source:{source_name}",
+            location=f"dom_runtime:{source_type}:{source_name}",
+            confidence=0.99,
+        ),
+    ]
+
+    auth_notes = list(getattr(base_context, "auth_notes", []) or [])
+    if auth_headers and not auth_notes:
+        auth_notes.append("Authenticated DOM scan context")
+
+    return dc_replace(
+        base_context,
+        dom_sinks=extra_sinks + list(getattr(base_context, "dom_sinks", []) or []),
+        notes=[dom_note, *list(getattr(base_context, "notes", []) or [])],
+        auth_notes=auth_notes,
+    )
+
+
+def _get_dom_local_payloads(
+    *,
+    context: Any,
+    model: str,
+    waf: str | None,
+    session_lessons: list[Any] | None = None,
+) -> list[str]:
+    """Ask the local model for DOM XSS payloads for one tainted source → sink path."""
+    try:
+        from ai_xss_generator.models import generate_payloads
+        from ai_xss_generator.learning import build_memory_profile
+
+        memory_profile = build_memory_profile(
+            context=context,
+            waf_name=waf,
+            delivery_mode="dom",
+        )
+        payloads, engine, *_ = generate_payloads(
+            context=context,
+            model=model,
+            waf=waf,
+            use_cloud=False,
+            memory_profile=memory_profile,
+            past_lessons=session_lessons,
+        )
+        if engine == "heuristic":
+            return []
+        return [
+            p.payload
+            for p in payloads
+            if p.payload and getattr(p, "source", "heuristic") != "heuristic"
+        ]
+    except Exception as exc:
+        log.debug("DOM local model failed for %s: %s", getattr(context, "source", "?"), exc)
+        return []
+
+
+def _get_dom_cloud_payloads(
+    *,
+    context: Any,
+    cloud_model: str,
+    waf: str | None,
+    ekey: str,
+    dedup_registry: DictProxy,
+    dedup_lock: Any,
+    ai_backend: str = "api",
+    cli_tool: str = "claude",
+    cli_model: str | None = None,
+    session_lessons: list[Any] | None = None,
+) -> list[str]:
+    """Call the cloud model once per unique DOM source → sink fingerprint."""
+    with dedup_lock:
+        if ekey in dedup_registry:
+            log.debug("DOM dedup hit — reusing cloud result for key %s", ekey[:12])
+            return dedup_registry[ekey]
+
+    try:
+        from ai_xss_generator.models import generate_cloud_payloads
+        from ai_xss_generator.learning import build_memory_profile
+
+        memory_profile = build_memory_profile(
+            context=context,
+            waf_name=waf,
+            delivery_mode="dom",
+        )
+        payloads, _ = generate_cloud_payloads(
+            context=context,
+            cloud_model=cloud_model,
+            waf=waf,
+            past_lessons=session_lessons,
+            ai_backend=ai_backend,
+            cli_tool=cli_tool,
+            cli_model=cli_model,
+            memory_profile=memory_profile,
+        )
+        result_strings = [p.payload for p in payloads if p.payload]
+    except Exception as exc:
+        log.debug("DOM cloud model failed for %s: %s", getattr(context, "source", "?"), exc)
+        result_strings = []
+
+    with dedup_lock:
+        dedup_registry[ekey] = result_strings
+    return result_strings
+
+
 # ---------------------------------------------------------------------------
 # DOM XSS worker entry point
 # ---------------------------------------------------------------------------
@@ -582,9 +727,17 @@ def _get_local_payloads(
 def run_dom_worker(
     url: str,
     waf_hint: str | None,
+    model: str,
+    cloud_model: str,
+    use_cloud: bool,
     timeout_seconds: int,
     result_queue: "multiprocessing.Queue",
+    dedup_registry: "DictProxy",
+    dedup_lock: Any,
     auth_headers: dict[str, str] | None = None,
+    ai_backend: str = "api",
+    cli_tool: str = "claude",
+    cli_model: str | None = None,
 ) -> None:
     """Worker entry point for DOM XSS runtime scanning.
 
@@ -602,9 +755,17 @@ def run_dom_worker(
         _run_dom(
             url=url,
             waf_hint=waf_hint,
+            model=model,
+            cloud_model=cloud_model,
+            use_cloud=use_cloud,
             timeout_seconds=timeout_seconds,
             put_result=_put_result,
+            dedup_registry=dedup_registry,
+            dedup_lock=dedup_lock,
             auth_headers=auth_headers,
+            ai_backend=ai_backend,
+            cli_tool=cli_tool,
+            cli_model=cli_model,
         )
     except Exception as exc:
         log.exception("DOM worker crashed for %s", url)
@@ -615,15 +776,58 @@ def _run_dom(
     *,
     url: str,
     waf_hint: str | None,
+    model: str,
+    cloud_model: str,
+    use_cloud: bool,
     timeout_seconds: int,
     put_result: Any,
+    dedup_registry: "DictProxy",
+    dedup_lock: Any,
     auth_headers: dict[str, str] | None = None,
+    ai_backend: str = "api",
+    cli_tool: str = "claude",
+    cli_model: str | None = None,
 ) -> None:
     from playwright.sync_api import sync_playwright
-    from ai_xss_generator.active.dom_xss import scan_dom_xss
+    from ai_xss_generator.active.dom_xss import (
+        attempt_dom_payloads,
+        discover_dom_taint_paths,
+        fallback_payloads_for_sink,
+    )
+    from ai_xss_generator.parser import parse_target as _parse_target
 
     # Cap per-navigation timeout to 15 s regardless of the overall worker timeout
     nav_timeout_ms = min(timeout_seconds * 1_000, 15_000)
+    _cached_context: Any = None
+    try:
+        _cached_context = _parse_target(
+            url=url,
+            html_value=None,
+            waf=waf_hint,
+            auth_headers=auth_headers,
+        )
+    except Exception as exc:
+        log.debug("Pre-parse of DOM target %s failed: %s", url, exc)
+
+    dom_session_lessons: list[Any] = []
+    try:
+        from ai_xss_generator.learning import build_memory_profile
+        from ai_xss_generator.lessons import build_mapping_lessons
+
+        memory_profile = build_memory_profile(
+            context=_cached_context,
+            waf_name=waf_hint,
+            delivery_mode="dom",
+        )
+        if auth_headers:
+            memory_profile["auth_required"] = True
+        if _cached_context is not None:
+            dom_session_lessons.extend(build_mapping_lessons(
+                _cached_context,
+                memory_profile=memory_profile,
+            ))
+    except Exception as exc:
+        log.debug("DOM lesson build failed for %s: %s", url, exc)
 
     try:
         pw = sync_playwright().start()
@@ -632,7 +836,7 @@ def _run_dom(
             args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
         )
         try:
-            dom_results = scan_dom_xss(url, browser, auth_headers, timeout_ms=nav_timeout_ms)
+            dom_hits = discover_dom_taint_paths(url, browser, auth_headers, timeout_ms=nav_timeout_ms)
         finally:
             browser.close()
             pw.stop()
@@ -643,29 +847,151 @@ def _run_dom(
         return
 
     findings: list[ConfirmedFinding] = []
-    for dr in dom_results:
-        findings.append(
-            ConfirmedFinding(
-                url=url,
-                param_name=dr.source_name,
-                context_type="dom_xss",
-                sink_context=dr.sink,
-                payload=dr.payload_fired or "",
-                transform_name="dom_xss_runtime",
-                # "dom_xss" = JS execution confirmed; "dom_taint" = taint proven but
-                # real payload blocked (CSP etc.) — still a high-confidence finding.
-                execution_method="dom_xss" if dr.confirmed_execution else "dom_taint",
-                execution_detail=dr.detail,
-                waf=waf_hint,
-                surviving_chars="",
-                fired_url=dr.fired_url,
-                source="dom_xss_runtime",
-                cloud_escalated=False,
-                code_location=dr.code_location,
-            )
-        )
+    cloud_escalated = False
 
-    if any(dr.confirmed_execution for dr in dom_results):
+    try:
+        pw = sync_playwright().start()
+        browser = pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+        )
+        try:
+            for hit in dom_hits:
+                dom_context = _build_dom_context(
+                    base_context=_cached_context,
+                    url=url,
+                    source_type=hit.source_type,
+                    source_name=hit.source_name,
+                    sink=hit.sink,
+                    code_location=hit.code_location,
+                    auth_headers=auth_headers,
+                )
+                confirmed = False
+                fired_payload = ""
+                fired_url = hit.canary_url
+                detail = (
+                    f"DOM taint confirmed — canary reached sink '{hit.sink}' via "
+                    f"{hit.source_type}:{hit.source_name!r}. "
+                    f"Real payload did not execute (possible CSP or payload mismatch)."
+                )
+                source = "dom_xss_runtime"
+                transform_name = "dom_xss_runtime"
+                cloud_used_for_hit = False
+
+                local_payloads = _get_dom_local_payloads(
+                    context=dom_context,
+                    model=model,
+                    waf=waf_hint,
+                    session_lessons=dom_session_lessons,
+                )
+                if local_payloads:
+                    exec_ok, exec_payload, exec_detail = attempt_dom_payloads(
+                        browser=browser,
+                        url=url,
+                        source_type=hit.source_type,
+                        source_name=hit.source_name,
+                        sink=hit.sink,
+                        payloads=local_payloads,
+                        auth_headers=auth_headers or {},
+                        timeout_ms=nav_timeout_ms,
+                    )
+                    if exec_ok:
+                        confirmed = True
+                        fired_payload = exec_payload
+                        fired_url = _inject_dom_source(url, hit.source_type, hit.source_name, exec_payload)
+                        detail = exec_detail
+                        source = "local_model"
+                        transform_name = "local_model"
+
+                if not confirmed and use_cloud:
+                    ekey = _escalation_key(
+                        url=url,
+                        param_name=hit.source_name,
+                        waf=waf_hint,
+                        surviving_chars=frozenset(),
+                        context_type=f"dom:{hit.source_type}:{hit.sink}",
+                    )
+                    cloud_payloads = _get_dom_cloud_payloads(
+                        context=dom_context,
+                        cloud_model=cloud_model,
+                        waf=waf_hint,
+                        ekey=ekey,
+                        dedup_registry=dedup_registry,
+                        dedup_lock=dedup_lock,
+                        ai_backend=ai_backend,
+                        cli_tool=cli_tool,
+                        cli_model=cli_model,
+                        session_lessons=dom_session_lessons,
+                    )
+                    if cloud_payloads:
+                        cloud_escalated = True
+                        cloud_used_for_hit = True
+                        exec_ok, exec_payload, exec_detail = attempt_dom_payloads(
+                            browser=browser,
+                            url=url,
+                            source_type=hit.source_type,
+                            source_name=hit.source_name,
+                            sink=hit.sink,
+                            payloads=cloud_payloads,
+                            auth_headers=auth_headers or {},
+                            timeout_ms=nav_timeout_ms,
+                        )
+                        if exec_ok:
+                            confirmed = True
+                            fired_payload = exec_payload
+                            fired_url = _inject_dom_source(url, hit.source_type, hit.source_name, exec_payload)
+                            detail = exec_detail
+                            source = "cloud_model"
+                            transform_name = "cloud_model"
+
+                if not confirmed:
+                    fallback_payloads = fallback_payloads_for_sink(hit.sink)
+                    exec_ok, exec_payload, exec_detail = attempt_dom_payloads(
+                        browser=browser,
+                        url=url,
+                        source_type=hit.source_type,
+                        source_name=hit.source_name,
+                        sink=hit.sink,
+                        payloads=fallback_payloads,
+                        auth_headers=auth_headers or {},
+                        timeout_ms=nav_timeout_ms,
+                    )
+                    if exec_ok:
+                        confirmed = True
+                        fired_payload = exec_payload
+                        fired_url = _inject_dom_source(url, hit.source_type, hit.source_name, exec_payload)
+                        detail = exec_detail
+                        source = "phase1_transform"
+                        transform_name = "dom_static_fallback"
+
+                findings.append(
+                    ConfirmedFinding(
+                        url=url,
+                        param_name=hit.source_name,
+                        context_type="dom_xss",
+                        sink_context=hit.sink,
+                        payload=fired_payload,
+                        transform_name=transform_name,
+                        execution_method="dom_xss" if confirmed else "dom_taint",
+                        execution_detail=detail,
+                        waf=waf_hint,
+                        surviving_chars="",
+                        fired_url=fired_url,
+                        source=source,
+                        cloud_escalated=cloud_used_for_hit,
+                        code_location=hit.code_location,
+                    )
+                )
+        finally:
+            browser.close()
+            pw.stop()
+    except Exception as exc:
+        put_result(WorkerResult(
+            url=url, status="error", error=f"DOM XSS payload execution failed: {exc}", kind="dom",
+        ))
+        return
+
+    if any(f.execution_method == "dom_xss" for f in findings):
         status = "confirmed"
     elif findings:
         status = "taint_only"
@@ -676,6 +1002,7 @@ def _run_dom(
         status=status,
         confirmed_findings=findings,
         waf=waf_hint,
+        cloud_escalated=cloud_escalated,
         kind="dom",
     ))
 

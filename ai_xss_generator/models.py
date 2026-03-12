@@ -80,6 +80,25 @@ def _extract_probe_context(context: ParsedContext) -> tuple[str, str, str]:
     return sink_type, context_type, surviving_chars
 
 
+def _extract_dom_runtime_context(context: ParsedContext) -> dict[str, str]:
+    """Return DOM runtime taint metadata embedded in context.notes, if present."""
+    prefix = "[dom:TAINT] "
+    for note in context.notes:
+        if not note.startswith(prefix):
+            continue
+        try:
+            payload = json.loads(note[len(prefix):])
+        except Exception:
+            continue
+        return {
+            "source_type": str(payload.get("source_type", "")),
+            "source_name": str(payload.get("source_name", "")),
+            "sink": str(payload.get("sink", "")),
+            "code_location": str(payload.get("code_location", "")),
+        }
+    return {}
+
+
 # ---------------------------------------------------------------------------
 # Prompt construction
 # ---------------------------------------------------------------------------
@@ -102,6 +121,7 @@ def _prompt_for_context(
       6. Output schema + requirements
     """
     sink_type, ctx_type, surviving_chars = _extract_probe_context(context)
+    dom_runtime = _extract_dom_runtime_context(context)
 
     # ── Section 1: Active probe summary ──────────────────────────────────────
     probe_section = ""
@@ -119,6 +139,17 @@ def _prompt_for_context(
             f"  reflection_context: {ctx_type or 'unknown'}\n"
             f"  surviving_chars: {surviving_display}\n"
             f"  {blocked_note}\n"
+        )
+
+    dom_section = ""
+    if dom_runtime:
+        dom_section = (
+            "DOM RUNTIME TAINT (highest priority for DOM scanning):\n"
+            f"  source_type: {dom_runtime.get('source_type') or 'unknown'}\n"
+            f"  source_name: {dom_runtime.get('source_name') or 'unknown'}\n"
+            f"  sink: {dom_runtime.get('sink') or sink_type or 'unknown'}\n"
+            f"  code_location: {dom_runtime.get('code_location') or 'unknown'}\n"
+            "  The canary already reached this sink at runtime. Generate payloads for this exact source→sink pair.\n"
         )
 
     # ── Section 2: Past findings (few-shot examples) ─────────────────────────
@@ -198,7 +229,7 @@ Requirements:
 - Include payloads from multiple bypass families that are plausible for this context.
 - Prefer compact, self-contained payloads with no external dependencies.
 
-{probe_section}{lessons_section}{findings_section}{auth_section}{waf_section}{reference_section}Full parsed context:
+{probe_section}{dom_section}{lessons_section}{findings_section}{auth_section}{waf_section}{reference_section}Full parsed context:
 {context_blob}""".strip()
 
 

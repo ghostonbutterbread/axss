@@ -6,9 +6,10 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from ai_xss_generator.active.transforms import TransformVariant
-from ai_xss_generator.active.worker import WorkerResult, _run, _run_post
+from ai_xss_generator.active.dom_xss import DomTaintHit
+from ai_xss_generator.active.worker import WorkerResult, _run, _run_dom, _run_post
 from ai_xss_generator.probe import ProbeResult, ReflectionContext
-from ai_xss_generator.types import PostFormTarget
+from ai_xss_generator.types import ParsedContext, PostFormTarget
 
 
 def _fake_context(source: str) -> SimpleNamespace:
@@ -19,6 +20,10 @@ def _fake_context(source: str) -> SimpleNamespace:
         dom_sinks=[],
         auth_notes=[],
     )
+
+
+def _fake_parsed_context(source: str) -> ParsedContext:
+    return ParsedContext(source=source, source_type="url")
 
 
 class _FakeFetcherSession:
@@ -204,6 +209,167 @@ def test_get_worker_uses_deterministic_fallback_only_after_local_and_cloud_fail(
     assert actions == ["local:html_body", "cloud:html_body", "fire:raw"]
     assert results and results[0].status == "confirmed"
     assert results[0].confirmed_findings[0].source == "phase1_transform"
+
+
+class _FakeBrowser:
+    def close(self) -> None:
+        pass
+
+
+class _FakeChromium:
+    def launch(self, **kwargs):
+        return _FakeBrowser()
+
+
+class _FakePlaywright:
+    chromium = _FakeChromium()
+
+    def start(self):
+        return self
+
+    def stop(self) -> None:
+        pass
+
+
+def test_dom_worker_runs_local_model_per_taint_path_before_any_fallback():
+    url = "https://example.test/#start"
+    dom_hits = [
+        DomTaintHit(
+            url=url,
+            source_type="query_param",
+            source_name="q",
+            sink="innerHTML",
+            canary="axss1",
+            canary_url="https://example.test/?q=axss1",
+            code_location="innerHTML stack",
+        ),
+        DomTaintHit(
+            url=url,
+            source_type="fragment",
+            source_name="hash",
+            sink="eval",
+            canary="axss2",
+            canary_url="https://example.test/#axss2",
+            code_location="eval stack",
+        ),
+    ]
+
+    local_calls: list[tuple[str, str, str]] = []
+    fire_calls: list[tuple[str, str]] = []
+    results: list[WorkerResult] = []
+
+    def _local_payloads(**kwargs):
+        note = kwargs["context"].notes[0]
+        if '"sink": "innerHTML"' in note:
+            local_calls.append(("query_param", "q", "innerHTML"))
+            return ["ai-inner"]
+        if '"sink": "eval"' in note:
+            local_calls.append(("fragment", "hash", "eval"))
+            return ["ai-eval"]
+        return []
+
+    def _attempt_payloads(**kwargs):
+        payload = kwargs["payloads"][0]
+        fire_calls.append((kwargs["sink"], payload))
+        return True, payload, f"executed:{kwargs['sink']}"
+
+    with (
+        patch("playwright.sync_api.sync_playwright", return_value=_FakePlaywright()),
+        patch("ai_xss_generator.parser.parse_target", return_value=_fake_parsed_context(url)),
+        patch("ai_xss_generator.learning.build_memory_profile", return_value={}),
+        patch("ai_xss_generator.lessons.build_mapping_lessons", return_value=[]),
+        patch("ai_xss_generator.active.dom_xss.discover_dom_taint_paths", return_value=dom_hits),
+        patch("ai_xss_generator.active.dom_xss.attempt_dom_payloads", side_effect=_attempt_payloads),
+        patch("ai_xss_generator.active.dom_xss.fallback_payloads_for_sink", side_effect=AssertionError("fallback should not run")),
+        patch("ai_xss_generator.active.worker._get_dom_local_payloads", side_effect=_local_payloads),
+        patch("ai_xss_generator.active.worker._get_dom_cloud_payloads", side_effect=AssertionError("cloud should not run")),
+    ):
+        _run_dom(
+            url=url,
+            waf_hint=None,
+            model="qwen3.5",
+            cloud_model="anthropic/claude-3-5-sonnet",
+            use_cloud=True,
+            timeout_seconds=30,
+            put_result=results.append,
+            dedup_registry={},
+            dedup_lock=threading.Lock(),
+            auth_headers=None,
+            ai_backend="api",
+            cli_tool="claude",
+            cli_model=None,
+        )
+
+    assert local_calls == [("query_param", "q", "innerHTML"), ("fragment", "hash", "eval")]
+    assert fire_calls == [("innerHTML", "ai-inner"), ("eval", "ai-eval")]
+    assert results and results[0].status == "confirmed"
+    assert [f.source for f in results[0].confirmed_findings] == ["local_model", "local_model"]
+
+
+def test_dom_worker_uses_static_fallback_only_after_local_and_cloud_fail():
+    url = "https://example.test/#start"
+    dom_hits = [
+        DomTaintHit(
+            url=url,
+            source_type="query_param",
+            source_name="q",
+            sink="innerHTML",
+            canary="axss1",
+            canary_url="https://example.test/?q=axss1",
+            code_location="innerHTML stack",
+        ),
+    ]
+
+    actions: list[str] = []
+    results: list[WorkerResult] = []
+
+    def _local_payloads(**kwargs):
+        actions.append("local:innerHTML")
+        return []
+
+    def _cloud_payloads(**kwargs):
+        actions.append("cloud:innerHTML")
+        return []
+
+    def _fallback_payloads(sink: str):
+        actions.append(f"fallback:{sink}")
+        return ["fallback-inner"]
+
+    def _attempt_payloads(**kwargs):
+        actions.append(f"fire:{kwargs['payloads'][0]}")
+        return True, kwargs["payloads"][0], "executed:fallback"
+
+    with (
+        patch("playwright.sync_api.sync_playwright", return_value=_FakePlaywright()),
+        patch("ai_xss_generator.parser.parse_target", return_value=_fake_parsed_context(url)),
+        patch("ai_xss_generator.learning.build_memory_profile", return_value={}),
+        patch("ai_xss_generator.lessons.build_mapping_lessons", return_value=[]),
+        patch("ai_xss_generator.active.dom_xss.discover_dom_taint_paths", return_value=dom_hits),
+        patch("ai_xss_generator.active.dom_xss.attempt_dom_payloads", side_effect=_attempt_payloads),
+        patch("ai_xss_generator.active.dom_xss.fallback_payloads_for_sink", side_effect=_fallback_payloads),
+        patch("ai_xss_generator.active.worker._get_dom_local_payloads", side_effect=_local_payloads),
+        patch("ai_xss_generator.active.worker._get_dom_cloud_payloads", side_effect=_cloud_payloads),
+    ):
+        _run_dom(
+            url=url,
+            waf_hint=None,
+            model="qwen3.5",
+            cloud_model="anthropic/claude-3-5-sonnet",
+            use_cloud=True,
+            timeout_seconds=30,
+            put_result=results.append,
+            dedup_registry={},
+            dedup_lock=threading.Lock(),
+            auth_headers=None,
+            ai_backend="api",
+            cli_tool="claude",
+            cli_model=None,
+        )
+
+    assert actions == ["local:innerHTML", "cloud:innerHTML", "fallback:innerHTML", "fire:fallback-inner"]
+    assert results and results[0].status == "confirmed"
+    assert results[0].confirmed_findings[0].source == "phase1_transform"
+    assert results[0].confirmed_findings[0].transform_name == "dom_static_fallback"
 
 
 def test_post_worker_runs_local_model_per_context_before_any_fallback():

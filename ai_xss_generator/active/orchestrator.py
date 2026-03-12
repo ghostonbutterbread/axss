@@ -344,9 +344,15 @@ def run_active_scan(
                             kwargs={
                                 "url": next_url,
                                 "waf_hint": config.waf,
+                                "model": config.model,
+                                "cloud_model": config.cloud_model,
+                                "use_cloud": config.use_cloud,
                                 "timeout_seconds": config.timeout_seconds,
                                 "result_queue": result_queue,
+                                "dedup_registry": dedup_registry,
+                                "dedup_lock": dedup_lock,
                                 "auth_headers": config.auth_headers,
+                                **_cli_kwargs,
                             },
                             daemon=True,
                         )
