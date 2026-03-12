@@ -34,11 +34,20 @@ _ACTIVE_CLOUD_GRACE_SECONDS = 60
 _DOM_CLOUD_START_AFTER_SECONDS = 30
 
 
-def active_worker_timeout_budget(timeout_seconds: int, use_cloud: bool) -> int:
+def active_worker_timeout_budget(
+    timeout_seconds: int,
+    use_cloud: bool,
+    ai_backend: str = "api",
+) -> int:
     """Return the effective per-worker budget for staged local+cloud execution."""
     minimum = _ACTIVE_LOCAL_MODEL_TIMEOUT_SECONDS
     if use_cloud:
-        minimum += _ACTIVE_CLOUD_GRACE_SECONDS
+        cloud_grace = _ACTIVE_CLOUD_GRACE_SECONDS
+        if ai_backend == "cli":
+            # CLI cloud failover may spend one timeout on the primary tool and
+            # a second timeout on the alternate tool before falling back.
+            cloud_grace *= 2
+        minimum += cloud_grace
     return max(timeout_seconds, minimum)
 
 
@@ -233,7 +242,7 @@ def _run(
     cli_tool: str = "claude",
     cli_model: str | None = None,
 ) -> None:
-    deadline = start_time + active_worker_timeout_budget(timeout_seconds, use_cloud)
+    deadline = start_time + active_worker_timeout_budget(timeout_seconds, use_cloud, ai_backend)
     local_model_timeout_seconds = _ACTIVE_LOCAL_MODEL_TIMEOUT_SECONDS
 
     def _timed_out() -> bool:
@@ -674,6 +683,20 @@ def _coerce_cloud_plan(value: Any) -> CloudPayloadPlan:
     return CloudPayloadPlan()
 
 
+def _dom_hit_priority(hit: Any) -> tuple[int, str, str]:
+    """Prefer client-only DOM sources before server-visible URL params."""
+    source_rank = {
+        "fragment": 0,
+        "hash": 0,
+        "query_param": 1,
+    }
+    return (
+        source_rank.get(str(getattr(hit, "source_type", "")), 5),
+        str(getattr(hit, "sink", "")),
+        str(getattr(hit, "source_name", "")),
+    )
+
+
 def _build_dom_context(
     *,
     base_context: Any,
@@ -906,7 +929,7 @@ def _run_dom(
     from ai_xss_generator.parser import parse_target as _parse_target
 
     started_at = time.monotonic()
-    deadline = started_at + active_worker_timeout_budget(timeout_seconds, use_cloud)
+    deadline = started_at + active_worker_timeout_budget(timeout_seconds, use_cloud, ai_backend)
 
     def _timed_out() -> bool:
         return time.monotonic() > deadline
@@ -953,6 +976,7 @@ def _run_dom(
         )
         try:
             dom_hits = discover_dom_taint_paths(url, browser, auth_headers, timeout_ms=nav_timeout_ms)
+            dom_hits = sorted(dom_hits, key=_dom_hit_priority)
         finally:
             browser.close()
             pw.stop()
@@ -1329,7 +1353,7 @@ def _run_post(
     from ai_xss_generator.active.transforms import all_variants_for_probe
     from ai_xss_generator.parser import parse_target as _parse_target
 
-    deadline = start_time + active_worker_timeout_budget(timeout_seconds, use_cloud)
+    deadline = start_time + active_worker_timeout_budget(timeout_seconds, use_cloud, ai_backend)
     local_model_timeout_seconds = _ACTIVE_LOCAL_MODEL_TIMEOUT_SECONDS
 
     def _timed_out() -> bool:

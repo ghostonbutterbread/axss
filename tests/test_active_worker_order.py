@@ -7,7 +7,14 @@ from unittest.mock import patch
 
 from ai_xss_generator.active.transforms import TransformVariant
 from ai_xss_generator.active.dom_xss import DomTaintHit
-from ai_xss_generator.active.worker import WorkerResult, _run, _run_dom, _run_post
+from ai_xss_generator.active.worker import (
+    WorkerResult,
+    _dom_hit_priority,
+    _run,
+    _run_dom,
+    _run_post,
+    active_worker_timeout_budget,
+)
 from ai_xss_generator.probe import ProbeResult, ReflectionContext
 from ai_xss_generator.types import ParsedContext, PostFormTarget
 
@@ -300,8 +307,8 @@ def test_dom_worker_runs_local_model_per_taint_path_before_any_fallback():
             cli_model=None,
         )
 
-    assert local_calls == [("query_param", "q", "innerHTML"), ("fragment", "hash", "eval")]
-    assert fire_calls == [("innerHTML", "ai-inner"), ("eval", "ai-eval")]
+    assert local_calls == [("fragment", "hash", "eval"), ("query_param", "q", "innerHTML")]
+    assert fire_calls == [("eval", "ai-eval"), ("innerHTML", "ai-inner")]
     assert results and results[0].status == "confirmed"
     assert [f.source for f in results[0].confirmed_findings] == ["local_model", "local_model"]
 
@@ -616,3 +623,33 @@ def test_post_worker_uses_deterministic_fallback_only_after_local_and_cloud_fail
     assert actions == ["local:html_body", "cloud:html_body", "fire:raw"]
     assert results and results[0].status == "confirmed"
     assert results[0].confirmed_findings[0].source == "phase1_transform"
+
+
+def test_cli_backend_gets_extended_worker_budget() -> None:
+    assert active_worker_timeout_budget(45, True, "api") == 120
+    assert active_worker_timeout_budget(45, True, "cli") == 180
+
+
+def test_dom_hit_priority_prefers_fragment_before_query_param() -> None:
+    hash_hit = DomTaintHit(
+        url="https://example.test/#x",
+        source_type="fragment",
+        source_name="hash",
+        sink="document.write",
+        canary="axss1",
+        canary_url="https://example.test/#axss1",
+        code_location="stack",
+    )
+    query_hit = DomTaintHit(
+        url="https://example.test/?q=x",
+        source_type="query_param",
+        source_name="q",
+        sink="document.write",
+        canary="axss2",
+        canary_url="https://example.test/?q=axss2",
+        code_location="stack",
+    )
+
+    ordered = sorted([query_hit, hash_hit], key=_dom_hit_priority)
+
+    assert ordered == [hash_hit, query_hit]

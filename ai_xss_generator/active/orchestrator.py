@@ -264,7 +264,11 @@ def run_active_scan(
         now = time.monotonic()
         for proc, plabel, pkind, started_at, result_url in active_procs:
             elapsed = now - started_at
-            worker_budget = active_worker_timeout_budget(config.timeout_seconds, config.use_cloud)
+            worker_budget = active_worker_timeout_budget(
+                config.timeout_seconds,
+                config.use_cloud,
+                config.ai_backend,
+            )
             if proc.is_alive() and elapsed > worker_budget:
                 warn(f"[worker] timeout after {worker_budget}s → {plabel}")
                 proc.kill()
@@ -420,7 +424,11 @@ def run_active_scan(
         signal.signal(signal.SIGINT, _original_sigint)
         teardown_panel()
         # Final drain after all processes finish
-        final_join_timeout = active_worker_timeout_budget(config.timeout_seconds, config.use_cloud) + 5
+        final_join_timeout = active_worker_timeout_budget(
+            config.timeout_seconds,
+            config.use_cloud,
+            config.ai_backend,
+        ) + 5
         for proc, _, _, _, _ in active_procs:
             proc.join(timeout=final_join_timeout)
         _drain_queue()
