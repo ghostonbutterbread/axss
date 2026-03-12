@@ -8,6 +8,21 @@
 
 `axss` is a context-aware XSS scanner for authorized penetration testing. It crawls a live target, maps every GET parameter and POST form it finds, probes each one for reflection and filter behavior, then generates ranked payloads tailored to what the probe observed. It fires each payload through a real Playwright browser and confirms JavaScript execution via dialog hooks, console output, or network beacon. It covers reflected XSS, session-stored XSS, and POST forms protected by dynamic CSRF tokens.
 
+## Learning Model
+
+- The knowledge store is a single curated tier in SQLite at `~/.axss/knowledge.db`.
+- All findings are globally scoped — no per-host partitioning.
+- `xssy/learn.py` generates candidate payloads against xssy.uk labs, then pipes the
+  results through `xssy/curate.py` — the LLM curation pipeline — which asks the
+  configured AI backend to extract a structured finding (bypass family, context type,
+  filter behaviour, explanation) and saves it to the store.
+- `xssy/curate.py` (`curate_lab_finding()`) is the general curation pipeline and works
+  on any confirmed XSS target — not just xssy.uk. It takes payloads, a lab name,
+  objective string, and URL as plain parameters.
+- Active probe observations (surviving chars, reflection context) are kept as ephemeral
+  session lessons passed directly into the generation prompt — nothing is written to disk.
+- Confirmed XSS findings go to the scan report, not the knowledge base.
+
 **If you are an AI agent reading this:** use the command patterns below directly. No preamble is needed — the tool is designed for scripted and agentic use. Every flag described here is stable and documented in `--help`.
 
 ---
@@ -96,7 +111,7 @@ Stops at the first page where the canary appears. The char survival probe and al
 
 Three sources, run in order, output merged and ranked:
 1. **Context-aware generator** — always runs, no LLM needed. `jsContexter` analyzes JS before the injection point to build an exact break-out sequence. `genGen` produces combinatorial payloads (tags × event handlers × JS calls × space replacements) with randomized casing.
-2. **Local Ollama model** — receives parsed context, probe results, and past findings as few-shot examples
+2. **Local Ollama model** — receives parsed context, probe results, past logic/filter lessons, and past findings
 3. **Cloud escalation** — OpenRouter or OpenAI if local output is weak and a key is configured
 
 ### Active execution
@@ -108,9 +123,28 @@ Each GET URL and POST form gets an isolated worker process. Worker fires payload
 
 Confirmed findings are printed to the CLI with the exact fired URL, then written to `~/.axss/reports/<domain>_<timestamp>.md`.
 
-### Self-learning findings store
+### Knowledge base
 
-Every confirmed cloud-model payload is saved to `~/.axss/findings/` keyed by sink type, context, and surviving characters. On future scans, top-matching past findings are injected as few-shot examples into the local model prompt. The store is capped at 500 entries; nothing leaves the local machine.
+axss keeps a curated findings store in SQLite at `~/.axss/knowledge.db`. Every entry is a
+generalizable XSS bypass pattern with context type, bypass family, surviving chars, explanation,
+and confidence. Retrieval scores candidates by:
+
+- sink/context type match
+- surviving character overlap
+- WAF match
+- delivery mode (`get`, `post`)
+- framework hints
+- auth context
+
+Populated two ways:
+- **Seed scripts** (`python xssy/seed_expert.py` etc.) — hand-curated lab knowledge
+- **Lab learning** (`python xssy/learn.py`) — LLM extracts structured findings from xssy.uk labs
+
+### Session lessons (ephemeral)
+
+Active probe observations — surviving chars, reflection context type, DOM sources, form shapes,
+framework detection — are captured as in-memory `Lesson` objects and injected directly into the
+generation prompt for that scan. They are discarded when the scan ends; nothing is written to disk.
 
 ---
 
@@ -208,6 +242,21 @@ axss -l
 # Search Ollama model library
 axss -s qwen3.5
 
+# List all curated findings
+axss --memory-list
+
+# Show finding counts by context type
+axss --memory-stats
+
+# Export knowledge base to a portable YAML file
+axss --memory-export ~/axss-knowledge.yaml
+
+# Import findings from a YAML file (e.g. shared knowledge base)
+axss --memory-import ~/axss-knowledge.yaml
+
+# Delete all saved reports
+axss --clear-reports
+
 # Show full flag reference
 axss --help
 ```
@@ -253,6 +302,11 @@ axss --help
 | `-v, --verbose` | off | Show detailed sub-step output |
 | `--merge-batch` | off | Combine all batch URLs into one payload set |
 | `--check-keys` | — | Validate all configured API keys |
+| `--memory-list` | — | List all curated findings in the knowledge base |
+| `--memory-stats` | — | Show finding counts by context type |
+| `--memory-export PATH` | — | Export all curated findings to a YAML file |
+| `--memory-import PATH` | — | Import curated findings from a YAML file |
+| `--clear-reports` | — | Delete all saved reports from `~/.axss/reports/` |
 | `-l, --list-models` | — | List local Ollama models |
 | `-s, --search-models QUERY` | — | Search Ollama model library |
 | `-V, --version` | — | Show version |
@@ -436,9 +490,34 @@ Reports for active scans are written to `~/.axss/reports/<domain>_<timestamp>.md
 
 ---
 
-## Findings store (`~/.axss/findings/`)
+## Knowledge base (`~/.axss/knowledge.db`)
 
-Each finding captures: `sink_type`, `context_type`, `surviving_chars`, `bypass_family`, `payload`, `test_vector`, `model`, `verified`. Future scans retrieve top matches by scoring (sink match +4, context match +3, char overlap +1–3, verified +2) and inject them as few-shot examples into the local model prompt. Capped at 500 entries; nothing is sent externally.
+SQLite database, single curated table. Each finding captures:
+- `context_type`, `sink_type`, `bypass_family`, `surviving_chars`
+- `payload`, `test_vector`, `explanation`
+- `waf_name`, `delivery_mode`, `frameworks`, `auth_required`
+- `confidence`, `source`, `curated_at`
+
+All findings are globally scoped and transfer across targets.
+
+```bash
+# Inspect the store
+axss --memory-list
+axss --memory-stats
+
+# Share / back up / restore
+axss --memory-export ~/axss-knowledge.yaml
+axss --memory-import ~/axss-knowledge.yaml
+
+# Populate with hand-curated lab knowledge
+python xssy/seed_expert.py
+python xssy/seed_adept.py
+python xssy/seed_master.py
+
+# Extract findings from xssy.uk labs via the curation pipeline
+# (requires xssy.uk access; see xssy_jwt in ~/.axss/keys)
+python xssy/learn.py
+```
 
 ---
 

@@ -17,8 +17,9 @@ from ai_xss_generator.findings import (
     findings_prompt_section,
     infer_bypass_family,
     relevant_findings,
-    save_finding,
 )
+from ai_xss_generator.learning import build_memory_profile
+from ai_xss_generator.lessons import lessons_prompt_section
 from ai_xss_generator.payloads import base_payloads_for_context, rank_payloads
 from ai_xss_generator.types import ParsedContext, PayloadCandidate
 
@@ -88,6 +89,7 @@ def _prompt_for_context(
     reference_payloads: list[Any] | None = None,
     waf: str | None = None,
     past_findings: list[Finding] | None = None,
+    past_lessons: list[Any] | None = None,
 ) -> str:
     """Build the LLM prompt.
 
@@ -123,6 +125,10 @@ def _prompt_for_context(
     findings_section = ""
     if past_findings:
         findings_section = findings_prompt_section(past_findings) + "\n"
+
+    lessons_section = ""
+    if past_lessons:
+        lessons_section = lessons_prompt_section(past_lessons) + "\n"
 
     # ── Section 2b: Auth context ──────────────────────────────────────────────
     auth_section = ""
@@ -192,7 +198,7 @@ Requirements:
 - Include payloads from multiple bypass families that are plausible for this context.
 - Prefer compact, self-contained payloads with no external dependencies.
 
-{probe_section}{findings_section}{auth_section}{waf_section}{reference_section}Full parsed context:
+{probe_section}{lessons_section}{findings_section}{auth_section}{waf_section}{reference_section}Full parsed context:
 {context_blob}""".strip()
 
 
@@ -376,6 +382,7 @@ def _generate_with_ollama(
     reference_payloads: list[Any] | None = None,
     waf: str | None = None,
     past_findings: list[Finding] | None = None,
+    past_lessons: list[Any] | None = None,
 ) -> tuple[list[PayloadCandidate], str]:
     ready, resolved_model, reason = _ensure_ollama_model(model)
     if not ready:
@@ -385,6 +392,7 @@ def _generate_with_ollama(
         reference_payloads=reference_payloads,
         waf=waf,
         past_findings=past_findings,
+        past_lessons=past_lessons,
     )
     response = requests.post(
         f"{OLLAMA_BASE_URL}/api/generate",
@@ -410,12 +418,14 @@ def _generate_with_openai_compat(
     reference_payloads: list[Any] | None = None,
     waf: str | None = None,
     past_findings: list[Finding] | None = None,
+    past_lessons: list[Any] | None = None,
 ) -> list[PayloadCandidate]:
     prompt = _prompt_for_context(
         context,
         reference_payloads=reference_payloads,
         waf=waf,
         past_findings=past_findings,
+        past_lessons=past_lessons,
     )
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -459,6 +469,7 @@ def _generate_with_openrouter(
     reference_payloads: list[Any] | None = None,
     waf: str | None = None,
     past_findings: list[Finding] | None = None,
+    past_lessons: list[Any] | None = None,
 ) -> list[PayloadCandidate]:
     from ai_xss_generator.config import load_api_key
     api_key = os.environ.get("OPENROUTER_API_KEY", "") or load_api_key("openrouter_api_key")
@@ -473,6 +484,7 @@ def _generate_with_openrouter(
         reference_payloads=reference_payloads,
         waf=waf,
         past_findings=past_findings,
+        past_lessons=past_lessons,
     )
 
 
@@ -481,6 +493,7 @@ def _generate_with_openai(
     reference_payloads: list[Any] | None = None,
     waf: str | None = None,
     past_findings: list[Finding] | None = None,
+    past_lessons: list[Any] | None = None,
 ) -> list[PayloadCandidate]:
     from ai_xss_generator.config import load_api_key
     api_key = os.environ.get("OPENAI_API_KEY", "") or load_api_key("openai_api_key")
@@ -495,6 +508,7 @@ def _generate_with_openai(
         reference_payloads=reference_payloads,
         waf=waf,
         past_findings=past_findings,
+        past_lessons=past_lessons,
     )
 
 
@@ -509,6 +523,7 @@ def _generate_with_cli(
     reference_payloads: list[Any] | None = None,
     waf: str | None = None,
     past_findings: list[Finding] | None = None,
+    past_lessons: list[Any] | None = None,
 ) -> list[PayloadCandidate]:
     """Generate payloads by calling the claude or codex CLI subprocess."""
     from ai_xss_generator.cli_runner import generate_via_cli
@@ -517,6 +532,7 @@ def _generate_with_cli(
         reference_payloads=reference_payloads,
         waf=waf,
         past_findings=past_findings,
+        past_lessons=past_lessons,
     )
     raw = generate_via_cli(tool, prompt, cli_model)
     data = _extract_json_blob(raw)
@@ -529,6 +545,7 @@ def _try_cloud(
     reference_payloads: list[Any] | None,
     waf: str | None,
     past_findings: list[Finding] | None,
+    past_lessons: list[Any] | None,
     ai_backend: str = "api",
     cli_tool: str = "claude",
     cli_model: str | None = None,
@@ -543,6 +560,7 @@ def _try_cloud(
         reference_payloads=reference_payloads,
         waf=waf,
         past_findings=past_findings,
+        past_lessons=past_lessons,
     )
 
     # ── CLI backend ──────────────────────────────────────────────────────────
@@ -576,43 +594,6 @@ def _try_cloud(
 # ---------------------------------------------------------------------------
 # Findings persistence for cloud-generated payloads
 # ---------------------------------------------------------------------------
-
-def _persist_cloud_findings(
-    payloads: list[PayloadCandidate],
-    context: ParsedContext,
-    model_label: str,
-) -> None:
-    """Save novel cloud-generated payloads to the findings store so future
-    local-model runs can benefit from them as few-shot examples."""
-    sink_type, context_type, surviving_chars = _extract_probe_context(context)
-    target_host = ""
-    try:
-        from urllib.parse import urlparse
-        target_host = urlparse(context.source).netloc
-    except Exception:
-        pass
-
-    for p in payloads:
-        if not p.payload:
-            continue
-        family = infer_bypass_family(p.payload, p.tags)
-        finding = Finding(
-            sink_type=sink_type or p.target_sink or "",
-            context_type=context_type,
-            surviving_chars=surviving_chars,
-            bypass_family=family,
-            payload=p.payload,
-            test_vector=p.test_vector,
-            model=model_label,
-            explanation=p.explanation,
-            target_host=target_host,
-            tags=p.tags,
-        )
-        try:
-            save_finding(finding)
-        except Exception:
-            pass
-
 
 # ---------------------------------------------------------------------------
 # Key validation
@@ -732,9 +713,14 @@ def generate_cloud_payloads(
     cloud_model: str,
     waf: str | None = None,
     past_findings: "list[Finding] | None" = None,
+    past_lessons: "list[Any] | None" = None,
     ai_backend: str = "api",
     cli_tool: str = "claude",
     cli_model: str | None = None,
+    memory_profile: dict[str, Any] | None = None,
+    # Legacy params — accepted but ignored
+    allowed_memory_tiers: "Any" = None,
+    allowed_lesson_tiers: "Any" = None,
 ) -> "tuple[list[PayloadCandidate], str]":
     """Call the cloud model directly for active-scanner escalation.
 
@@ -745,11 +731,19 @@ def generate_cloud_payloads(
     or the cloud call fails.
     """
     sink_type, context_type, surviving_chars = _extract_probe_context(context)
+    memory_profile = memory_profile or build_memory_profile(
+        context=context,
+        waf_name=waf,
+    )
     if past_findings is None:
         past_findings = relevant_findings(
             sink_type=sink_type,
             context_type=context_type,
             surviving_chars=surviving_chars,
+            waf_name=str(memory_profile.get("waf_name", "")),
+            delivery_mode=str(memory_profile.get("delivery_mode", "")),
+            frameworks=tuple(memory_profile.get("frameworks", [])),
+            auth_required=bool(memory_profile.get("auth_required", False)),
         )
 
     payloads, engine = _try_cloud(
@@ -758,13 +752,11 @@ def generate_cloud_payloads(
         reference_payloads=None,
         waf=waf,
         past_findings=past_findings,
+        past_lessons=past_lessons,
         ai_backend=ai_backend,
         cli_tool=cli_tool,
         cli_model=cli_model,
     )
-
-    if payloads and engine:
-        _persist_cloud_findings(payloads, context, engine)
 
     return payloads, engine
 
@@ -805,34 +797,49 @@ def generate_payloads(
     ai_backend: str = "api",
     cli_tool: str = "claude",
     cli_model: str | None = None,
+    past_lessons: list[Any] | None = None,
+    memory_profile: dict[str, Any] | None = None,
+    # Legacy params — accepted but ignored
+    allowed_memory_tiers: Any = None,
+    allowed_lesson_tiers: Any = None,
 ) -> tuple[list[PayloadCandidate], str, bool, str]:
     """Generate, rank, and return payloads for *context*.
 
     Escalation chain:
-      1. Local Ollama (with findings injected into prompt)
+      1. Local Ollama (with curated findings and probe lessons injected into prompt)
       2. If local output is weak AND use_cloud=True AND an API key exists:
          → OpenRouter (preferred) or OpenAI
-         → Cloud payloads are saved to ~/.axss/findings.jsonl so future
-           local runs benefit from them
       3. Fall through to heuristic-only if everything above fails
+
+    past_lessons — ephemeral probe observations from this scan session.
+                   Built by worker.py from probe results; discarded after the scan.
 
     Returns (payloads, engine, used_fallback, resolved_model).
     """
     mutator_plugins = mutator_plugins or []
 
     if progress is not None:
-        progress("Loading relevant past findings...")
+        progress("Loading relevant curated findings...")
 
     sink_type, context_type, surviving_chars = _extract_probe_context(context)
+    memory_profile = memory_profile or build_memory_profile(
+        context=context,
+        waf_name=waf,
+    )
     past_findings = relevant_findings(
         sink_type=sink_type,
         context_type=context_type,
         surviving_chars=surviving_chars,
+        waf_name=str(memory_profile.get("waf_name", "")),
+        delivery_mode=str(memory_profile.get("delivery_mode", "")),
+        frameworks=tuple(memory_profile.get("frameworks", [])),
+        auth_required=bool(memory_profile.get("auth_required", False)),
     )
 
     if progress is not None:
-        hint = f"{len(past_findings)} relevant finding(s) found" if past_findings else "no prior findings for this context"
-        progress(f"Findings store: {hint}.")
+        hint = f"{len(past_findings)} curated finding(s) found" if past_findings else "no curated findings for this context"
+        lesson_hint = f"{len(past_lessons)} probe observation(s)" if past_lessons else "no probe observations"
+        progress(f"Knowledge base: {hint}; {lesson_hint}.")
         progress("Generating payloads...")
 
     heuristics = base_payloads_for_context(context)
@@ -849,6 +856,7 @@ def generate_payloads(
             reference_payloads=reference_payloads,
             waf=waf,
             past_findings=past_findings,
+            past_lessons=past_lessons,
         )
         engine = "ollama"
         used_fallback = False
@@ -867,6 +875,7 @@ def generate_payloads(
             reference_payloads=reference_payloads,
             waf=waf,
             past_findings=past_findings,
+            past_lessons=past_lessons,
             ai_backend=ai_backend,
             cli_tool=cli_tool,
             cli_model=cli_model,
@@ -874,8 +883,7 @@ def generate_payloads(
 
         if cloud_payloads:
             if progress is not None:
-                progress(f"Cloud ({cloud_engine}) returned {len(cloud_payloads)} payloads — saving to findings store.")
-            _persist_cloud_findings(cloud_payloads, context, cloud_engine)
+                progress(f"Cloud ({cloud_engine}) returned {len(cloud_payloads)} payloads.")
             ai_payloads = cloud_payloads
             engine = cloud_engine
             resolved_model = cloud_model

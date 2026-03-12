@@ -198,6 +198,10 @@ pull_selected_model() {
   if ! have_cmd ollama; then
     return 1
   fi
+  if ollama list 2>/dev/null | awk 'NR>1 {print $1}' | grep -qx "$SELECTED_MODEL"; then
+    echo "Model $SELECTED_MODEL already present — skipping pull."
+    return 0
+  fi
   if ollama pull "$SELECTED_MODEL"; then
     return 0
   fi
@@ -210,10 +214,7 @@ init_axss_dir() {
   mkdir -p "$CONFIG_DIR"
   chmod 700 "$CONFIG_DIR"
 
-  # 2. Findings store directory
-  mkdir -p "$CONFIG_DIR/findings"
-
-  # 3. config.json — create with defaults on first run; on subsequent runs only
+  # 2. config.json — create with defaults on first run; on subsequent runs only
   #    update default_model + detected CLI backend so user edits to other fields
   #    (use_cloud, cloud_model, cli_model, etc.) are preserved.
   "$PYTHON" - "$CONFIG_PATH" "$SELECTED_MODEL" "$DETECTED_CLI_BACKEND" "$DETECTED_CLI_TOOL" <<'PYEOF'
@@ -226,10 +227,11 @@ try:
         cfg = {}
 except Exception:
     cfg = {}
-# Always update model (hardware-detected) and CLI backend (auto-detected).
+# Always update hardware-detected model recommendation.
 cfg["default_model"] = model
-cfg["ai_backend"] = backend
-cfg["cli_tool"] = cli_tool
+# Seed auto-detected CLI backend/tool only on first run; preserve user edits after that.
+cfg.setdefault("ai_backend", backend)
+cfg.setdefault("cli_tool", cli_tool)
 # Write defaults for keys the user hasn't set yet.
 cfg.setdefault("use_cloud", True)
 cfg.setdefault("cloud_model", "anthropic/claude-3-5-sonnet")
@@ -295,11 +297,28 @@ if [ ! -f "$VENV_PYTHON" ]; then
   VENV_PYTHON="$VENV_DIR/bin/python3"
 fi
 
-"$VENV_PYTHON" -m pip install --upgrade pip
-"$VENV_PYTHON" -m pip install -r "$ROOT_DIR/requirements.txt"
-# Install Playwright browser binaries required by Scrapling's stealth fetcher
-if ! "$VENV_PYTHON" -m playwright install chromium --with-deps; then
-  echo "Warning: playwright install chromium failed — active scanner (--active) will not work." >&2
+# Only reinstall packages (and playwright browser) when requirements.txt has changed
+# or packages are broken.  The stamp file stores the last successful hash.
+REQS_HASH_FILE="$CONFIG_DIR/.reqs_hash"
+REQS_CURRENT_HASH="$(sha256sum "$ROOT_DIR/requirements.txt" 2>/dev/null | cut -d' ' -f1)"
+if [ -f "$REQS_HASH_FILE" ] && [ "$(cat "$REQS_HASH_FILE" 2>/dev/null)" = "$REQS_CURRENT_HASH" ] \
+    && "$VENV_PYTHON" -m pip check >/dev/null 2>&1; then
+  echo "Python packages up-to-date (requirements.txt unchanged) — skipping install."
+else
+  "$VENV_PYTHON" -m pip install --upgrade pip
+  "$VENV_PYTHON" -m pip install -r "$ROOT_DIR/requirements.txt"
+  # Install Playwright browser binaries required by Scrapling's stealth fetcher.
+  # Playwright version is pinned in requirements.txt so this only runs when packages change.
+  _playwright_ok=1
+  if ! "$VENV_PYTHON" -m playwright install chromium --with-deps; then
+    echo "Warning: playwright install chromium failed — active scanner (--active) will not work." >&2
+    _playwright_ok=0
+  fi
+  # Write the stamp only when both pip and playwright succeeded so a partial failure
+  # forces a retry next run.
+  if [ "$_playwright_ok" -eq 1 ]; then
+    echo "$REQS_CURRENT_HASH" > "$REQS_HASH_FILE"
+  fi
 fi
 
 mkdir -p "$BIN_DIR"

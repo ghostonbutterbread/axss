@@ -16,7 +16,11 @@ EVENT_HANDLER_RE = re.compile(r"\bon[a-z0-9_-]+\b", re.IGNORECASE)
 FRAMEWORK_PATTERNS = {
     "React": re.compile(r"react|data-reactroot|dangerouslySetInnerHTML|jsx", re.IGNORECASE),
     "Vue": re.compile(r"v-|vue|@click|:class|{{.*?}}", re.IGNORECASE | re.DOTALL),
-    "Angular": re.compile(r"ng-|angular|\$scope|\[ng", re.IGNORECASE),
+    "Angular": re.compile(
+        r"\bng-(?:app|bind|class|click|controller|form|href|if|include|init|model|repeat|src|style|submit|switch|view)\b|"
+        r"\bangular\b|\$scope\b|\[ng(?:[A-Z][A-Za-z]+|-[a-z-]+)",
+        re.IGNORECASE,
+    ),
     "AngularJS": re.compile(r"ng-app|ng-controller|\$eval|\$parse", re.IGNORECASE),
 }
 SINK_PATTERNS = {

@@ -259,12 +259,19 @@ def teardown_panel() -> None:
         _panel_active = False
         return
     rows, _ = _term_rows_cols()
-    out = ["\033[s"]
+    out = []
+    # Clear each panel row via absolute positioning (no save/restore needed).
     for r in range(rows - _PANEL_LINES + 1, rows + 1):
         out.append(f"\033[{r};1H\033[2K")
-    out.append("\033[u")
+    # Restore the full scroll region BEFORE repositioning the cursor.
+    # Setting \033[r homes the cursor on many terminals, so we always
+    # follow it with an explicit absolute move rather than relying on
+    # \033[u to put us somewhere sensible.
     out.append(f"\033[1;{rows}r")    # restore full scroll region
     out.append("\033[?7h")           # re-enable auto-wrap
+    # Land the cursor at the bottom of the log area so subsequent prints
+    # continue cleanly into the (now blank) former-panel rows.
+    out.append(f"\033[{rows - _PANEL_LINES};1H")
     sys.stdout.write("".join(out))
     sys.stdout.flush()
     _panel_active = False

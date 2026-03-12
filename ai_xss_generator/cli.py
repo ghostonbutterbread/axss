@@ -9,6 +9,12 @@ from typing import Callable
 from ai_xss_generator import __version__
 from ai_xss_generator.config import APP_NAME, CONFIG_PATH, DEFAULT_MODEL, load_config
 from ai_xss_generator.console import header, info, step, success, warn, waf_label
+from ai_xss_generator.findings import (
+    export_yaml,
+    import_yaml,
+    load_findings,
+    memory_stats,
+)
 from ai_xss_generator.models import check_api_keys, generate_payloads, list_ollama_models, search_ollama_models
 from ai_xss_generator.output import render_batch_json, render_heat, render_json, render_list, render_summary
 from ai_xss_generator.parser import BatchParseError, parse_target, parse_targets, read_url_list
@@ -27,6 +33,16 @@ class _HelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescrip
         if default in (None, False, argparse.SUPPRESS):
             return help_text
         return super()._get_help_string(action)
+
+
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than 0")
+    return parsed
 
 
 def build_parser(config_default_model: str) -> argparse.ArgumentParser:
@@ -94,6 +110,33 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
             "Reads from ~/.axss/keys and environment variables, makes a lightweight "
             "probe request to each service, and reports status."
         ),
+    )
+    action_group.add_argument(
+        "--clear-reports",
+        action="store_true",
+        help="--clear-reports  Delete all saved reports from ~/.axss/reports/.",
+    )
+    action_group.add_argument(
+        "--memory-list",
+        action="store_true",
+        default=False,
+        help="--memory-list  Show all curated findings in the knowledge base.",
+    )
+    action_group.add_argument(
+        "--memory-stats",
+        action="store_true",
+        default=False,
+        help="--memory-stats  Show knowledge base entry counts.",
+    )
+    action_group.add_argument(
+        "--memory-export",
+        metavar="PATH",
+        help="--memory-export PATH  Export the curated knowledge base to a YAML file.",
+    )
+    action_group.add_argument(
+        "--memory-import",
+        metavar="PATH",
+        help="--memory-import PATH  Import curated findings from a YAML file.",
     )
 
     # Payload sourcing flags
@@ -425,6 +468,72 @@ def _render_table(rows: list[dict[str, str]]) -> str:
         for row in rows
     ]
     return "\n".join([header_line, separator, *body])
+
+
+def _render_finding(f: object) -> str:
+    from ai_xss_generator.findings import finding_id
+    fid = finding_id(f)  # type: ignore[arg-type]
+    lines = [
+        f"{'id':>14}: {fid}",
+        f"{'context':>14}: {getattr(f, 'context_type', '') or '-'}",
+        f"{'sink':>14}: {getattr(f, 'sink_type', '') or '-'}",
+        f"{'bypass_family':>14}: {getattr(f, 'bypass_family', '') or '-'}",
+        f"{'waf':>14}: {getattr(f, 'waf_name', '') or '-'}",
+        f"{'delivery':>14}: {getattr(f, 'delivery_mode', '') or '-'}",
+        f"{'frameworks':>14}: {','.join(getattr(f, 'frameworks', [])) or '-'}",
+        f"{'confidence':>14}: {getattr(f, 'confidence', 1.0):.2f}",
+        f"{'source':>14}: {getattr(f, 'source', '') or '-'}",
+        f"{'payload':>14}: {getattr(f, 'payload', '')}",
+    ]
+    explanation = getattr(f, "explanation", "")
+    if explanation:
+        lines.append(f"{'explanation':>14}: {explanation}")
+    return "\n".join(lines)
+
+
+def _handle_memory_stats() -> int:
+    stats = memory_stats()
+    print(_render_table([{
+        "store": "curated_findings",
+        "total": str(stats["total"]),
+    }]))
+    return 0
+
+
+def _handle_memory_list() -> int:
+    findings = load_findings()
+    if not findings:
+        info("No curated findings in the knowledge base.")
+        return 0
+    rows = []
+    for f in findings:
+        rows.append({
+            "context": f.context_type or "-",
+            "bypass_family": f.bypass_family or "-",
+            "waf": f.waf_name or "-",
+            "delivery": f.delivery_mode or "-",
+            "confidence": f"{f.confidence:.2f}",
+            "payload": f.payload[:60],
+        })
+    print(_render_table(rows))
+    return 0
+
+
+def _handle_memory_export(path_str: str) -> int:
+    path = Path(path_str)
+    count = export_yaml(path)
+    success(f"Exported {count} curated findings to {path}.")
+    return 0
+
+
+def _handle_memory_import(path_str: str) -> int:
+    path = Path(path_str)
+    if not path.exists():
+        warn(f"File not found: {path}")
+        return 1
+    inserted, skipped = import_yaml(path)
+    success(f"Imported {inserted} findings ({skipped} skipped as duplicates) from {path}.")
+    return 0
 
 
 def _print_context_banner(result: GenerationResult, waf: str | None = None) -> None:
@@ -913,7 +1022,7 @@ def _resolve_session(
         config_summary=config_summary,
         total_items=total_items,
     )
-    log.debug("New session: %s", seed_hash[:16])
+    info(f"New session: {seed_hash[:16]}")
     return session
 
 
@@ -922,18 +1031,30 @@ def _resolve_session(
 # ---------------------------------------------------------------------------
 
 def main(argv: list[str] | None = None) -> int:
+    import logging as _logging
     config = load_config()
     parser = build_parser(config.default_model)
     args = parser.parse_args(argv)
 
+    # Scrapling emits INFO-level fetch logs to stderr on every request.
+    # These bypass our status-bar hooks and corrupt the terminal display.
+    # Suppress them unless the user explicitly asked for verbose output.
+    if not getattr(args, "verbose", False):
+        _logging.getLogger("scrapling").setLevel(_logging.WARNING)
+
     has_target = bool(args.url or args.urls or args.input)
-    is_utility = args.list_models or args.search_models or args.check_keys
+    is_utility = (
+        args.list_models or args.search_models or args.check_keys or args.clear_reports
+        or args.memory_list or args.memory_stats
+        or args.memory_export or args.memory_import
+    )
 
     # Validate: need at least one of: target, --public, or a utility action
     if not has_target and not args.public and not is_utility:
         parser.error(
             "one of the arguments -u/--url --urls -i/--input -l/--list-models "
-            "-s/--search-models --check-keys --public is required"
+            "-s/--search-models --check-keys --public --memory-list --memory-stats "
+            "--memory-export --memory-import is required"
         )
 
     # --- Utility: check API keys ---
@@ -950,6 +1071,22 @@ def main(argv: list[str] | None = None) -> int:
         print()
         any_invalid = any(r["status"] in {"invalid", "error"} for r in results)
         return 1 if any_invalid else 0
+
+    # --- Utility: clear reports ---
+    if args.clear_reports:
+        from ai_xss_generator.config import CONFIG_DIR
+        reports_dir = CONFIG_DIR / "reports"
+        if not reports_dir.exists():
+            info("No reports directory found — nothing to clear.")
+            return 0
+        files = sorted(reports_dir.glob("*.md"))
+        if not files:
+            info("No reports found.")
+            return 0
+        for f in files:
+            f.unlink()
+        success(f"Cleared {len(files)} report(s) from {reports_dir}")
+        return 0
 
     # --- Utility: list / search models ---
     if args.list_models:
@@ -969,6 +1106,18 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Ollama model search for {args.search_models!r} ({source})")
         print(_render_table(rows))
         return 0
+
+    if args.memory_stats:
+        return _handle_memory_stats()
+
+    if args.memory_list:
+        return _handle_memory_list()
+
+    if args.memory_export:
+        return _handle_memory_export(args.memory_export)
+
+    if args.memory_import:
+        return _handle_memory_import(args.memory_import)
 
     # --- Validate rate ---
     if not math.isfinite(args.rate) or args.rate < 0:

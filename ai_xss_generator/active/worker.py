@@ -232,6 +232,44 @@ def _run(
     injectable = [r for r in probe_results if r.is_injectable]
     reflected  = [r for r in probe_results if r.is_reflected]
 
+    # ── Step 4: Parse target HTML once — reused by local/cloud model helpers ─
+    from ai_xss_generator.parser import parse_target as _parse_target
+    _cached_context: Any = None
+    try:
+        _cached_context = _parse_target(
+            url=url, html_value=None, waf=waf_hint, auth_headers=auth_headers,
+            cached_html=_prefetched_html,
+        )
+    except Exception as exc:
+        log.debug("Pre-parse of %s failed (will retry per-param): %s", url, exc)
+
+    session_lessons: list[Any] = []
+    try:
+        from ai_xss_generator.learning import build_memory_profile
+        from ai_xss_generator.lessons import build_mapping_lessons, build_probe_lessons
+
+        memory_profile = build_memory_profile(
+            context=_cached_context,
+            waf_name=waf_hint,
+            delivery_mode="get",
+            target_host=parsed.netloc,
+        )
+        if auth_headers:
+            memory_profile["auth_required"] = True
+        if _cached_context is not None:
+            session_lessons.extend(build_mapping_lessons(
+                _cached_context,
+                memory_profile=memory_profile,
+            ))
+        if reflected:
+            session_lessons.extend(build_probe_lessons(
+                reflected,
+                memory_profile=memory_profile,
+                delivery_mode="get",
+            ))
+    except Exception as exc:
+        log.debug("Session lesson build failed for %s: %s", url, exc)
+
     if not reflected:
         put_result(WorkerResult(
             url=url,
@@ -250,17 +288,6 @@ def _run(
             params_reflected=len(reflected),
         ))
         return
-
-    # ── Step 4: Parse target HTML once — reused by local/cloud model helpers ─
-    from ai_xss_generator.parser import parse_target as _parse_target
-    _cached_context: Any = None
-    try:
-        _cached_context = _parse_target(
-            url=url, html_value=None, waf=waf_hint, auth_headers=auth_headers,
-            cached_html=_prefetched_html,
-        )
-    except Exception as exc:
-        log.debug("Pre-parse of %s failed (will retry per-param): %s", url, exc)
 
     # ── Step 5: Start Playwright executor (shared for all payload attempts) ──
     from ai_xss_generator.active.executor import ActiveExecutor
@@ -320,7 +347,6 @@ def _run(
                             cloud_escalated=False,
                         )
                         confirmed_findings.append(finding)
-                        _save_finding_safe(finding, findings_lock)
                         context_confirmed = True
                         break  # confirmed for this context — move to next param
                     else:
@@ -335,6 +361,8 @@ def _run(
                         waf=waf_hint,
                         base_context=_cached_context,
                         auth_headers=auth_headers,
+                        delivery_mode="get",
+                        session_lessons=session_lessons,
                     )
 
                     for lp in local_payloads:
@@ -360,7 +388,6 @@ def _run(
                                 cloud_escalated=False,
                             )
                             confirmed_findings.append(finding)
-                            _save_finding_safe(finding, findings_lock)
                             context_confirmed = True
                             break
                         else:
@@ -394,6 +421,8 @@ def _run(
                         ai_backend=ai_backend,
                         cli_tool=cli_tool,
                         cli_model=cli_model,
+                        delivery_mode="get",
+                        session_lessons=session_lessons,
                     )
 
                     if cloud_payloads:
@@ -422,7 +451,6 @@ def _run(
                                 cloud_escalated=True,
                             )
                             confirmed_findings.append(finding)
-                            _save_finding_safe(finding, findings_lock)
                             break
 
     finally:
@@ -482,6 +510,8 @@ def _get_local_payloads(
     waf: str | None,
     base_context: Any = None,
     auth_headers: dict[str, str] | None = None,
+    delivery_mode: str = "get",
+    session_lessons: list[Any] | None = None,
 ) -> list[str]:
     """Ask the local model for payloads. Returns raw payload strings.
 
@@ -492,17 +522,25 @@ def _get_local_payloads(
     try:
         from ai_xss_generator.probe import enrich_context
         from ai_xss_generator.models import generate_payloads
+        from ai_xss_generator.learning import build_memory_profile
 
         if base_context is None:
             from ai_xss_generator.parser import parse_target
             base_context = parse_target(url=url, html_value=None, waf=waf, auth_headers=auth_headers)
 
         context = enrich_context(base_context, [probe_result])
+        memory_profile = build_memory_profile(
+            context=context,
+            waf_name=waf,
+            delivery_mode=delivery_mode,
+        )
         payloads, *_ = generate_payloads(
             context=context,
             model=model,
             waf=waf,
             use_cloud=False,  # local only at this step
+            memory_profile=memory_profile,
+            past_lessons=session_lessons,
         )
         return [p.payload for p in payloads if p.payload]
     except Exception as exc:
@@ -523,6 +561,8 @@ def _get_cloud_payloads(
     ai_backend: str = "api",
     cli_tool: str = "claude",
     cli_model: str | None = None,
+    delivery_mode: str = "get",
+    session_lessons: list[Any] | None = None,
 ) -> list[str]:
     """Check dedup registry; call cloud model if this is a novel fingerprint.
 
@@ -537,19 +577,27 @@ def _get_cloud_payloads(
     try:
         from ai_xss_generator.probe import enrich_context
         from ai_xss_generator.models import generate_cloud_payloads
+        from ai_xss_generator.learning import build_memory_profile
 
         if base_context is None:
             from ai_xss_generator.parser import parse_target
             base_context = parse_target(url=url, html_value=None, waf=waf, auth_headers=auth_headers)
 
         context = enrich_context(base_context, [probe_result])
+        memory_profile = build_memory_profile(
+            context=context,
+            waf_name=waf,
+            delivery_mode=delivery_mode,
+        )
         payloads, _ = generate_cloud_payloads(
             context=context,
             cloud_model=cloud_model,
             waf=waf,
+            past_lessons=session_lessons,
             ai_backend=ai_backend,
             cli_tool=cli_tool,
             cli_model=cli_model,
+            memory_profile=memory_profile,
         )
         result_strings = [p.payload for p in payloads if p.payload]
     except Exception as exc:
@@ -671,6 +719,28 @@ def _run_post(
     injectable = [r for r in probe_results if r.is_injectable]
     reflected  = [r for r in probe_results if r.is_reflected]
 
+    post_session_lessons: list[Any] = []
+    try:
+        from ai_xss_generator.learning import build_memory_profile
+        from ai_xss_generator.lessons import build_probe_lessons
+
+        memory_profile = build_memory_profile(
+            context=None,
+            waf_name=waf_hint,
+            delivery_mode="post",
+            target_host=urllib.parse.urlparse(post_form.action_url).netloc,
+        )
+        if auth_headers:
+            memory_profile["auth_required"] = True
+        if reflected:
+            post_session_lessons.extend(build_probe_lessons(
+                reflected,
+                memory_profile=memory_profile,
+                delivery_mode="post",
+            ))
+    except Exception as exc:
+        log.debug("POST lesson build failed for %s: %s", post_form.action_url, exc)
+
     if not reflected:
         put_result(WorkerResult(
             url=post_form.action_url,
@@ -747,7 +817,6 @@ def _run_post(
                             cloud_escalated=False,
                         )
                         confirmed_findings.append(finding)
-                        _save_finding_safe(finding, findings_lock)
                         context_confirmed = True
                         break
                     else:
@@ -778,6 +847,8 @@ def _run_post(
                         ai_backend=ai_backend,
                         cli_tool=cli_tool,
                         cli_model=cli_model,
+                        delivery_mode="post",
+                        session_lessons=post_session_lessons,
                     )
                     if cloud_payloads:
                         cloud_escalated = True
@@ -807,7 +878,6 @@ def _run_post(
                                 cloud_escalated=True,
                             )
                             confirmed_findings.append(finding)
-                            _save_finding_safe(finding, findings_lock)
                             break
 
     finally:
@@ -827,35 +897,3 @@ def _run_post(
     ))
 
 
-def _save_finding_safe(finding: ConfirmedFinding, findings_lock: Any) -> None:
-    """Write to findings store with process-safe lock.
-
-    Finding construction (including infer_bypass_family) is done *outside* the
-    lock so the critical section only covers the file write.
-    """
-    try:
-        from ai_xss_generator.findings import Finding, save_finding, infer_bypass_family
-        f = Finding(
-            sink_type=f"probe:{finding.context_type}",
-            context_type=finding.context_type,
-            surviving_chars=finding.surviving_chars,
-            bypass_family=infer_bypass_family(finding.payload, []),
-            payload=finding.payload,
-            test_vector=f"?{finding.param_name}={finding.payload}",
-            model=finding.source,
-            explanation=(
-                f"Active scan confirmed via {finding.execution_method}. "
-                f"Transform: {finding.transform_name}. WAF: {finding.waf or 'none'}."
-            ),
-            target_host=urllib.parse.urlparse(finding.url).netloc,
-            tags=[finding.source, finding.execution_method, finding.transform_name],
-            verified=True,
-        )
-    except Exception as exc:
-        log.debug("Failed to build Finding object: %s", exc)
-        return
-    try:
-        with findings_lock:
-            save_finding(f)
-    except Exception as exc:
-        log.debug("Failed to save finding: %s", exc)

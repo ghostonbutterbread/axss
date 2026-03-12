@@ -1,300 +1,187 @@
-"""Local findings store — persists discovered filter behaviors and working payloads.
+"""Curated XSS knowledge store — persists trusted bypass patterns and payloads.
 
-Layout
-------
-~/.axss/findings/<context_type>.jsonl   — one file per reflection context type
-~/.axss/findings/unknown.jsonl          — catch-all for unclassified findings
-~/.axss/findings.jsonl                  — legacy flat file (migrated on first access)
+Storage: SQLite at ~/.axss/knowledge.db (via store.py)
 
-Partitioning by context_type means relevant_findings() only reads the slice of
-the store that's useful for the current target.  Even with tens of thousands of
-total entries the hot-path load is just one or two small files.  Each partition
-has its own rolling cap (MAX_PER_PARTITION); the global store is effectively
-unbounded as long as context variety keeps growing.
+The store has a single tier: curated.  All entries are globally scoped —
+there is no per-host partitioning.  Findings are populated two ways:
+  1. Seed scripts  (xssy/seed_*.py) — hand-curated lab knowledge
+  2. Curation pipeline (xssy/curate.py) — LLM-extracted from confirmed lab runs
 
-The store serves three purposes:
-  1. Inject relevant past findings as few-shot examples into LLM prompts so the
-     local model benefits from prior discoveries (including those found by a cloud
-     model).
-  2. Track which bypass families work against which filter behaviors so the tool
-     can short-circuit to the right payload class without asking the LLM.
-  3. Gradually accumulate a private knowledge base that grows more useful the more
-     the tool is used.
+Retrieval scores candidates by:
+  context_type / sink_type match, surviving chars overlap, WAF, delivery mode,
+  framework hints, and auth context.  See relevant_findings() for weights.
 """
 from __future__ import annotations
 
-import json
-import re
-from dataclasses import asdict, dataclass, field
+import hashlib
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
+
+from ai_xss_generator import store as _store
 
 
 # ---------------------------------------------------------------------------
-# Paths
-# ---------------------------------------------------------------------------
-
-FINDINGS_DIR  = Path.home() / ".axss" / "findings"
-FINDINGS_PATH = Path.home() / ".axss" / "findings.jsonl"   # legacy flat file
-
-# Per-partition rolling cap.  Oldest unverified entries are evicted first when
-# a partition exceeds this limit.  With ~20 context types the total store can
-# hold ~40 000 entries while keeping any single file manageable.
-MAX_PER_PARTITION = 2_000
-
-
-# ---------------------------------------------------------------------------
-# Bypass family taxonomy — shared between prompts and finding classification
+# Bypass family taxonomy
 # ---------------------------------------------------------------------------
 
 BYPASS_FAMILIES: list[str] = [
     # ── Encoding / obfuscation ───────────────────────────────────────────────
-    "whitespace-in-scheme",      # tab/LF/CR inserted inside javascript: scheme
-    "case-variant",              # jAvAsCrIpT:
-    "html-entity-encoding",      # &#106;avascript: or &colon;
-    "double-url-encoding",       # %2522 → %22 → "
-    "unicode-js-escape",         # \u0061lert(1) — JS identifier unicode escape
-    "unicode-zero-width",        # ZWS/ZWNJ inserted into keywords or URIs
-    "unicode-fullwidth",         # full-width chars in CSS / protocol strings
-    "unicode-whitespace",        # NBSP/em/en space as HTML attribute separator
+    "whitespace-in-scheme",
+    "case-variant",
+    "html-entity-encoding",
+    "double-url-encoding",
+    "unicode-js-escape",
+    "unicode-zero-width",
+    "unicode-fullwidth",
+    "unicode-whitespace",
     # ── Injection context breakouts ──────────────────────────────────────────
-    "js-string-breakout",        # ";alert(1)// or ';alert(1)//
-    "template-literal-breakout", # `${alert(1)}`
-    "html-attribute-breakout",   # "><svg/onload=alert(1)>
-    "comment-breakout",          # -->payload
-    "xml-cdata-injection",       # <![CDATA[<script>alert(1)</script>]]>
-    "mutation-xss",              # mXSS — parser mutation after sanitisation
+    "js-string-breakout",
+    "template-literal-breakout",
+    "html-attribute-breakout",
+    "comment-breakout",
+    "xml-cdata-injection",
+    "mutation-xss",
     # ── Sink / feature exploitation ──────────────────────────────────────────
-    "event-handler-injection",   # value reflected directly in onX=
-    "svg-namespace",             # <svg><animate onbegin=alert(1)>
-    "srcdoc-injection",          # srcdoc="<script>alert(1)</script>"
-    "data-uri",                  # data:text/html,<script>alert(1)</script>
-    "base-tag-injection",        # <base href="//attacker.com/"> hijacks relative URLs
-    "postmessage-injection",     # postMessage → eval / innerHTML sink
-    "template-expression",       # {{constructor.constructor('alert(1)')()}}
-    "constructor-chain",         # [].filter.constructor('alert(1)')()
-    "prototype-pollution",       # __proto__[x]=payload
-    "dom-clobbering",            # anchor id overrides window property
+    "event-handler-injection",
+    "svg-namespace",
+    "srcdoc-injection",
+    "data-uri",
+    "base-tag-injection",
+    "postmessage-injection",
+    "template-expression",
+    "constructor-chain",
+    "prototype-pollution",
+    "dom-clobbering",
     # ── Header / request-level ───────────────────────────────────────────────
-    "host-header-injection",     # Host: or X-Forwarded-Host reflected unsanitised
-    "referer-header-injection",  # Referer header reflected into page
-    "metadata-xss",              # XSS payload in file metadata (EXIF, SVG attrs)
+    "host-header-injection",
+    "referer-header-injection",
+    "metadata-xss",
     # ── CSP bypasses ─────────────────────────────────────────────────────────
-    "csp-nonce-bypass",          # predict or leak nonce, inject matching script tag
-    "csp-jsonp-bypass",          # allowlisted JSONP endpoint used as script src
-    "csp-upload-bypass",         # upload JS to same origin, bypass script-src self
-    "csp-injection-bypass",      # inject into CSP header itself
-    "csp-exfiltration",          # data leak via img-src / dns-prefetch despite strict csp
+    "csp-nonce-bypass",
+    "csp-jsonp-bypass",
+    "csp-upload-bypass",
+    "csp-injection-bypass",
+    "csp-exfiltration",
     # ── Filter / sanitiser evasion ───────────────────────────────────────────
-    "regex-filter-bypass",       # weak regex strips some but not all variants
-    "upload-type-bypass",        # bypass file-type checks to deliver XSS payload
-    "content-sniffing",          # browser sniffs MIME and renders as HTML
-    "enctype-spoofing",          # multipart/text-plain enctype tricks server parser
+    "regex-filter-bypass",
+    "upload-type-bypass",
+    "content-sniffing",
+    "enctype-spoofing",
 ]
 
 
+# ---------------------------------------------------------------------------
+# Finding dataclass
+# ---------------------------------------------------------------------------
+
 @dataclass
 class Finding:
-    sink_type: str        # e.g. "reflected_in_href", "js_string_via_base64"
-    context_type: str     # e.g. "html_attr_url", "js_string_dq", "html_body"
-    surviving_chars: str  # chars confirmed to survive the filter, e.g. "()/;`"
-    bypass_family: str    # one of BYPASS_FAMILIES
-    payload: str          # the exact payload string
-    test_vector: str      # how to deliver it, e.g. "?param=..."
-    model: str            # model that generated/confirmed this finding
-    explanation: str = ""
-    target_host: str = ""
-    tags: list[str] = field(default_factory=list)
-    verified: bool = False   # True if manually confirmed to execute in browser
-    ts: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    """A curated XSS bypass pattern.
 
-
-# ---------------------------------------------------------------------------
-# Internal: partition key → file path
-# ---------------------------------------------------------------------------
-
-def _partition_key(context_type: str) -> str:
-    """Sanitise context_type into a safe filename stem."""
-    key = re.sub(r"[^a-z0-9_-]", "_", (context_type or "unknown").lower()).strip("_")
-    return key or "unknown"
-
-
-def _partition_path(context_type: str) -> Path:
-    return FINDINGS_DIR / f"{_partition_key(context_type)}.jsonl"
-
-
-def _load_partition(path: Path) -> list[Finding]:
-    """Load all findings from one partition file."""
-    if not path.exists():
-        return []
-    results: list[Finding] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            d = json.loads(line)
-            results.append(Finding(
-                sink_type=d.get("sink_type", ""),
-                context_type=d.get("context_type", ""),
-                surviving_chars=d.get("surviving_chars", ""),
-                bypass_family=d.get("bypass_family", ""),
-                payload=d.get("payload", ""),
-                test_vector=d.get("test_vector", ""),
-                model=d.get("model", "unknown"),
-                explanation=d.get("explanation", ""),
-                target_host=d.get("target_host", ""),
-                tags=d.get("tags", []),
-                verified=d.get("verified", False),
-                ts=d.get("ts", ""),
-            ))
-        except Exception:
-            continue
-    return results
-
-
-def _write_partition(path: Path, findings: list[Finding]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if not findings:
-        path.write_text("", encoding="utf-8")
-        return
-    path.write_text(
-        "\n".join(json.dumps(asdict(f)) for f in findings) + "\n",
-        encoding="utf-8",
-    )
-
-
-def _trim_partition(path: Path) -> None:
-    """Evict oldest unverified entries when partition exceeds MAX_PER_PARTITION."""
-    findings = _load_partition(path)
-    if len(findings) <= MAX_PER_PARTITION:
-        return
-    # Separate verified (never evicted) from unverified (evict oldest first)
-    verified = [f for f in findings if f.verified]
-    unverified = [f for f in findings if not f.verified]
-    # How many unverified we can keep
-    keep_unverified = max(0, MAX_PER_PARTITION - len(verified))
-    # Keep the newest unverified entries (they're appended in order, so tail = newest)
-    trimmed = verified + unverified[-keep_unverified:]
-    _write_partition(path, trimmed)
-
-
-# ---------------------------------------------------------------------------
-# Migration: flat findings.jsonl → partitioned directory
-# ---------------------------------------------------------------------------
-
-def _migrate_legacy() -> None:
-    """Move entries from the legacy flat file into the new partition layout.
-
-    Called once (the flat file is removed after migration so this is a no-op
-    on subsequent runs).
+    Seed scripts and the curation pipeline create these.  All findings in the
+    store are globally applicable (no host scope) and trusted by definition.
     """
-    if not FINDINGS_PATH.exists():
-        return
-    findings = []
-    for line in FINDINGS_PATH.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            d = json.loads(line)
-            findings.append(Finding(
-                sink_type=d.get("sink_type", ""),
-                context_type=d.get("context_type", ""),
-                surviving_chars=d.get("surviving_chars", ""),
-                bypass_family=d.get("bypass_family", ""),
-                payload=d.get("payload", ""),
-                test_vector=d.get("test_vector", ""),
-                model=d.get("model", "unknown"),
-                explanation=d.get("explanation", ""),
-                target_host=d.get("target_host", ""),
-                tags=d.get("tags", []),
-                verified=d.get("verified", False),
-                ts=d.get("ts", ""),
-            ))
-        except Exception:
-            continue
-
-    if not findings:
-        FINDINGS_PATH.unlink(missing_ok=True)
-        return
-
-    # Group by partition and write
-    from collections import defaultdict
-    buckets: dict[str, list[Finding]] = defaultdict(list)
-    for f in findings:
-        buckets[_partition_key(f.context_type)].append(f)
-
-    FINDINGS_DIR.mkdir(parents=True, exist_ok=True)
-    for key, bucket in buckets.items():
-        path = FINDINGS_DIR / f"{key}.jsonl"
-        existing = _load_partition(path)
-        existing_payloads = {(e.payload, e.sink_type) for e in existing}
-        new_entries = [f for f in bucket if (f.payload, f.sink_type) not in existing_payloads]
-        _write_partition(path, existing + new_entries)
-        _trim_partition(path)
-
-    # Rename legacy file so it's preserved but won't be migrated again
-    FINDINGS_PATH.rename(FINDINGS_PATH.with_suffix(".jsonl.migrated"))
+    sink_type: str
+    context_type: str
+    surviving_chars: str
+    bypass_family: str
+    payload: str
+    test_vector: str = ""
+    model: str = ""          # 'curated', model name, or 'migrated'
+    explanation: str = ""
+    tags: list[str] = field(default_factory=list)
+    verified: bool = True
+    waf_name: str = ""
+    delivery_mode: str = ""
+    frameworks: list[str] = field(default_factory=list)
+    auth_required: bool = False
+    confidence: float = 1.0
+    source: str = ""         # provenance — lab name, URL, etc.
+    curated_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
-# Run migration exactly once when this module is imported
-try:
-    _migrate_legacy()
-except Exception:
-    pass  # never crash on migration failure
+def finding_id(finding: Finding) -> str:
+    material = "|".join([
+        finding.payload,
+        finding.sink_type,
+        finding.context_type,
+        finding.bypass_family,
+    ])
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
 
 
 # ---------------------------------------------------------------------------
-# Storage
+# Storage — delegates to store.py (SQLite)
 # ---------------------------------------------------------------------------
 
 def save_finding(finding: Finding) -> bool:
-    """Append *finding* to the appropriate partition.
+    """Persist a finding to the curated SQLite store.
 
-    Silently deduplicates (same payload + sink_type) within the partition.
-    Trims the partition to MAX_PER_PARTITION after appending.
-
-    Returns True if the finding was actually written, False if it was a duplicate.
+    Silently deduplicates — returns True if a new row was inserted.
     """
-    path = _partition_path(finding.context_type)
-    existing = _load_partition(path)
-    for f in existing:
-        if f.payload == finding.payload and f.sink_type == finding.sink_type:
-            return False  # already stored
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(asdict(finding)) + "\n")
-    _trim_partition(path)
-    return True
+    return _store.save_finding({
+        "context_type":    finding.context_type,
+        "sink_type":       finding.sink_type,
+        "bypass_family":   finding.bypass_family,
+        "payload":         finding.payload,
+        "explanation":     finding.explanation,
+        "surviving_chars": finding.surviving_chars,
+        "waf_name":        finding.waf_name,
+        "delivery_mode":   finding.delivery_mode,
+        "frameworks":      finding.frameworks,
+        "auth_required":   finding.auth_required,
+        "tags":            finding.tags,
+        "confidence":      finding.confidence,
+        "source":          finding.source,
+        "test_vector":     finding.test_vector,
+        "curated_by":      finding.model,
+        "curated_at":      finding.curated_at,
+    })
 
 
 def load_findings(context_type: str | None = None) -> list[Finding]:
-    """Load findings from disk.
-
-    If *context_type* is given, load only that partition (fast path).
-    If None, load all partitions (for CLI export or migration).
-    """
-    if not FINDINGS_DIR.exists():
-        return []
-    if context_type is not None:
-        return _load_partition(_partition_path(context_type))
-    # Load all partitions
-    all_findings: list[Finding] = []
-    for path in sorted(FINDINGS_DIR.glob("*.jsonl")):
-        all_findings.extend(_load_partition(path))
-    return all_findings
+    return [_row_to_finding(r) for r in _store.load_findings(context_type)]
 
 
-def partition_stats() -> dict[str, int]:
-    """Return {context_type: entry_count} for every partition on disk."""
-    if not FINDINGS_DIR.exists():
-        return {}
-    stats: dict[str, int] = {}
-    for path in sorted(FINDINGS_DIR.glob("*.jsonl")):
-        count = sum(1 for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
-        stats[path.stem] = count
-    return stats
+def count_findings(context_type: str | None = None) -> int:
+    return _store.count_findings(context_type)
+
+
+def export_yaml(path: Path) -> int:
+    return _store.export_yaml(path)
+
+
+def import_yaml(path: Path) -> tuple[int, int]:
+    return _store.import_yaml(path)
+
+
+def memory_stats() -> dict[str, int]:
+    total = _store.count_findings()
+    return {"total": total, "curated": total}
+
+
+def _row_to_finding(row: dict[str, Any]) -> Finding:
+    return Finding(
+        sink_type=str(row.get("sink_type", "")),
+        context_type=str(row.get("context_type", "")),
+        surviving_chars=str(row.get("surviving_chars", "")),
+        bypass_family=str(row.get("bypass_family", "")),
+        payload=str(row.get("payload", "")),
+        test_vector=str(row.get("test_vector", "")),
+        model=str(row.get("curated_by", "")),
+        explanation=str(row.get("explanation", "")),
+        tags=list(row.get("tags", [])),
+        verified=True,
+        waf_name=str(row.get("waf_name", "")),
+        delivery_mode=str(row.get("delivery_mode", "")),
+        frameworks=list(row.get("frameworks", [])),
+        auth_required=bool(row.get("auth_required", False)),
+        confidence=float(row.get("confidence", 1.0)),
+        source=str(row.get("source", "")),
+        curated_at=str(row.get("curated_at", "")),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -307,43 +194,45 @@ def relevant_findings(
     context_type: str,
     surviving_chars: str,
     limit: int = 6,
+    waf_name: str = "",
+    delivery_mode: str = "",
+    frameworks: tuple[str, ...] = (),
+    auth_required: bool | None = None,
+    # Legacy params — accepted but ignored for backward compat
+    allowed_tiers: Any = None,
+    target_host: str = "",
 ) -> list[Finding]:
-    """Return the most contextually relevant past findings.
+    """Return the most contextually relevant curated findings.
 
-    Loads only the matching context_type partition (primary) plus the
-    unknown/catch-all partition (secondary).  If context_type is empty,
-    loads all partitions (same behaviour as before).
-
-    Scoring:
+    Scoring weights:
       +4  exact sink_type match
       +2  partial sink_type match
       +3  exact context_type match
       +1-3 surviving chars overlap (capped at 3)
-      +2  verified finding
+      +2  verified (always True for curated, kept for scoring consistency)
+      +3  delivery_mode match
+      +3  waf_name exact match
+      +1  waf_name partial match
+      +0-2 framework overlap (capped at 2)
+      +1  auth_required match
     """
+    # Narrow load to matching context partition for speed; fall back to all
     if context_type:
-        primary   = _load_partition(_partition_path(context_type))
-        catchall  = _load_partition(_partition_path("unknown"))
-        # Also pull from any partition whose name partially matches the sink_type,
-        # so related contexts (e.g. html_attr_url + html_attr_href) cross-pollinate.
-        candidates: list[Finding] = []
-        seen_partitions = {_partition_key(context_type), "unknown"}
-        if sink_type and FINDINGS_DIR.exists():
-            for path in FINDINGS_DIR.glob("*.jsonl"):
-                if path.stem not in seen_partitions and sink_type.split("_")[0] in path.stem:
-                    candidates.extend(_load_partition(path))
-                    seen_partitions.add(path.stem)
-        all_f = primary + catchall + candidates
+        candidates = load_findings(context_type)
+        if not candidates:
+            candidates = load_findings()
     else:
-        all_f = load_findings()
+        candidates = load_findings()
 
-    if not all_f:
+    if not candidates:
         return []
 
     surviving_set = set(surviving_chars)
-    scored: list[tuple[int, Finding]] = []
-    for f in all_f:
-        score = 0
+    framework_set = {f.lower() for f in frameworks}
+    scored: list[tuple[float, Finding]] = []
+
+    for f in candidates:
+        score: float = 0.0
         if f.sink_type == sink_type:
             score += 4
         elif sink_type and (sink_type in f.sink_type or f.sink_type in sink_type):
@@ -353,22 +242,34 @@ def relevant_findings(
         score += min(len(surviving_set & set(f.surviving_chars)), 3)
         if f.verified:
             score += 2
+        if delivery_mode and f.delivery_mode == delivery_mode.lower():
+            score += 3
+        if waf_name and f.waf_name == waf_name.lower():
+            score += 3
+        elif waf_name and f.waf_name and (waf_name.lower() in f.waf_name or f.waf_name in waf_name.lower()):
+            score += 1
+        if framework_set and f.frameworks:
+            score += min(len(framework_set & {fw.lower() for fw in f.frameworks}), 2)
+        if auth_required is not None and f.auth_required == auth_required:
+            score += 1
+        score *= f.confidence  # weight by confidence
+
         if score > 0:
             scored.append((score, f))
+
     scored.sort(key=lambda x: -x[0])
     return [f for _, f in scored[:limit]]
 
 
 # ---------------------------------------------------------------------------
-# Helpers for models.py
+# Prompt formatting
 # ---------------------------------------------------------------------------
 
 def findings_prompt_section(findings: list[Finding]) -> str:
-    """Format findings as a few-shot prompt block."""
     if not findings:
         return ""
     lines = [
-        "Past findings for similar filter/sink contexts "
+        "Curated findings for similar filter/sink contexts "
         "(study the bypass TECHNIQUE — do NOT copy verbatim, adapt to this target):"
     ]
     for f in findings:
@@ -376,6 +277,11 @@ def findings_prompt_section(findings: list[Finding]) -> str:
             f"  sink={f.sink_type}  context={f.context_type}  "
             f"surviving_chars={f.surviving_chars!r}  bypass_family={f.bypass_family}"
         )
+        if f.waf_name or f.delivery_mode or f.frameworks:
+            lines.append(
+                f"  delivery={f.delivery_mode or '-'}  waf={f.waf_name or '-'}  "
+                f"frameworks={','.join(f.frameworks) or '-'}"
+            )
         lines.append(f"  payload: {f.payload}")
         if f.explanation:
             lines.append(f"  why_it_works: {f.explanation}")
@@ -383,8 +289,11 @@ def findings_prompt_section(findings: list[Finding]) -> str:
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Bypass family inference
+# ---------------------------------------------------------------------------
+
 def infer_bypass_family(payload_str: str, tags: list[str]) -> str:
-    """Best-effort bypass family classification from payload text and tags."""
     tag_set = set(tags)
     text = payload_str.lower()
     if "unicode" in tag_set or "js-escape" in tag_set:

@@ -20,14 +20,36 @@ class CliHelpTest(unittest.TestCase):
         self.assertIn("-j PATH, --json-out PATH", help_text)
         self.assertIn("-v, --verbose", help_text)
         self.assertIn("--merge-batch", help_text)
+        self.assertIn("--memory-list", help_text)
+        self.assertIn("--memory-stats", help_text)
+        self.assertIn("--memory-export", help_text)
+        self.assertIn("--memory-import", help_text)
+        self.assertNotIn("--memory-review", help_text)
+        self.assertNotIn("--memory-promote", help_text)
+        self.assertNotIn("--memory-reject", help_text)
         self.assertIn("-V, --version", help_text)
-        # New XSS type selectors
+        # XSS type selectors
         self.assertIn("--generate", help_text)
         self.assertIn("--reflected", help_text)
         self.assertIn("--stored", help_text)
         self.assertIn("--dom", help_text)
         self.assertNotIn("--html", help_text)
         self.assertNotIn("(default: None)", help_text)
+
+    def test_memory_commands_parse_cleanly(self) -> None:
+        parser = build_parser(DEFAULT_MODEL)
+
+        args = parser.parse_args(["--memory-list"])
+        self.assertTrue(args.memory_list)
+
+        args = parser.parse_args(["--memory-stats"])
+        self.assertTrue(args.memory_stats)
+
+        args = parser.parse_args(["--memory-export", "/tmp/out.yaml"])
+        self.assertEqual(args.memory_export, "/tmp/out.yaml")
+
+        args = parser.parse_args(["--memory-import", "/tmp/in.yaml"])
+        self.assertEqual(args.memory_import, "/tmp/in.yaml")
 
 
 if __name__ == "__main__":
