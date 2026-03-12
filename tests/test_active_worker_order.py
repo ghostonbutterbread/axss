@@ -372,6 +372,71 @@ def test_dom_worker_uses_static_fallback_only_after_local_and_cloud_fail():
     assert results[0].confirmed_findings[0].transform_name == "dom_static_fallback"
 
 
+def test_dom_worker_starts_cloud_after_local_delay_and_accepts_cloud_result():
+    url = "https://example.test/#start"
+    dom_hits = [
+        DomTaintHit(
+            url=url,
+            source_type="query_param",
+            source_name="q",
+            sink="innerHTML",
+            canary="axss1",
+            canary_url="https://example.test/?q=axss1",
+            code_location="innerHTML stack",
+        ),
+    ]
+
+    actions: list[str] = []
+    results: list[WorkerResult] = []
+
+    def _local_payloads(**kwargs):
+        time.sleep(0.08)
+        actions.append("local:return")
+        return ["ai-local"]
+
+    def _cloud_payloads(**kwargs):
+        actions.append("cloud:return")
+        return ["ai-cloud"]
+
+    def _attempt_payloads(**kwargs):
+        payload = kwargs["payloads"][0]
+        actions.append(f"fire:{payload}")
+        return payload == "ai-cloud", payload, f"executed:{payload}"
+
+    with (
+        patch("playwright.sync_api.sync_playwright", return_value=_FakePlaywright()),
+        patch("ai_xss_generator.parser.parse_target", return_value=_fake_parsed_context(url)),
+        patch("ai_xss_generator.learning.build_memory_profile", return_value={}),
+        patch("ai_xss_generator.lessons.build_mapping_lessons", return_value=[]),
+        patch("ai_xss_generator.active.dom_xss.discover_dom_taint_paths", return_value=dom_hits),
+        patch("ai_xss_generator.active.dom_xss.attempt_dom_payloads", side_effect=_attempt_payloads),
+        patch("ai_xss_generator.active.dom_xss.fallback_payloads_for_sink", side_effect=AssertionError("fallback should not run")),
+        patch("ai_xss_generator.active.worker._get_dom_local_payloads", side_effect=_local_payloads),
+        patch("ai_xss_generator.active.worker._get_dom_cloud_payloads", side_effect=_cloud_payloads),
+        patch("ai_xss_generator.active.worker._DOM_CLOUD_START_AFTER_SECONDS", 0.01),
+    ):
+        _run_dom(
+            url=url,
+            waf_hint=None,
+            model="qwen3.5",
+            cloud_model="anthropic/claude-3-5-sonnet",
+            use_cloud=True,
+            timeout_seconds=30,
+            put_result=results.append,
+            dedup_registry={},
+            dedup_lock=threading.Lock(),
+            auth_headers=None,
+            ai_backend="api",
+            cli_tool="claude",
+            cli_model=None,
+        )
+
+    assert "cloud:return" in actions
+    assert "fire:ai-cloud" in actions
+    assert results and results[0].status == "confirmed"
+    assert results[0].confirmed_findings[0].source == "cloud_model"
+
+
 def test_post_worker_runs_local_model_per_context_before_any_fallback():
     post_form = PostFormTarget(
         action_url="https://example.test/submit",

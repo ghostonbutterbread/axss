@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from ai_xss_generator.active.worker import _get_dom_local_payloads, _get_local_payloads
+from ai_xss_generator.models import _compact_dom_prompt_for_local
 from ai_xss_generator.probe import ProbeResult, ReflectionContext
 from ai_xss_generator.types import FormContext, FormField, ParsedContext
 from xssy.learn import _runtime_learning_context
@@ -45,11 +46,11 @@ def test_dom_local_payloads_forwards_local_timeout_to_generator():
 
     def _fake_generate_payloads(**kwargs):
         captured["timeout"] = kwargs["local_timeout_seconds"]
-        return [], "heuristic", True, "qwen3.5:9b"
+        return [], "ollama"
 
     with (
         patch("ai_xss_generator.learning.build_memory_profile", return_value={}),
-        patch("ai_xss_generator.models.generate_payloads", side_effect=_fake_generate_payloads),
+        patch("ai_xss_generator.models.generate_dom_local_payloads", side_effect=_fake_generate_payloads),
     ):
         _get_dom_local_payloads(
             context=context,
@@ -59,6 +60,22 @@ def test_dom_local_payloads_forwards_local_timeout_to_generator():
         )
 
     assert captured["timeout"] == 23
+
+
+def test_compact_dom_prompt_uses_sink_specific_profile():
+    context = ParsedContext(
+        source="https://example.test/#x",
+        source_type="url",
+        notes=[
+            '[dom:TAINT] {"code_location": "bundle.js:42", "sink": "document.write", "source_name": "hash", "source_type": "fragment"}'
+        ],
+    )
+
+    prompt = _compact_dom_prompt_for_local(context)
+
+    assert "Sink profile: document_write" in prompt
+    assert "URL-attribute breakout" in prompt
+    assert "Produce 3-6 payloads only." in prompt
 
 
 def test_xssy_learning_prefers_probe_enriched_runtime_context():

@@ -236,6 +236,124 @@ Requirements:
 {context_blob}""".strip()
 
 
+def _dom_sink_request_profile(sink: str) -> tuple[str, list[str]]:
+    normalized = sink.strip().lower()
+    if normalized in {"innerhtml", "outerhtml", "insertadjacenthtml"}:
+        return (
+            "html_injection",
+            [
+                "Focus on direct HTML element injection that auto-executes without user interaction.",
+                "Prefer compact event-handler payloads such as image, svg, details, or similar DOM-native HTML vectors.",
+                "Do not spend tokens on JavaScript string breakout ideas unless the sink explicitly indicates script evaluation.",
+            ],
+        )
+    if normalized in {"eval", "function", "settimeout", "setinterval"}:
+        return (
+            "js_execution",
+            [
+                "Focus on JavaScript expressions or statements that execute immediately in code-evaluation sinks.",
+                "Prefer short expression payloads over HTML tags.",
+                "Do not propose HTML-only payloads unless they are wrapped in code that the sink will execute.",
+            ],
+        )
+    if normalized in {"document.write", "document.writeln"}:
+        return (
+            "document_write",
+            [
+                "Focus on HTML or attribute breakout payloads suitable for markup assembled by document.write.",
+                "Prioritize quote closure, URL-attribute breakout, and same-tag event-handler injection when angle brackets may be constrained.",
+                "Include both full-tag injection payloads and no-angle-bracket attribute pivots if they are plausible.",
+            ],
+        )
+    return (
+        "generic_dom",
+        [
+            "Focus on payloads tailored to the exact DOM sink that already received tainted input.",
+            "Prefer compact, auto-executing payloads over generic broad XSS lists.",
+        ],
+    )
+
+
+def _compact_dom_prompt_for_local(
+    context: ParsedContext,
+    waf: str | None = None,
+    past_findings: list[Finding] | None = None,
+    past_lessons: list[Any] | None = None,
+) -> str:
+    """Build a compact sink-specific DOM prompt for smaller local models."""
+    dom_runtime = _extract_dom_runtime_context(context)
+    sink = dom_runtime.get("sink", "") or (context.dom_sinks[0].sink if context.dom_sinks else "")
+    profile_name, profile_rules = _dom_sink_request_profile(sink)
+
+    findings_section = ""
+    if past_findings:
+        slim = [
+            {
+                "payload": finding.payload,
+                "sink_type": finding.sink_type,
+                "context_type": finding.context_type,
+                "bypass_family": finding.bypass_family,
+            }
+            for finding in past_findings[:2]
+        ]
+        findings_section = "Related findings:\n" + json.dumps(slim, indent=2) + "\n"
+
+    lessons_section = ""
+    if past_lessons:
+        lesson_lines = []
+        for lesson in past_lessons[:2]:
+            title = getattr(lesson, "title", "")
+            summary = getattr(lesson, "summary", "")
+            if title or summary:
+                lesson_lines.append(f"- {title}: {summary}".strip(": "))
+        if lesson_lines:
+            lessons_section = "Runtime lessons:\n" + "\n".join(lesson_lines) + "\n"
+
+    context_summary = {
+        "source": context.source,
+        "frameworks": context.frameworks[:3],
+        "auth": bool(context.auth_notes),
+        "dom_runtime": dom_runtime,
+        "dom_sinks": [
+            {
+                "sink": sink_item.sink,
+                "location": sink_item.location,
+            }
+            for sink_item in context.dom_sinks[:3]
+        ],
+    }
+
+    waf_line = f"WAF: {waf}\n" if waf else ""
+    rule_lines = "\n".join(f"- {rule}" for rule in profile_rules)
+
+    return f"""You are generating authorized DOM XSS test payloads for a small local model pass.
+Return ONLY compact JSON.
+
+Output schema:
+{{
+  "payloads": [
+    {{
+      "payload": "string",
+      "target_sink": "{sink or 'unknown'}",
+      "tags": ["short", "labels"]
+    }}
+  ]
+}}
+
+Requirements:
+- Produce 3-6 payloads only.
+- Solve the exact DOM source->sink path shown below.
+- Prefer fast, practical payloads over exhaustive coverage.
+- Avoid explanations, rankings, essays, or long reasoning.
+- Sink profile: {profile_name}
+{rule_lines}
+
+DOM runtime:
+{json.dumps(dom_runtime, indent=2)}
+{waf_line}{lessons_section}{findings_section}Context summary:
+{json.dumps(context_summary, indent=2)}""".strip()
+
+
 # ---------------------------------------------------------------------------
 # Output quality gate
 # ---------------------------------------------------------------------------
@@ -425,6 +543,34 @@ def _generate_with_ollama(
     prompt = _prompt_for_context(
         context,
         reference_payloads=reference_payloads,
+        waf=waf,
+        past_findings=past_findings,
+        past_lessons=past_lessons,
+    )
+    response = requests.post(
+        f"{OLLAMA_BASE_URL}/api/generate",
+        json={"model": resolved_model, "prompt": prompt, "stream": False},
+        timeout=max(1, request_timeout_seconds),
+    )
+    response.raise_for_status()
+    body = response.json()
+    data = _extract_json_blob(body.get("response", ""))
+    return _normalize_payloads(data.get("payloads", []), source="ollama"), resolved_model
+
+
+def _generate_dom_local_with_ollama(
+    context: ParsedContext,
+    model: str,
+    waf: str | None = None,
+    past_findings: list[Finding] | None = None,
+    past_lessons: list[Any] | None = None,
+    request_timeout_seconds: int = 60,
+) -> tuple[list[PayloadCandidate], str]:
+    ready, resolved_model, reason = _ensure_ollama_model(model)
+    if not ready:
+        raise RuntimeError(f"Ollama unavailable: {reason}")
+    prompt = _compact_dom_prompt_for_local(
+        context,
         waf=waf,
         past_findings=past_findings,
         past_lessons=past_lessons,
@@ -794,6 +940,44 @@ def generate_cloud_payloads(
     )
 
     return payloads, engine
+
+
+def generate_dom_local_payloads(
+    context: ParsedContext,
+    model: str,
+    waf: str | None = None,
+    past_findings: list[Finding] | None = None,
+    past_lessons: list[Any] | None = None,
+    memory_profile: dict[str, Any] | None = None,
+    local_timeout_seconds: int = 60,
+) -> tuple[list[PayloadCandidate], str]:
+    """Generate a compact DOM-specific local payload set for active scans."""
+    dom_runtime = _extract_dom_runtime_context(context)
+    sink_type = dom_runtime.get("sink", "") or (context.dom_sinks[0].sink if context.dom_sinks else "")
+    memory_profile = memory_profile or build_memory_profile(
+        context=context,
+        waf_name=waf,
+        delivery_mode="dom",
+    )
+    if past_findings is None:
+        past_findings = relevant_findings(
+            sink_type=sink_type,
+            context_type="dom_xss",
+            surviving_chars="",
+            waf_name=str(memory_profile.get("waf_name", "")),
+            delivery_mode=str(memory_profile.get("delivery_mode", "")),
+            frameworks=tuple(memory_profile.get("frameworks", [])),
+            auth_required=bool(memory_profile.get("auth_required", False)),
+        )
+
+    return _generate_dom_local_with_ollama(
+        context=context,
+        model=model,
+        waf=waf,
+        past_findings=past_findings,
+        past_lessons=past_lessons,
+        request_timeout_seconds=local_timeout_seconds,
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -14,6 +14,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import queue
+import threading
 import time
 import urllib.parse
 from dataclasses import dataclass, field
@@ -28,7 +30,8 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 _ACTIVE_LOCAL_MODEL_TIMEOUT_SECONDS = 60
-_ACTIVE_CLOUD_GRACE_SECONDS = 30
+_ACTIVE_CLOUD_GRACE_SECONDS = 60
+_DOM_CLOUD_START_AFTER_SECONDS = 30
 
 
 def active_worker_timeout_budget(timeout_seconds: int, use_cloud: bool) -> int:
@@ -37,6 +40,32 @@ def active_worker_timeout_budget(timeout_seconds: int, use_cloud: bool) -> int:
     if use_cloud:
         minimum += _ACTIVE_CLOUD_GRACE_SECONDS
     return max(timeout_seconds, minimum)
+
+
+def _start_async_payload_stage(fn: Any) -> tuple[threading.Thread, "queue.Queue[list[str]]"]:
+    """Run a payload-generation callable in a daemon thread and capture its result."""
+    out: "queue.Queue[list[str]]" = queue.Queue(maxsize=1)
+
+    def _runner() -> None:
+        try:
+            payloads = fn() or []
+        except Exception:
+            payloads = []
+        try:
+            out.put_nowait(payloads)
+        except queue.Full:
+            pass
+
+    thread = threading.Thread(target=_runner, daemon=True)
+    thread.start()
+    return thread, out
+
+
+def _poll_async_payloads(out: "queue.Queue[list[str]]") -> tuple[bool, list[str]]:
+    try:
+        return True, out.get_nowait()
+    except queue.Empty:
+        return False, []
 
 
 # ---------------------------------------------------------------------------
@@ -660,7 +689,7 @@ def _get_dom_local_payloads(
 ) -> list[str]:
     """Ask the local model for DOM XSS payloads for one tainted source → sink path."""
     try:
-        from ai_xss_generator.models import generate_payloads
+        from ai_xss_generator.models import generate_dom_local_payloads
         from ai_xss_generator.learning import build_memory_profile
 
         memory_profile = build_memory_profile(
@@ -668,17 +697,14 @@ def _get_dom_local_payloads(
             waf_name=waf,
             delivery_mode="dom",
         )
-        payloads, engine, *_ = generate_payloads(
+        payloads, engine = generate_dom_local_payloads(
             context=context,
             model=model,
             waf=waf,
-            use_cloud=False,
             memory_profile=memory_profile,
             past_lessons=session_lessons,
             local_timeout_seconds=local_timeout_seconds,
         )
-        if engine == "heuristic":
-            return []
         return [
             p.payload
             for p in payloads
@@ -903,73 +929,103 @@ def _run_dom(
                 source = "dom_xss_runtime"
                 transform_name = "dom_xss_runtime"
                 cloud_used_for_hit = False
-
-                local_payloads = [] if _timed_out() else _get_dom_local_payloads(
-                    context=dom_context,
-                    model=model,
+                local_stage = None
+                local_done = False
+                local_payloads: list[str] = []
+                local_payloads_tried = False
+                cloud_stage = None
+                cloud_done = False
+                cloud_payloads: list[str] = []
+                cloud_delay_deadline = time.monotonic() + _DOM_CLOUD_START_AFTER_SECONDS
+                cloud_ekey = _escalation_key(
+                    url=url,
+                    param_name=hit.source_name,
                     waf=waf_hint,
-                    session_lessons=dom_session_lessons,
-                    local_timeout_seconds=local_model_timeout_seconds,
+                    surviving_chars=frozenset(),
+                    context_type=f"dom:{hit.source_type}:{hit.sink}",
                 )
-                if local_payloads:
+
+                if not _timed_out():
+                    local_stage = _start_async_payload_stage(lambda: _get_dom_local_payloads(
+                        context=dom_context,
+                        model=model,
+                        waf=waf_hint,
+                        session_lessons=dom_session_lessons,
+                        local_timeout_seconds=local_model_timeout_seconds,
+                    ))
+
+                def _try_dom_payloads(payloads: list[str], stage_name: str) -> bool:
+                    nonlocal confirmed, fired_payload, fired_url, detail
+                    nonlocal source, transform_name, local_payloads_tried, cloud_used_for_hit, cloud_escalated
+                    if not payloads or _timed_out():
+                        return False
                     exec_ok, exec_payload, exec_detail = attempt_dom_payloads(
                         browser=browser,
                         url=url,
                         source_type=hit.source_type,
                         source_name=hit.source_name,
                         sink=hit.sink,
-                        payloads=local_payloads,
+                        payloads=payloads,
                         auth_headers=auth_headers or {},
                         timeout_ms=nav_timeout_ms,
                     )
+                    if stage_name == "local_model":
+                        local_payloads_tried = True
+                    if stage_name == "cloud_model":
+                        cloud_used_for_hit = True
+                        cloud_escalated = True
                     if exec_ok:
                         confirmed = True
                         fired_payload = exec_payload
                         fired_url = _inject_dom_source(url, hit.source_type, hit.source_name, exec_payload)
                         detail = exec_detail
-                        source = "local_model"
-                        transform_name = "local_model"
+                        source = stage_name
+                        transform_name = stage_name
+                        return True
+                    return False
 
-                if not confirmed and use_cloud and not _timed_out():
-                    ekey = _escalation_key(
-                        url=url,
-                        param_name=hit.source_name,
-                        waf=waf_hint,
-                        surviving_chars=frozenset(),
-                        context_type=f"dom:{hit.source_type}:{hit.sink}",
-                    )
-                    cloud_payloads = _get_dom_cloud_payloads(
-                        context=dom_context,
-                        cloud_model=cloud_model,
-                        waf=waf_hint,
-                        ekey=ekey,
-                        dedup_registry=dedup_registry,
-                        dedup_lock=dedup_lock,
-                        ai_backend=ai_backend,
-                        cli_tool=cli_tool,
-                        cli_model=cli_model,
-                        session_lessons=dom_session_lessons,
-                    )
-                    if cloud_payloads:
-                        cloud_escalated = True
-                        cloud_used_for_hit = True
-                        exec_ok, exec_payload, exec_detail = attempt_dom_payloads(
-                            browser=browser,
-                            url=url,
-                            source_type=hit.source_type,
-                            source_name=hit.source_name,
-                            sink=hit.sink,
-                            payloads=cloud_payloads,
-                            auth_headers=auth_headers or {},
-                            timeout_ms=nav_timeout_ms,
-                        )
-                        if exec_ok:
-                            confirmed = True
-                            fired_payload = exec_payload
-                            fired_url = _inject_dom_source(url, hit.source_type, hit.source_name, exec_payload)
-                            detail = exec_detail
-                            source = "cloud_model"
-                            transform_name = "cloud_model"
+                while not confirmed and not _timed_out():
+                    if local_stage is not None and not local_done:
+                        local_ready, payloads = _poll_async_payloads(local_stage[1])
+                        if local_ready:
+                            local_done = True
+                            local_payloads = payloads
+                            if _try_dom_payloads(local_payloads, "local_model"):
+                                break
+
+                    if use_cloud and cloud_stage is None:
+                        should_start_cloud = (
+                            local_done
+                        ) or (not local_done and time.monotonic() >= cloud_delay_deadline)
+                        if should_start_cloud:
+                            cloud_stage = _start_async_payload_stage(lambda: _get_dom_cloud_payloads(
+                                context=dom_context,
+                                cloud_model=cloud_model,
+                                waf=waf_hint,
+                                ekey=cloud_ekey,
+                                dedup_registry=dedup_registry,
+                                dedup_lock=dedup_lock,
+                                ai_backend=ai_backend,
+                                cli_tool=cli_tool,
+                                cli_model=cli_model,
+                                session_lessons=dom_session_lessons,
+                            ))
+
+                    if cloud_stage is not None and not cloud_done:
+                        cloud_ready, payloads = _poll_async_payloads(cloud_stage[1])
+                        if cloud_ready:
+                            cloud_done = True
+                            cloud_payloads = payloads
+                            if _try_dom_payloads(cloud_payloads, "cloud_model"):
+                                break
+
+                    if local_done and cloud_done:
+                        break
+                    if local_done and local_payloads_tried and (not use_cloud or cloud_done):
+                        break
+                    if local_done and not local_payloads and not use_cloud:
+                        break
+                    time.sleep(0.05)
 
                 if not confirmed and not _timed_out():
                     fallback_payloads = fallback_payloads_for_sink(hit.sink)
