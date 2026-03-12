@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -22,6 +23,8 @@ from ai_xss_generator.learning import build_memory_profile
 from ai_xss_generator.lessons import lessons_prompt_section
 from ai_xss_generator.payloads import base_payloads_for_context, rank_payloads
 from ai_xss_generator.types import ParsedContext, PayloadCandidate
+
+log = logging.getLogger(__name__)
 
 
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
@@ -414,6 +417,7 @@ def _generate_with_ollama(
     waf: str | None = None,
     past_findings: list[Finding] | None = None,
     past_lessons: list[Any] | None = None,
+    request_timeout_seconds: int = 120,
 ) -> tuple[list[PayloadCandidate], str]:
     ready, resolved_model, reason = _ensure_ollama_model(model)
     if not ready:
@@ -428,7 +432,7 @@ def _generate_with_ollama(
     response = requests.post(
         f"{OLLAMA_BASE_URL}/api/generate",
         json={"model": resolved_model, "prompt": prompt, "stream": False},
-        timeout=120,
+        timeout=max(1, request_timeout_seconds),
     )
     response.raise_for_status()
     body = response.json()
@@ -830,6 +834,7 @@ def generate_payloads(
     cli_model: str | None = None,
     past_lessons: list[Any] | None = None,
     memory_profile: dict[str, Any] | None = None,
+    local_timeout_seconds: int = 120,
     # Legacy params — accepted but ignored
     allowed_memory_tiers: Any = None,
     allowed_lesson_tiers: Any = None,
@@ -888,6 +893,7 @@ def generate_payloads(
             waf=waf,
             past_findings=past_findings,
             past_lessons=past_lessons,
+            request_timeout_seconds=local_timeout_seconds,
         )
         engine = "ollama"
         used_fallback = False

@@ -29,7 +29,12 @@ from typing import Any, Sequence, TYPE_CHECKING
 if TYPE_CHECKING:
     from ai_xss_generator.types import PostFormTarget
 
-from ai_xss_generator.active.worker import WorkerResult, run_worker, run_dom_worker
+from ai_xss_generator.active.worker import (
+    WorkerResult,
+    active_worker_timeout_budget,
+    run_dom_worker,
+    run_worker,
+)
 from ai_xss_generator.console import (
     fmt_duration, info, setup_panel, step, success,
     teardown_panel, update_panel, warn,
@@ -157,8 +162,8 @@ def run_active_scan(
 
     # Start with results from a prior session run (empty list on fresh scan)
     results: list[WorkerResult] = list(prior_results)
-    # (proc, label, kind) — kind is "get" or "post" for worker pill display
-    active_procs: list[tuple[multiprocessing.Process, str, str]] = []
+    # (proc, label, kind, started_at, result_url)
+    active_procs: list[tuple[multiprocessing.Process, str, str, float, str]] = []
     work_iter = iter(work_items)
     total_count = len(work_items)
     completed = 0
@@ -204,7 +209,7 @@ def run_active_scan(
         # ── Workers + confirmed + active label ─────────────────────────────
         pills: list[str] = []
         _MAGENTA = "\033[35m"
-        for _, _lbl, _kind in active_procs:
+        for _, _lbl, _kind, _, _ in active_procs:
             if _kind == "get":
                 pills.append(f"{GREEN}GET●{RESET}")
             elif _kind == "post":
@@ -232,20 +237,22 @@ def run_active_scan(
         workers = f"  {pills_str}   {DIM}│{RESET}  {conf_str} confirmed{label_part}"
         return sep, bar, workers
 
-    def _drain_queue() -> None:
+    def _record_result(r: WorkerResult) -> None:
         nonlocal confirmed_count
+        results.append(r)
+        _log_result(r)
+        if r.status == "confirmed":
+            confirmed_count += len(r.confirmed_findings)
+        if session is not None:
+            from ai_xss_generator.session import checkpoint as _checkpoint
+            _checkpoint(session, r.url, r)
+
+    def _drain_queue() -> None:
         import queue as _queue
         while True:
             try:
                 r = result_queue.get(timeout=0.05)
-                results.append(r)
-                _log_result(r)
-                if r.status == "confirmed":
-                    confirmed_count += len(r.confirmed_findings)
-                # Checkpoint every completed result so a crash or pause is resumable
-                if session is not None:
-                    from ai_xss_generator.session import checkpoint as _checkpoint
-                    _checkpoint(session, r.url, r)
+                _record_result(r)
             except _queue.Empty:
                 break
             except Exception:
@@ -254,13 +261,28 @@ def run_active_scan(
     def _reap_finished() -> None:
         nonlocal active_procs, completed
         still_running = []
-        for proc, plabel, pkind in active_procs:
+        now = time.monotonic()
+        for proc, plabel, pkind, started_at, result_url in active_procs:
+            elapsed = now - started_at
+            worker_budget = active_worker_timeout_budget(config.timeout_seconds, config.use_cloud)
+            if proc.is_alive() and elapsed > worker_budget:
+                warn(f"[worker] timeout after {worker_budget}s → {plabel}")
+                proc.kill()
+                proc.join(timeout=1)
+                completed += 1
+                _record_result(WorkerResult(
+                    url=result_url,
+                    status="error",
+                    error=f"Worker timed out after {worker_budget}s",
+                    kind=pkind,
+                ))
+                continue
             if not proc.is_alive():
                 proc.join(timeout=1)
                 completed += 1
                 log.debug("Worker done for %s (%d/%d)", plabel, completed, total_count)
             else:
-                still_running.append((proc, plabel, pkind))
+                still_running.append((proc, plabel, pkind, started_at, result_url))
         active_procs = still_running
 
     # Install SIGINT handler for two-stage graceful pause.
@@ -273,7 +295,7 @@ def run_active_scan(
         if _pause_requested:
             # Second Ctrl+C — kill everything now
             warn("Force-kill: terminating all workers immediately...")
-            for proc, _, _ in active_procs:
+            for proc, _, _, _, _ in active_procs:
                 proc.kill()
             raise KeyboardInterrupt
         _pause_requested = True
@@ -382,7 +404,8 @@ def run_active_scan(
                         )
                         log_label = f"[POST] {pf.action_url}"
                     proc.start()
-                    active_procs.append((proc, log_label, kind))
+                    result_url = next_url if kind != "post" else pf.action_url
+                    active_procs.append((proc, log_label, kind, time.monotonic(), result_url))
                     info(f"[worker] started → {log_label}")
 
             update_panel(*_build_panel())
@@ -397,8 +420,9 @@ def run_active_scan(
         signal.signal(signal.SIGINT, _original_sigint)
         teardown_panel()
         # Final drain after all processes finish
-        for proc, _, _ in active_procs:
-            proc.join(timeout=config.timeout_seconds + 5)
+        final_join_timeout = active_worker_timeout_budget(config.timeout_seconds, config.use_cloud) + 5
+        for proc, _, _, _, _ in active_procs:
+            proc.join(timeout=final_join_timeout)
         _drain_queue()
         manager.shutdown()
         # Mark session complete only on clean finish; paused/crashed stays in_progress

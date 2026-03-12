@@ -27,6 +27,17 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+_ACTIVE_LOCAL_MODEL_TIMEOUT_SECONDS = 60
+_ACTIVE_CLOUD_GRACE_SECONDS = 30
+
+
+def active_worker_timeout_budget(timeout_seconds: int, use_cloud: bool) -> int:
+    """Return the effective per-worker budget for staged local+cloud execution."""
+    minimum = _ACTIVE_LOCAL_MODEL_TIMEOUT_SECONDS
+    if use_cloud:
+        minimum += _ACTIVE_CLOUD_GRACE_SECONDS
+    return max(timeout_seconds, minimum)
+
 
 # ---------------------------------------------------------------------------
 # Result types
@@ -183,7 +194,8 @@ def _run(
     cli_tool: str = "claude",
     cli_model: str | None = None,
 ) -> None:
-    deadline = start_time + timeout_seconds
+    deadline = start_time + active_worker_timeout_budget(timeout_seconds, use_cloud)
+    local_model_timeout_seconds = _ACTIVE_LOCAL_MODEL_TIMEOUT_SECONDS
 
     def _timed_out() -> bool:
         return time.monotonic() > deadline
@@ -337,6 +349,7 @@ def _run(
                         auth_headers=auth_headers,
                         delivery_mode="get",
                         session_lessons=session_lessons,
+                        local_timeout_seconds=local_model_timeout_seconds,
                     )
 
                     for lp in local_payloads:
@@ -533,6 +546,7 @@ def _get_local_payloads(
     auth_headers: dict[str, str] | None = None,
     delivery_mode: str = "get",
     session_lessons: list[Any] | None = None,
+    local_timeout_seconds: int = _ACTIVE_LOCAL_MODEL_TIMEOUT_SECONDS,
 ) -> list[str]:
     """Ask the local model for payloads. Returns raw payload strings.
 
@@ -562,6 +576,7 @@ def _get_local_payloads(
             use_cloud=False,  # local only at this step
             memory_profile=memory_profile,
             past_lessons=session_lessons,
+            local_timeout_seconds=local_timeout_seconds,
         )
         if engine == "heuristic":
             return []
@@ -641,6 +656,7 @@ def _get_dom_local_payloads(
     model: str,
     waf: str | None,
     session_lessons: list[Any] | None = None,
+    local_timeout_seconds: int = _ACTIVE_LOCAL_MODEL_TIMEOUT_SECONDS,
 ) -> list[str]:
     """Ask the local model for DOM XSS payloads for one tainted source → sink path."""
     try:
@@ -659,6 +675,7 @@ def _get_dom_local_payloads(
             use_cloud=False,
             memory_profile=memory_profile,
             past_lessons=session_lessons,
+            local_timeout_seconds=local_timeout_seconds,
         )
         if engine == "heuristic":
             return []
@@ -796,8 +813,15 @@ def _run_dom(
     )
     from ai_xss_generator.parser import parse_target as _parse_target
 
+    started_at = time.monotonic()
+    deadline = started_at + active_worker_timeout_budget(timeout_seconds, use_cloud)
+
+    def _timed_out() -> bool:
+        return time.monotonic() > deadline
+
     # Cap per-navigation timeout to 15 s regardless of the overall worker timeout
     nav_timeout_ms = min(timeout_seconds * 1_000, 15_000)
+    local_model_timeout_seconds = _ACTIVE_LOCAL_MODEL_TIMEOUT_SECONDS
     _cached_context: Any = None
     try:
         _cached_context = _parse_target(
@@ -857,6 +881,8 @@ def _run_dom(
         )
         try:
             for hit in dom_hits:
+                if _timed_out():
+                    break
                 dom_context = _build_dom_context(
                     base_context=_cached_context,
                     url=url,
@@ -878,11 +904,12 @@ def _run_dom(
                 transform_name = "dom_xss_runtime"
                 cloud_used_for_hit = False
 
-                local_payloads = _get_dom_local_payloads(
+                local_payloads = [] if _timed_out() else _get_dom_local_payloads(
                     context=dom_context,
                     model=model,
                     waf=waf_hint,
                     session_lessons=dom_session_lessons,
+                    local_timeout_seconds=local_model_timeout_seconds,
                 )
                 if local_payloads:
                     exec_ok, exec_payload, exec_detail = attempt_dom_payloads(
@@ -903,7 +930,7 @@ def _run_dom(
                         source = "local_model"
                         transform_name = "local_model"
 
-                if not confirmed and use_cloud:
+                if not confirmed and use_cloud and not _timed_out():
                     ekey = _escalation_key(
                         url=url,
                         param_name=hit.source_name,
@@ -944,7 +971,7 @@ def _run_dom(
                             source = "cloud_model"
                             transform_name = "cloud_model"
 
-                if not confirmed:
+                if not confirmed and not _timed_out():
                     fallback_payloads = fallback_payloads_for_sink(hit.sink)
                     exec_ok, exec_payload, exec_detail = attempt_dom_payloads(
                         browser=browser,
@@ -1153,7 +1180,8 @@ def _run_post(
     from ai_xss_generator.active.transforms import all_variants_for_probe
     from ai_xss_generator.parser import parse_target as _parse_target
 
-    deadline = start_time + timeout_seconds
+    deadline = start_time + active_worker_timeout_budget(timeout_seconds, use_cloud)
+    local_model_timeout_seconds = _ACTIVE_LOCAL_MODEL_TIMEOUT_SECONDS
 
     def _timed_out() -> bool:
         return time.monotonic() > deadline
@@ -1276,6 +1304,7 @@ def _run_post(
                         auth_headers=auth_headers,
                         delivery_mode="post",
                         session_lessons=post_session_lessons,
+                        local_timeout_seconds=local_model_timeout_seconds,
                     )
 
                     for lp in local_payloads:
