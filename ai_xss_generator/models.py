@@ -184,6 +184,8 @@ def _effective_constraints_section(
     deprioritized_families = list(knowledge.get("avoid_strategies", []) or [])[:5]
     failed_families: list[str] = []
     strategy_shifts: list[str] = []
+    delivery_shifts: list[str] = []
+    creative_techniques: list[str] = []
 
     if past_lessons:
         for lesson in past_lessons:
@@ -198,20 +200,39 @@ def _effective_constraints_section(
                 shift_text = str(shift or "").strip()
                 if shift_text and shift_text not in strategy_shifts:
                     strategy_shifts.append(shift_text)
+            for shift in metadata.get("delivery_constraints", []) or []:
+                shift_text = str(shift or "").strip()
+                if shift_text and shift_text not in delivery_shifts:
+                    delivery_shifts.append(shift_text)
 
     if context_type == "html_attr_url":
         if "scheme_fragmentation" not in recommended_families:
             recommended_families.append("scheme_fragmentation")
+        creative_techniques.extend([
+            "split or fragment URL delivery when query-only delivery keeps missing",
+            "entity-encoded or whitespace-broken scheme shaping",
+        ])
     if context_type in {"html_attr_value", "html_body"} or dom_runtime.get("sink") == "document.write":
         if "quote_closure" not in recommended_families:
             recommended_families.append("quote_closure")
+        creative_techniques.append("same-tag attribute pivots before broad full-tag escapes")
     if surviving_chars and "<" not in surviving_chars and "plain_script_tag" not in deprioritized_families:
         deprioritized_families.append("plain_script_tag")
     if observed_transforms and "mixed_case_markup" not in recommended_families:
         recommended_families.append("mixed_case_markup")
+        creative_techniques.append("numeric/entity-encoded alpha or other case-agnostic markup shaping")
+    if knowledge.get("normalization", {}).get("html_entity_decode") is False:
+        creative_techniques.append("HTML numeric/entity encoding when raw tokens are high-pressure")
+    if knowledge.get("normalization", {}).get("unicode_escape_decode") is False:
+        creative_techniques.append("Unicode-width or escaped-token variants only when the sink/parser plausibly preserves them")
     for family in failed_families:
         if family not in deprioritized_families:
             deprioritized_families.append(family)
+
+    deduped_creative: list[str] = []
+    for item in creative_techniques:
+        if item not in deduped_creative:
+            deduped_creative.append(item)
 
     compact = {
         "confirmed_sink": sink_type or dom_runtime.get("sink", ""),
@@ -221,6 +242,8 @@ def _effective_constraints_section(
         "recommended_families": recommended_families[:5],
         "deprioritized_families": deprioritized_families[:5],
         "required_strategy_shifts": strategy_shifts[:4],
+        "required_delivery_shifts": delivery_shifts[:4],
+        "creative_techniques": deduped_creative[:4],
     }
     return "EFFECTIVE CONSTRAINTS:\n" + json.dumps(compact, indent=2) + "\n"
 
@@ -231,6 +254,7 @@ def _execution_feedback_section(past_lessons: list[Any] | None) -> str:
 
     failed_families: list[str] = []
     strategy_constraints: list[str] = []
+    delivery_constraints: list[str] = []
     duplicate_payloads: list[str] = []
     observations: list[str] = []
 
@@ -248,6 +272,7 @@ def _execution_feedback_section(past_lessons: list[Any] | None) -> str:
         metadata = getattr(lesson, "metadata", {}) or {}
         _extend_unique(failed_families, metadata.get("failed_families", []) or [], 5)
         _extend_unique(strategy_constraints, metadata.get("strategy_constraints", []) or [], 5)
+        _extend_unique(delivery_constraints, metadata.get("delivery_constraints", []) or [], 5)
         _extend_unique(duplicate_payloads, metadata.get("duplicate_payloads", []) or [], 4)
         observation = str(metadata.get("observation", "") or "").strip()
         if observation and observation not in observations:
@@ -255,12 +280,13 @@ def _execution_feedback_section(past_lessons: list[Any] | None) -> str:
         if len(observations) >= 2:
             break
 
-    if not any((failed_families, strategy_constraints, duplicate_payloads, observations)):
+    if not any((failed_families, strategy_constraints, delivery_constraints, duplicate_payloads, observations)):
         return ""
 
     compact = {
         "failed_families": failed_families[:5],
         "strategy_shifts": strategy_constraints[:5],
+        "delivery_shifts": delivery_constraints[:5],
         "duplicate_payloads": duplicate_payloads[:4],
         "observations": observations[:2],
     }
@@ -412,6 +438,7 @@ Requirements:
 - Include payloads from multiple bypass families that are plausible for this context.
 - Prefer compact, self-contained payloads with no external dependencies.
 - Include a compact `strategy` object per payload so the scanner can reason about delivery shape, encoding style, and what to pivot to next if the attempt fails.
+- When the effective constraints justify it, consider uncommon but plausible techniques such as numeric entities, Unicode-width variants, mixed encodings, or parser-state pivots. Do not use novelty unless it materially helps this exact context.
 
 {probe_section}{dom_section}{behavior_section}{waf_knowledge_section}{effective_constraints_section}{execution_feedback_section}{lessons_section}{findings_section}{auth_section}{waf_section}{reference_section}Full parsed context:
 {context_blob}""".strip()
@@ -543,6 +570,7 @@ Requirements:
 - Prefer fast, practical payloads over exhaustive coverage.
 - Avoid explanations, rankings, essays, or long reasoning.
 - Keep each `strategy` object short and actionable.
+- If the effective constraints suggest it, you may use uncommon encodings such as numeric entities or Unicode-width variants, but only when they plausibly survive and change interpretation.
 - Sink profile: {profile_name}
 {rule_lines}
 
@@ -752,6 +780,7 @@ Requirements:
 - Prefer materially distinct payload families over near-duplicates.
 - Keep payloads compact and execution-focused.
 - Use `strategy` to describe delivery shape and the next tactic to pivot to if the sink stays taint-only.
+- If the effective constraints justify it, you may use uncommon encodings such as numeric entities, Unicode-width variants, or mixed encoding, but only when they plausibly change parser or WAF interpretation.
 - Sink profile: {profile_name}
 {rule_lines}
 
@@ -854,6 +883,7 @@ Requirements:
 - Avoid safe parser probes and other non-executing markup.
 - Prefer materially distinct payload families over near-duplicates.
 - Use `strategy` to explain which attack family the payload belongs to and what family should be tried next if it does not execute.
+- If the effective constraints justify it, you may use uncommon encodings such as numeric entities, Unicode-width variants, or mixed encoding, but only when they plausibly improve this exact document.write subcontext.
 
 DOM runtime:
 {json.dumps(dom_runtime, indent=2)}

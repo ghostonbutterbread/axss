@@ -244,6 +244,13 @@ def _build_cloud_feedback_lessons(
         duplicate_payloads=duplicate_payloads or [],
         observation=observation,
     )
+    delivery_constraints = _infer_delivery_constraints(
+        prompt_context=prompt_context,
+        delivery_mode=delivery_mode,
+        context_type=context_type,
+        sink_context=sink_context,
+        observation=observation,
+    )
 
     summary_parts = [
         f"Cloud attempt {attempt_number}/{total_attempts} for {delivery_mode or 'active'} "
@@ -260,6 +267,10 @@ def _build_cloud_feedback_lessons(
     if strategy_constraints:
         summary_parts.append(
             "Strategy shifts for the next batch: " + " ".join(strategy_constraints)
+        )
+    if delivery_constraints:
+        summary_parts.append(
+            "Delivery shifts for the next batch: " + " ".join(delivery_constraints)
         )
     summary_parts.append("Return a materially different next batch and avoid near-duplicates.")
     failed_families = _infer_failed_families(
@@ -290,6 +301,7 @@ def _build_cloud_feedback_lessons(
                 "sink_context": sink_context,
                 "failed_families": failed_families,
                 "strategy_constraints": strategy_constraints[:4],
+                "delivery_constraints": delivery_constraints[:4],
                 "observation": observation.strip(),
                 "duplicate_payloads": [payload for payload in (duplicate_payloads or []) if payload][:4],
             },
@@ -396,6 +408,53 @@ def _infer_failed_families(
         _add("document_write_markup_escape")
 
     return families[:4]
+
+
+def _infer_delivery_constraints(
+    *,
+    prompt_context: Any,
+    delivery_mode: str,
+    context_type: str,
+    sink_context: str,
+    observation: str,
+) -> list[str]:
+    constraints: list[str] = []
+    normalized_context = context_type.strip().lower()
+    normalized_sink = sink_context.strip().lower()
+    lowered_observation = observation.lower()
+
+    def _add(note: str) -> None:
+        cleaned = note.strip()
+        if cleaned and cleaned not in constraints:
+            constraints.append(cleaned)
+
+    if delivery_mode == "get" and normalized_context == "html_attr_url":
+        _add("Change delivery shape as well as payload syntax; consider fragment-only delivery, split URL construction, or same-session follow-up before repeating query-only attempts.")
+    if delivery_mode == "post":
+        _add("Consider coordinated multi-field delivery or stored follow-up rendering instead of single-field rewrites only.")
+    if delivery_mode == "dom":
+        _add("If the sink is router- or DOM-state driven, prefer fragment-only or same-session navigation pivots before broad query retries.")
+    if normalized_sink in {"document.write", "document.writeln"}:
+        _add("Document.write contexts often reward fragment or same-page attribute pivots more than repeated query-only full-tag escapes.")
+    if "no dialog" in lowered_observation or "no execution signal" in lowered_observation:
+        _add("If the syntax family changed but nothing executed, also change the delivery path or state transition on the next attempt.")
+
+    try:
+        from ai_xss_generator.behavior import extract_behavior_profile
+
+        profile = extract_behavior_profile(prompt_context)
+    except Exception:
+        profile = {}
+
+    probe_modes = {
+        str(item).strip().lower()
+        for item in profile.get("probe_modes", []) or []
+        if str(item).strip()
+    }
+    if "stealth" in probe_modes:
+        _add("Keep delivery low-noise and compact; prefer one or two deliberate pivots over broad request churn.")
+
+    return constraints[:4]
 
 
 # ---------------------------------------------------------------------------
