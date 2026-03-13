@@ -427,6 +427,16 @@ def touch_profile_last_used(ref: str, store: dict[str, Any] | None = None) -> di
     return upsert_profile(resolved, active_store)
 
 
+def record_profile_validation(
+    profile: AuthProfile,
+    validation: AuthValidationResult,
+    store: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    profile.last_validated_at = _now_iso()
+    profile.invalid_reason = validation.reason if validation.invalid else ""
+    return upsert_profile(profile, store)
+
+
 def _is_loginish_url(url: str) -> bool:
     path = urllib.parse.urlparse(url).path.lower()
     return any(token in path for token in _LOGIN_PATH_TOKENS)
@@ -508,4 +518,3 @@ def purge_invalid_profiles(
         active_store["active_profile"] = ""
     save_auth_store(active_store)
     return active_store, removed
-

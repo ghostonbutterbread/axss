@@ -197,3 +197,13 @@ def test_auth_list_prunes_invalid_profiles(tmp_path, monkeypatch, capsys) -> Non
     assert rc == 0
     output = capsys.readouterr().out
     assert "Removed expired auth profile demo/bad" in output
+
+
+def test_auth_command_without_subcommand_opens_tui_when_interactive(monkeypatch) -> None:
+    from ai_xss_generator.auth_cli import handle_auth_command
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("ai_xss_generator.auth_tui.run_auth_tui", lambda: 7)
+
+    assert handle_auth_command([]) == 7

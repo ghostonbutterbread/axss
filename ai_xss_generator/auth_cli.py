@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 from ai_xss_generator.auth import describe_auth
@@ -106,7 +107,13 @@ def _print_grouped_profiles(store: dict) -> None:
 def handle_auth_command(argv: list[str]) -> int:
     parser = build_auth_parser()
     args = parser.parse_args(argv)
-    command = args.command or "list"
+    command = args.command or "tui"
+
+    if command == "tui":
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            from ai_xss_generator.auth_tui import run_auth_tui
+            return run_auth_tui()
+        command = "list"
 
     if command == "none":
         clear_active_profile()
@@ -125,6 +132,7 @@ def handle_auth_command(argv: list[str]) -> int:
         if args.activate:
             store, resolved = set_active_profile(profile.ref, store)
             if resolved is not None:
+                touch_profile_last_used(resolved.ref, store)
                 success(f"Imported and activated {resolved.ref}")
         else:
             success(f"Imported {profile.ref}")
