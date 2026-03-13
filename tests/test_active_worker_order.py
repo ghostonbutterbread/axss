@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from ai_xss_generator.active.transforms import TransformVariant
 from ai_xss_generator.active.dom_xss import DomTaintHit
+from ai_xss_generator.behavior import attach_behavior_profile, build_target_behavior_profile
 from ai_xss_generator.active.worker import (
     WorkerResult,
     _dom_hit_priority,
@@ -31,6 +32,24 @@ def _fake_context(source: str) -> SimpleNamespace:
 
 def _fake_parsed_context(source: str) -> ParsedContext:
     return ParsedContext(source=source, source_type="url")
+
+
+def _context_with_behavior(source: str, *, delivery_mode: str, waf_name: str, auth: bool = False) -> ParsedContext:
+    context = ParsedContext(
+        source=source,
+        source_type="url",
+        auth_notes=["Session cookies provided (1 cookie(s))"] if auth else [],
+    )
+    profile = build_target_behavior_profile(
+        url=source,
+        delivery_mode=delivery_mode,
+        waf_name=waf_name,
+        auth_required=auth,
+        context=context,
+    )
+    attached = attach_behavior_profile(context, profile)
+    assert attached is not None
+    return attached
 
 
 class _FakeFetcherSession:
@@ -300,6 +319,81 @@ def test_get_worker_uses_deterministic_fallback_only_after_local_and_cloud_fail(
     assert actions == ["local:html_body", "cloud:html_body", "fire:raw"]
     assert results and results[0].status == "confirmed"
     assert results[0].confirmed_findings[0].source == "phase1_transform"
+
+
+def test_get_worker_skips_local_on_high_friction_hard_context_and_uses_cloud() -> None:
+    url = "https://example.test/login?redirect=/account"
+    probe_result = ProbeResult(
+        param_name="redirect",
+        original_value="/account",
+        reflections=[
+            ReflectionContext(context_type="html_attr_url", attr_name="href", surviving_chars=frozenset({"'", "\"", "(", ")"})),
+        ],
+    )
+    actions: list[str] = []
+    results: list[WorkerResult] = []
+
+    class FakeExecutor:
+        def __init__(self, auth_headers=None) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            pass
+
+        def fire(self, **kwargs):
+            actions.append(f"fire:{kwargs['transform_name']}:{kwargs['payload']}")
+            return SimpleNamespace(
+                confirmed=kwargs["payload"] == "cloud-url",
+                method="dialog",
+                detail="alert fired",
+                transform_name=kwargs["transform_name"],
+                payload=kwargs["payload"],
+                fired_url=kwargs["url"],
+            )
+
+    with (
+        patch("ai_xss_generator.probe.probe_url", return_value=[probe_result]),
+        patch(
+            "ai_xss_generator.parser.parse_target",
+            return_value=_context_with_behavior(url, delivery_mode="get", waf_name="akamai", auth=True),
+        ),
+        patch("scrapling.fetchers.FetcherSession", _FakeFetcherSession),
+        patch("ai_xss_generator.active.executor.ActiveExecutor", FakeExecutor),
+        patch(
+            "ai_xss_generator.active.transforms.all_variants_for_probe",
+            return_value=[("redirect", "html_attr_url", [TransformVariant("raw", "fallback-url")])],
+        ),
+        patch("ai_xss_generator.active.worker._get_local_payloads", side_effect=AssertionError("local should be skipped")),
+        patch("ai_xss_generator.active.worker._get_cloud_payloads", return_value=["cloud-url"]),
+    ):
+        _run(
+            url=url,
+            rate=5.0,
+            waf_hint="akamai",
+            model="qwen3.5",
+            cloud_model="anthropic/claude-3-5-sonnet",
+            use_cloud=True,
+            timeout_seconds=30,
+            result_queue=None,
+            dedup_registry={},
+            dedup_lock=threading.Lock(),
+            findings_lock=threading.Lock(),
+            start_time=time.monotonic(),
+            put_result=results.append,
+            auth_headers={"Cookie": "sid=abc"},
+            sink_url=None,
+            ai_backend="api",
+            cli_tool="claude",
+            cli_model=None,
+        )
+
+    assert actions == ["fire:cloud_model:cloud-url"]
+    assert results and results[0].status == "confirmed"
+    assert results[0].confirmed_findings[0].source == "cloud_model"
+    assert "Skipped local model" in results[0].confirmed_findings[0].ai_note
 
 
 class _FakeBrowser:

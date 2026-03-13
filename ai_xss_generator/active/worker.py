@@ -522,6 +522,13 @@ def _run(
                     break
 
                 context_probe_result = _probe_result_for_context(probe_result, context_type)
+                from ai_xss_generator.behavior import derive_ai_escalation_policy
+
+                escalation_policy = derive_ai_escalation_policy(
+                    _cached_context,
+                    delivery_mode="get",
+                    context_type=context_type,
+                )
                 cloud_plan = CloudPayloadPlan()
                 # Track confirmation per context — a confirmed finding on one
                 # param must not suppress escalation on a different param.
@@ -531,7 +538,7 @@ def _run(
                 # Only AI-origin payloads are returned here; heuristic payloads
                 # still exist in generate_payloads() but stay out of active
                 # execution so deterministic fallback remains explicit.
-                if not context_confirmed and not _timed_out():
+                if escalation_policy.use_local and not context_confirmed and not _timed_out():
                     local_payloads = _get_local_payloads(
                         url=url,
                         probe_result=context_probe_result,
@@ -541,7 +548,10 @@ def _run(
                         auth_headers=auth_headers,
                         delivery_mode="get",
                         session_lessons=session_lessons,
-                        local_timeout_seconds=local_model_timeout_seconds,
+                        local_timeout_seconds=min(
+                            local_model_timeout_seconds,
+                            escalation_policy.local_timeout_seconds,
+                        ),
                     )
 
                     for lp in local_payloads:
@@ -565,6 +575,7 @@ def _run(
                                 waf=waf_hint,
                                 source="local_model",
                                 cloud_escalated=False,
+                                ai_note=escalation_policy.note,
                             )
                             confirmed_findings.append(finding)
                             context_confirmed = True
@@ -638,10 +649,13 @@ def _run(
                                     source="cloud_model",
                                     cloud_escalated=True,
                                     ai_engine=cloud_plan.engine,
-                                    ai_note=_cloud_attempt_note(
-                                        cloud_plan.note,
-                                        attempt_number,
-                                        max(1, cloud_attempts),
+                                    ai_note=_merge_ai_notes(
+                                        escalation_policy.note,
+                                        _cloud_attempt_note(
+                                            cloud_plan.note,
+                                            attempt_number,
+                                            max(1, cloud_attempts),
+                                        ),
                                     ),
                                 )
                                 confirmed_findings.append(finding)
@@ -690,7 +704,10 @@ def _run(
                                 waf=waf_hint,
                                 source="phase1_transform",
                                 cloud_escalated=False,
-                                ai_note=cloud_plan.note if use_cloud else "",
+                                ai_note=_merge_ai_notes(
+                                    escalation_policy.note,
+                                    cloud_plan.note if use_cloud else "",
+                                ),
                             )
                             confirmed_findings.append(finding)
                             context_confirmed = True
@@ -912,6 +929,11 @@ def _coerce_cloud_plan(value: Any) -> CloudPayloadPlan:
     if isinstance(value, list):
         return CloudPayloadPlan(payloads=list(value))
     return CloudPayloadPlan()
+
+
+def _merge_ai_notes(*notes: str) -> str:
+    merged = [note.strip() for note in notes if note and note.strip()]
+    return " ".join(merged)
 
 
 def _dom_hit_priority(hit: Any) -> tuple[int, str, str]:
@@ -1347,6 +1369,13 @@ def _run_dom(
                     code_location=hit.code_location,
                     auth_headers=auth_headers,
                 )
+                from ai_xss_generator.behavior import derive_ai_escalation_policy
+
+                escalation_policy = derive_ai_escalation_policy(
+                    dom_context,
+                    delivery_mode="dom",
+                    sink_context=hit.sink,
+                )
                 confirmed = False
                 fired_payload = ""
                 fired_url = hit.canary_url
@@ -1361,7 +1390,7 @@ def _run_dom(
                 ai_engine = ""
                 ai_note = ""
                 local_stage = None
-                local_done = False
+                local_done = not escalation_policy.use_local
                 local_payloads: list[str] = []
                 local_payloads_tried = False
                 cloud_stage = None
@@ -1371,7 +1400,11 @@ def _run_dom(
                 cloud_payloads: list[str] = []
                 cloud_feedback_lessons: list[Any] | None = None
                 seen_cloud_payloads: set[str] = set()
-                cloud_delay_deadline = time.monotonic() + _DOM_CLOUD_START_AFTER_SECONDS
+                cloud_delay_deadline = time.monotonic() + (
+                    escalation_policy.cloud_start_after_seconds
+                    if escalation_policy.cloud_start_after_seconds is not None
+                    else _DOM_CLOUD_START_AFTER_SECONDS
+                )
                 cloud_ekey = _escalation_key(
                     url=url,
                     param_name=hit.source_name,
@@ -1380,13 +1413,16 @@ def _run_dom(
                     context_type=f"dom:{hit.source_type}:{hit.sink}",
                 )
 
-                if not _timed_out():
+                if escalation_policy.use_local and not _timed_out():
                     local_stage = _start_async_payload_stage(lambda: _get_dom_local_payloads(
                         context=dom_context,
                         model=model,
                         waf=waf_hint,
                         session_lessons=dom_session_lessons,
-                        local_timeout_seconds=local_model_timeout_seconds,
+                        local_timeout_seconds=min(
+                            local_model_timeout_seconds,
+                            escalation_policy.local_timeout_seconds,
+                        ),
                     ))
 
                 def _try_dom_payloads(payloads: list[str], stage_name: str) -> bool:
@@ -1411,10 +1447,13 @@ def _run_dom(
                         cloud_used_for_hit = True
                         cloud_escalated = True
                         ai_engine = cloud_plan.engine
-                        ai_note = _cloud_attempt_note(
-                            cloud_plan.note,
-                            cloud_rounds_started,
-                            max(1, cloud_attempts),
+                        ai_note = _merge_ai_notes(
+                            escalation_policy.note,
+                            _cloud_attempt_note(
+                                cloud_plan.note,
+                                cloud_rounds_started,
+                                max(1, cloud_attempts),
+                            ),
                         )
                     if exec_ok:
                         confirmed = True
@@ -1510,11 +1549,18 @@ def _run_dom(
                         detail = exec_detail
                         source = "phase1_transform"
                         transform_name = "dom_static_fallback"
-                        ai_note = _cloud_attempt_note(
-                            cloud_plan.note,
-                            cloud_rounds_started,
-                            max(1, cloud_attempts),
-                        ) if cloud_rounds_started else cloud_plan.note
+                        ai_note = _merge_ai_notes(
+                            escalation_policy.note,
+                            (
+                                _cloud_attempt_note(
+                                    cloud_plan.note,
+                                    cloud_rounds_started,
+                                    max(1, cloud_attempts),
+                                )
+                                if cloud_rounds_started
+                                else cloud_plan.note
+                            ),
+                        )
 
                 findings.append(
                     ConfirmedFinding(
@@ -1533,7 +1579,7 @@ def _run_dom(
                         cloud_escalated=cloud_used_for_hit,
                         code_location=hit.code_location,
                         ai_engine=ai_engine,
-                        ai_note=ai_note,
+                        ai_note=ai_note or escalation_policy.note,
                     )
                 )
         finally:
@@ -1864,10 +1910,17 @@ def _run_post(
                     break
 
                 context_probe_result = _probe_result_for_context(probe_result, context_type)
+                from ai_xss_generator.behavior import derive_ai_escalation_policy
+
+                escalation_policy = derive_ai_escalation_policy(
+                    _cached_context,
+                    delivery_mode="post",
+                    context_type=context_type,
+                )
                 cloud_plan = CloudPayloadPlan()
                 context_confirmed = False
 
-                if not context_confirmed and not _timed_out():
+                if escalation_policy.use_local and not context_confirmed and not _timed_out():
                     local_payloads = _get_local_payloads(
                         url=post_form.source_page_url,
                         probe_result=context_probe_result,
@@ -1877,7 +1930,10 @@ def _run_post(
                         auth_headers=auth_headers,
                         delivery_mode="post",
                         session_lessons=post_session_lessons,
-                        local_timeout_seconds=local_model_timeout_seconds,
+                        local_timeout_seconds=min(
+                            local_model_timeout_seconds,
+                            escalation_policy.local_timeout_seconds,
+                        ),
                     )
 
                     for lp in local_payloads:
@@ -1903,6 +1959,7 @@ def _run_post(
                                 waf=waf_hint,
                                 source="local_model",
                                 cloud_escalated=False,
+                                ai_note=escalation_policy.note,
                             )
                             confirmed_findings.append(finding)
                             context_confirmed = True
@@ -1974,10 +2031,13 @@ def _run_post(
                                     source="cloud_model",
                                     cloud_escalated=True,
                                     ai_engine=cloud_plan.engine,
-                                    ai_note=_cloud_attempt_note(
-                                        cloud_plan.note,
-                                        attempt_number,
-                                        max(1, cloud_attempts),
+                                    ai_note=_merge_ai_notes(
+                                        escalation_policy.note,
+                                        _cloud_attempt_note(
+                                            cloud_plan.note,
+                                            attempt_number,
+                                            max(1, cloud_attempts),
+                                        ),
                                     ),
                                 )
                                 confirmed_findings.append(finding)
@@ -2026,7 +2086,10 @@ def _run_post(
                                 waf=waf_hint,
                                 source="phase1_transform",
                                 cloud_escalated=False,
-                                ai_note=cloud_plan.note if use_cloud else "",
+                                ai_note=_merge_ai_notes(
+                                    escalation_policy.note,
+                                    cloud_plan.note if use_cloud else "",
+                                ),
                             )
                             confirmed_findings.append(finding)
                             context_confirmed = True

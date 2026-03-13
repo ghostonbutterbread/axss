@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from ai_xss_generator.behavior import (
+    derive_ai_escalation_policy,
     attach_behavior_profile,
     build_target_behavior_profile,
     extract_behavior_profile,
@@ -145,3 +146,45 @@ def test_adaptive_probe_plan_uses_stealth_on_strong_edge_login_paths() -> None:
     assert plan.mode == "stealth"
     assert plan.chars == '"\'()'
     assert plan.follow_up_limit <= 12
+
+
+def test_escalation_policy_skips_local_for_high_friction_hard_reflection() -> None:
+    context = ParsedContext(source="https://example.test/search?q=x", source_type="url")
+    profile = build_target_behavior_profile(
+        url=context.source,
+        delivery_mode="get",
+        waf_name="akamai",
+        auth_required=True,
+        context=context,
+        probe_results=[],
+    )
+    enriched = attach_behavior_profile(context, profile)
+
+    policy = derive_ai_escalation_policy(
+        enriched,
+        delivery_mode="get",
+        context_type="html_attr_url",
+    )
+
+    assert policy.use_local is False
+    assert "Skipped local model" in policy.note
+
+
+def test_escalation_policy_skips_local_for_document_write_dom() -> None:
+    context = ParsedContext(source="https://example.test/#x", source_type="url")
+    profile = build_target_behavior_profile(
+        url=context.source,
+        delivery_mode="dom",
+        waf_name="cloudflare",
+        context=context,
+    )
+    enriched = attach_behavior_profile(context, profile)
+
+    policy = derive_ai_escalation_policy(
+        enriched,
+        delivery_mode="dom",
+        sink_context="document.write",
+    )
+
+    assert policy.use_local is False
+    assert policy.cloud_start_after_seconds == 0.0

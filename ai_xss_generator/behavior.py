@@ -88,6 +88,14 @@ class TargetBehaviorProfile:
         return PROFILE_NOTE_PREFIX + json.dumps(self.to_dict(), sort_keys=True)
 
 
+@dataclass(slots=True)
+class AIEscalationPolicy:
+    use_local: bool = True
+    local_timeout_seconds: int = 60
+    cloud_start_after_seconds: float | None = None
+    note: str = ""
+
+
 def build_target_behavior_profile(
     *,
     url: str,
@@ -251,6 +259,70 @@ def extract_behavior_profile(context: ParsedContext | None) -> dict[str, Any]:
             return payload
         return {}
     return {}
+
+
+def derive_ai_escalation_policy(
+    context: ParsedContext | None,
+    *,
+    delivery_mode: str,
+    context_type: str = "",
+    sink_context: str = "",
+) -> AIEscalationPolicy:
+    """Return a bounded AI escalation policy from observed target behavior."""
+    profile = extract_behavior_profile(context)
+    browser_required = bool(profile.get("browser_required", False))
+    auth_required = bool(profile.get("auth_required", False))
+    probe_modes = {str(item) for item in profile.get("probe_modes", []) or [] if str(item)}
+    high_friction = browser_required or auth_required or "stealth" in probe_modes
+
+    normalized_context = context_type.strip().lower()
+    normalized_sink = sink_context.strip().lower()
+    hard_reflection_contexts = {
+        "html_attr_url",
+        "js_string_dq",
+        "js_string_sq",
+        "js_string_bt",
+        "js_code",
+        "json_value",
+    }
+    hard_dom_sinks = {
+        "document.write",
+        "document.writeln",
+        "eval",
+        "function",
+        "settimeout",
+        "setinterval",
+    }
+
+    if delivery_mode == "dom" and normalized_sink in {"document.write", "document.writeln"}:
+        return AIEscalationPolicy(
+            use_local=False,
+            cloud_start_after_seconds=0.0,
+            note="Skipped local model for document.write DOM sink; prioritize cloud planning for rich subcontext handling.",
+        )
+
+    if high_friction and normalized_context in hard_reflection_contexts:
+        return AIEscalationPolicy(
+            use_local=False,
+            note="Skipped local model on a high-friction target because this reflection context typically benefits from cloud planning first.",
+        )
+
+    if delivery_mode == "dom" and high_friction and normalized_sink in hard_dom_sinks:
+        return AIEscalationPolicy(
+            use_local=True,
+            local_timeout_seconds=25,
+            cloud_start_after_seconds=5.0,
+            note="Reduced local DOM budget and accelerated cloud start because the sink is high-friction and execution-sensitive.",
+        )
+
+    if high_friction and normalized_context:
+        return AIEscalationPolicy(
+            use_local=True,
+            local_timeout_seconds=25,
+            note="Reduced local model budget because the target is operating in a stealth/high-friction probe mode.",
+        )
+
+    return AIEscalationPolicy()
 
 
 def attach_behavior_profile(
