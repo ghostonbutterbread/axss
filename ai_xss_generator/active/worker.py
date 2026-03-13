@@ -433,8 +433,23 @@ def _run(
 
     session_lessons: list[Any] = []
     try:
+        from ai_xss_generator.behavior import attach_behavior_profile, build_target_behavior_profile
         from ai_xss_generator.learning import build_memory_profile
-        from ai_xss_generator.lessons import build_mapping_lessons, build_probe_lessons
+        from ai_xss_generator.lessons import (
+            build_behavior_lessons,
+            build_mapping_lessons,
+            build_probe_lessons,
+        )
+
+        behavior_profile = build_target_behavior_profile(
+            url=url,
+            delivery_mode="get",
+            waf_name=waf_hint,
+            auth_required=bool(auth_headers),
+            context=_cached_context,
+            probe_results=probe_results,
+        )
+        _cached_context = attach_behavior_profile(_cached_context, behavior_profile)
 
         memory_profile = build_memory_profile(
             context=_cached_context,
@@ -444,6 +459,7 @@ def _run(
         )
         if auth_headers:
             memory_profile["auth_required"] = True
+        session_lessons.extend(build_behavior_lessons(behavior_profile))
         if _cached_context is not None:
             session_lessons.extend(build_mapping_lessons(
                 _cached_context,
@@ -1260,26 +1276,6 @@ def _run_dom(
     except Exception as exc:
         log.debug("Pre-parse of DOM target %s failed: %s", url, exc)
 
-    dom_session_lessons: list[Any] = []
-    try:
-        from ai_xss_generator.learning import build_memory_profile
-        from ai_xss_generator.lessons import build_mapping_lessons
-
-        memory_profile = build_memory_profile(
-            context=_cached_context,
-            waf_name=waf_hint,
-            delivery_mode="dom",
-        )
-        if auth_headers:
-            memory_profile["auth_required"] = True
-        if _cached_context is not None:
-            dom_session_lessons.extend(build_mapping_lessons(
-                _cached_context,
-                memory_profile=memory_profile,
-            ))
-    except Exception as exc:
-        log.debug("DOM lesson build failed for %s: %s", url, exc)
-
     try:
         pw = sync_playwright().start()
         browser = pw.chromium.launch(
@@ -1300,6 +1296,37 @@ def _run_dom(
 
     findings: list[ConfirmedFinding] = []
     cloud_escalated = False
+    dom_session_lessons: list[Any] = []
+    try:
+        from ai_xss_generator.behavior import attach_behavior_profile, build_target_behavior_profile
+        from ai_xss_generator.learning import build_memory_profile
+        from ai_xss_generator.lessons import build_behavior_lessons, build_mapping_lessons
+
+        behavior_profile = build_target_behavior_profile(
+            url=url,
+            delivery_mode="dom",
+            waf_name=waf_hint,
+            auth_required=bool(auth_headers),
+            context=_cached_context,
+            dom_hits=dom_hits,
+        )
+        _cached_context = attach_behavior_profile(_cached_context, behavior_profile)
+
+        memory_profile = build_memory_profile(
+            context=_cached_context,
+            waf_name=waf_hint,
+            delivery_mode="dom",
+        )
+        if auth_headers:
+            memory_profile["auth_required"] = True
+        dom_session_lessons.extend(build_behavior_lessons(behavior_profile))
+        if _cached_context is not None:
+            dom_session_lessons.extend(build_mapping_lessons(
+                _cached_context,
+                memory_profile=memory_profile,
+            ))
+    except Exception as exc:
+        log.debug("DOM lesson build failed for %s: %s", url, exc)
 
     try:
         pw = sync_playwright().start()
@@ -1749,8 +1776,23 @@ def _run_post(
 
     post_session_lessons: list[Any] = []
     try:
+        from ai_xss_generator.behavior import attach_behavior_profile, build_target_behavior_profile
         from ai_xss_generator.learning import build_memory_profile
-        from ai_xss_generator.lessons import build_mapping_lessons, build_probe_lessons
+        from ai_xss_generator.lessons import (
+            build_behavior_lessons,
+            build_mapping_lessons,
+            build_probe_lessons,
+        )
+
+        behavior_profile = build_target_behavior_profile(
+            url=post_form.action_url,
+            delivery_mode="post",
+            waf_name=waf_hint,
+            auth_required=bool(auth_headers),
+            context=_cached_context,
+            probe_results=probe_results,
+        )
+        _cached_context = attach_behavior_profile(_cached_context, behavior_profile)
 
         memory_profile = build_memory_profile(
             context=_cached_context,
@@ -1760,6 +1802,7 @@ def _run_post(
         )
         if auth_headers:
             memory_profile["auth_required"] = True
+        post_session_lessons.extend(build_behavior_lessons(behavior_profile))
         if _cached_context is not None:
             post_session_lessons.extend(build_mapping_lessons(
                 _cached_context,

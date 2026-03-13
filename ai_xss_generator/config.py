@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 
 APP_NAME = "axss"
@@ -56,6 +57,16 @@ class AppConfig:
     cli_model: str | None = None
 
 
+@dataclass(frozen=True)
+class ResolvedAIConfig:
+    model: str
+    use_cloud: bool
+    cloud_model: str
+    ai_backend: str
+    cli_tool: str
+    cli_model: str | None = None
+
+
 def load_config() -> AppConfig:
     try:
         raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
@@ -96,4 +107,62 @@ def load_config() -> AppConfig:
         ai_backend=ai_backend,
         cli_tool=cli_tool,
         cli_model=cli_model.strip() if cli_model else None,
+    )
+
+
+def resolve_ai_config(
+    config: AppConfig,
+    *,
+    args: Any | None = None,
+    model: str | None = None,
+    no_cloud: bool | None = None,
+    ai_backend: str | None = None,
+    cli_tool: str | None = None,
+    cli_model: str | None = None,
+    cloud_model: str | None = None,
+) -> ResolvedAIConfig:
+    """Resolve the effective AI policy once from config plus optional overrides."""
+    resolved_model = (
+        model
+        or getattr(args, "model", None)
+        or config.default_model
+        or DEFAULT_MODEL
+    )
+    if not isinstance(resolved_model, str) or not resolved_model.strip():
+        resolved_model = DEFAULT_MODEL
+
+    if no_cloud is None:
+        no_cloud = bool(getattr(args, "no_cloud", False)) if args is not None else False
+    resolved_use_cloud = bool(config.use_cloud) and not bool(no_cloud)
+
+    resolved_cloud_model = cloud_model or config.cloud_model or "anthropic/claude-3-5-sonnet"
+    if not isinstance(resolved_cloud_model, str) or not resolved_cloud_model.strip():
+        resolved_cloud_model = "anthropic/claude-3-5-sonnet"
+
+    resolved_backend = ai_backend or getattr(args, "backend", None) or config.ai_backend or "api"
+    if resolved_backend not in {"api", "cli"}:
+        resolved_backend = "api"
+
+    resolved_cli_tool = cli_tool or getattr(args, "cli_tool", None) or config.cli_tool or "claude"
+    if resolved_cli_tool not in {"claude", "codex"}:
+        resolved_cli_tool = "claude"
+
+    resolved_cli_model = cli_model
+    if resolved_cli_model is None and args is not None:
+        resolved_cli_model = getattr(args, "cli_model", None)
+    if resolved_cli_model is None:
+        resolved_cli_model = config.cli_model
+    if resolved_cli_model is not None:
+        if not isinstance(resolved_cli_model, str) or not resolved_cli_model.strip():
+            resolved_cli_model = None
+        else:
+            resolved_cli_model = resolved_cli_model.strip()
+
+    return ResolvedAIConfig(
+        model=resolved_model.strip(),
+        use_cloud=resolved_use_cloud,
+        cloud_model=resolved_cloud_model.strip(),
+        ai_backend=resolved_backend,
+        cli_tool=resolved_cli_tool,
+        cli_model=resolved_cli_model,
     )

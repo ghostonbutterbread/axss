@@ -49,10 +49,13 @@ class EphemeralLessonsTest(unittest.TestCase):
             surviving_chars=frozenset("<>()")
         )
         probe_result = _make_probe_result("name", [reflection])
+        probe_result.tested_chars = "<>()"
+        probe_result.probe_mode = "stealth"
         lessons = build_probe_lessons([probe_result], delivery_mode="get")
         filter_lesson = next(l for l in lessons if l.lesson_type == LESSON_TYPE_FILTER)
         for ch in "<>()":
             self.assertIn(ch, filter_lesson.surviving_chars)
+        self.assertIn("Tested charset was ()<>", filter_lesson.summary)
 
     def test_build_mapping_lessons_capture_forms_dom_auth(self):
         form = MagicMock()

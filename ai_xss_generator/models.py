@@ -12,6 +12,7 @@ from urllib.parse import quote_plus
 
 import requests
 
+from ai_xss_generator.behavior import extract_behavior_profile
 from ai_xss_generator.findings import (
     BYPASS_FAMILIES,
     Finding,
@@ -102,6 +103,31 @@ def _extract_dom_runtime_context(context: ParsedContext) -> dict[str, str]:
     return {}
 
 
+def _behavior_profile_section(context: ParsedContext) -> str:
+    profile = extract_behavior_profile(context)
+    if not profile:
+        return ""
+
+    compact = {
+        "delivery_mode": profile.get("delivery_mode", ""),
+        "waf_name": profile.get("waf_name", ""),
+        "browser_required": bool(profile.get("browser_required", False)),
+        "auth_required": bool(profile.get("auth_required", False)),
+        "frameworks": list(profile.get("frameworks", []) or [])[:4],
+        "reflected_params": int(profile.get("reflected_params", 0) or 0),
+        "injectable_params": int(profile.get("injectable_params", 0) or 0),
+        "reflection_contexts": list(profile.get("reflection_contexts", []) or [])[:6],
+        "reflection_transforms": list(profile.get("reflection_transforms", []) or [])[:4],
+        "discovery_styles": list(profile.get("discovery_styles", []) or [])[:4],
+        "probe_modes": list(profile.get("probe_modes", []) or [])[:4],
+        "tested_charsets": list(profile.get("tested_charsets", []) or [])[:4],
+        "dom_sources": list(profile.get("dom_sources", []) or [])[:4],
+        "dom_sinks": list(profile.get("dom_sinks", []) or [])[:6],
+        "observations": list(profile.get("observations", []) or [])[:4],
+    }
+    return "TARGET BEHAVIOR PROFILE:\n" + json.dumps(compact, indent=2) + "\n"
+
+
 # ---------------------------------------------------------------------------
 # Prompt construction
 # ---------------------------------------------------------------------------
@@ -169,6 +195,7 @@ def _prompt_for_context(
     lessons_section = ""
     if past_lessons:
         lessons_section = lessons_prompt_section(past_lessons) + "\n"
+    behavior_section = _behavior_profile_section(context)
 
     # ── Section 2b: Auth context ──────────────────────────────────────────────
     auth_section = ""
@@ -238,7 +265,7 @@ Requirements:
 - Include payloads from multiple bypass families that are plausible for this context.
 - Prefer compact, self-contained payloads with no external dependencies.
 
-{probe_section}{dom_section}{lessons_section}{findings_section}{auth_section}{waf_section}{reference_section}Full parsed context:
+{probe_section}{dom_section}{behavior_section}{lessons_section}{findings_section}{auth_section}{waf_section}{reference_section}Full parsed context:
 {context_blob}""".strip()
 
 
@@ -314,6 +341,7 @@ def _compact_dom_prompt_for_local(
                 lesson_lines.append(f"- {title}: {summary}".strip(": "))
         if lesson_lines:
             lessons_section = "Runtime lessons:\n" + "\n".join(lesson_lines) + "\n"
+    behavior_section = _behavior_profile_section(context)
 
     context_summary = {
         "source": context.source,
@@ -356,7 +384,7 @@ Requirements:
 
 DOM runtime:
 {json.dumps(dom_runtime, indent=2)}
-{waf_line}{lessons_section}{findings_section}Context summary:
+{waf_line}{behavior_section}{lessons_section}{findings_section}Context summary:
 {json.dumps(context_summary, indent=2)}""".strip()
 
 
@@ -504,6 +532,7 @@ def _compact_dom_prompt_for_cloud(
                 lesson_lines.append(f"- {title}: {summary}".strip(": "))
         if lesson_lines:
             lessons_section = "Runtime lessons:\n" + "\n".join(lesson_lines) + "\n"
+    behavior_section = _behavior_profile_section(context)
 
     context_summary = {
         "source": context.source,
@@ -555,7 +584,7 @@ Requirements:
 
 DOM runtime:
 {json.dumps(dom_runtime, indent=2)}
-{waf_line}{lessons_section}{findings_section}{seed_section}Context summary:
+{waf_line}{behavior_section}{lessons_section}{findings_section}{seed_section}Context summary:
 {json.dumps(context_summary, indent=2)}""".strip()
 
 
@@ -579,6 +608,7 @@ def _document_write_prompt_for_cloud(
                 lesson_lines.append(f"- {title}: {summary}".strip(": "))
         if lesson_lines:
             lessons_section = "Runtime lessons:\n" + "\n".join(lesson_lines) + "\n"
+    behavior_section = _behavior_profile_section(context)
 
     targeted_examples = [
         {
@@ -649,7 +679,7 @@ Document.write subcontext:
 {json.dumps(subcontext, indent=2)}
 Recommended payload families:
 {recommended}
-{waf_line}{lessons_section}Targeted examples:
+{waf_line}{behavior_section}{lessons_section}Targeted examples:
 {json.dumps(targeted_examples, indent=2)}
 Context summary:
 {json.dumps(context_summary, indent=2)}""".strip()

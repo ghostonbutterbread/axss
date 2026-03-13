@@ -20,7 +20,7 @@ from typing import Any, TYPE_CHECKING
 import requests
 
 from ai_xss_generator.cli_runner import generate_via_cli
-from ai_xss_generator.config import AppConfig, load_api_key
+from ai_xss_generator.config import AppConfig, load_api_key, resolve_ai_config
 from ai_xss_generator.findings import BYPASS_FAMILIES, Finding, save_finding
 
 if TYPE_CHECKING:
@@ -99,10 +99,11 @@ Return ONLY a JSON object — no markdown, no text outside the JSON:
 
 def _call_ai(prompt: str, config: AppConfig) -> str:
     """Send *prompt* to whichever backend config specifies; return raw text."""
+    ai_config = resolve_ai_config(config)
 
     # ── CLI backend ───────────────────────────────────────────────────────────
-    if config.ai_backend == "cli":
-        return generate_via_cli(config.cli_tool, prompt, config.cli_model)
+    if ai_config.ai_backend == "cli":
+        return generate_via_cli(ai_config.cli_tool, prompt, ai_config.cli_model)
 
     # ── API backend: OpenRouter first, then OpenAI ────────────────────────────
     or_key = os.environ.get("OPENROUTER_API_KEY", "") or load_api_key("openrouter_api_key")
@@ -116,7 +117,7 @@ def _call_ai(prompt: str, config: AppConfig) -> str:
                 "X-Title": "axss",
             },
             json={
-                "model": config.cloud_model,
+                "model": ai_config.cloud_model,
                 "response_format": {"type": "json_object"},
                 "messages": [
                     {

@@ -50,7 +50,7 @@ import requests
 # Ensure the project root is on the path when run directly
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from ai_xss_generator.config import DEFAULT_MODEL, load_api_key, load_config
+from ai_xss_generator.config import DEFAULT_MODEL, load_api_key, load_config, resolve_ai_config
 from ai_xss_generator.console import (
     _ensure_utf8,
     dim_line,
@@ -372,8 +372,9 @@ def main(argv: list[str] | None = None) -> int:
     config = load_config()
     args = build_parser().parse_args(argv)
 
-    model = args.model or config.default_model
-    use_cloud = config.use_cloud and not args.no_cloud
+    ai_config = resolve_ai_config(config, args=args)
+    model = ai_config.model
+    use_cloud = ai_config.use_cloud
     xssy_token = args.xssy_token or load_api_key("xssy_jwt") or None
 
     registry = PluginRegistry()
@@ -529,10 +530,10 @@ def main(argv: list[str] | None = None) -> int:
                 mutator_plugins=registry.mutators,
                 progress=lambda msg: info(f"  {msg}") if args.verbose else None,
                 use_cloud=use_cloud,
-                cloud_model=config.cloud_model,
-                ai_backend=config.ai_backend,
-                cli_tool=config.cli_tool,
-                cli_model=config.cli_model,
+                cloud_model=ai_config.cloud_model,
+                ai_backend=ai_config.ai_backend,
+                cli_tool=ai_config.cli_tool,
+                cli_model=ai_config.cli_model,
                 past_lessons=session_lessons,
                 local_timeout_seconds=60,
             )

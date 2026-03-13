@@ -209,6 +209,10 @@ class ProbeResult:
     original_value: str
     reflections: list[ReflectionContext] = field(default_factory=list)
     error: str | None = None
+    reflection_transform: str = ""
+    discovery_style: str = ""
+    probe_mode: str = ""
+    tested_chars: str = PROBE_CHARS
 
     @property
     def is_reflected(self) -> bool:
@@ -249,6 +253,97 @@ class ProbeResult:
 
 def _make_canary() -> str:
     return "axss" + secrets.token_hex(4)
+
+
+@dataclass(slots=True)
+class _ProbeSeed:
+    reflection_value: str
+    char_probe_value: str
+    style: str
+
+
+@dataclass(slots=True)
+class _ProbePlan:
+    mode: str
+    chars: str
+    follow_up_limit: int
+
+
+def _probe_seed_for_param(param_name: str, canary: str, original_value: str = "") -> _ProbeSeed:
+    """Return a low-noise reflection seed for semantically constrained params."""
+    name = param_name.lower()
+    original = (original_value or "").strip().lower()
+    markers = _PROBE_OPEN + PROBE_CHARS + _PROBE_CLOSE
+
+    def _wrap(prefix: str = "", suffix: str = "", style: str = "plain") -> _ProbeSeed:
+        return _ProbeSeed(
+            reflection_value=prefix + canary + suffix,
+            char_probe_value=prefix + canary + markers + suffix,
+            style=style,
+        )
+
+    urlish_names = {
+        "url", "uri", "redirect", "return", "returnto", "next", "continue",
+        "dest", "destination", "target", "href", "src", "link",
+    }
+    search_names = {
+        "q", "query", "search", "text", "articleq", "keyword", "keywords",
+        "term", "name",
+    }
+    location_names = {
+        "location", "city", "state", "country", "zip", "zipcode", "postcode",
+        "post_code", "address", "region",
+    }
+    email_names = {"email", "mail", "username", "user"}
+
+    if name in urlish_names or original.startswith(("http://", "https://", "/")):
+        return _wrap(prefix="https://axss.invalid/", style="url_like")
+    if name in email_names or "@" in original:
+        return _wrap(suffix="@example.test", style="email_like")
+    if name in location_names:
+        return _wrap(prefix="san-francisco-", style="location_like")
+    if name in search_names:
+        return _wrap(prefix="search-", style="search_text")
+    return _wrap(style="plain")
+
+
+def _adaptive_probe_plan(
+    *,
+    url: str,
+    waf: str | None,
+    auth_headers: dict[str, str] | None,
+    param_name: str,
+    param_count: int,
+) -> _ProbePlan:
+    """Choose a bounded discovery mode based on observed target sensitivity."""
+    lower_url = url.lower()
+    lower_param = param_name.lower()
+    lower_waf = (waf or "").lower()
+    sensitive_path = any(
+        marker in lower_url
+        for marker in ("/login", "/signin", "/auth", "/register", "/account", "/checkout")
+    )
+    sensitive_param = lower_param in {
+        "redirect", "return", "returnto", "next", "continue",
+        "location", "email", "username", "token",
+    }
+    strong_edge = lower_waf in _BROWSER_REQUIRED_WAFS
+    auth_required = bool(auth_headers)
+
+    if strong_edge or auth_required or sensitive_path:
+        chars = '<>"\'()/'
+        if sensitive_param:
+            chars = '"\'()'
+        return _ProbePlan(
+            mode="stealth",
+            chars=chars,
+            follow_up_limit=8 if param_count > 3 else 12,
+        )
+
+    if param_count >= 8:
+        return _ProbePlan(mode="budgeted", chars='<>"/\'()', follow_up_limit=12)
+
+    return _ProbePlan(mode="standard", chars=PROBE_CHARS, follow_up_limit=_FOLLOW_UP_CRAWLED_LIMIT)
 
 
 def _canary_variants(canary: str) -> list[str]:
@@ -668,11 +763,21 @@ def _probe_param(
     delay: float,
     ua_cycle: Any,
     proxy_cycle: Any | None,
+    waf: str | None = None,
     auth_headers: dict[str, str] | None = None,
     rate_limiter: "_RateLimiter | None" = None,
     sink_url: str | None = None,
 ) -> ProbeResult:
     """Send two probe requests for one parameter and return a ProbeResult."""
+    probe_seed = _probe_seed_for_param(param_name, canary, original_value)
+    probe_plan = _adaptive_probe_plan(
+        url=url,
+        waf=waf,
+        auth_headers=auth_headers,
+        param_name=param_name,
+        param_count=len(all_params),
+    )
+    probe_marker = _PROBE_OPEN + probe_plan.chars + _PROBE_CLOSE
     # Auth headers first; User-Agent from rotation always wins
     merged_headers: dict[str, str] = {**(auth_headers or {}), "User-Agent": next(ua_cycle)}
     req_kwargs: dict[str, Any] = {"headers": merged_headers}
@@ -688,9 +793,20 @@ def _probe_param(
     # Phase 1 — reflection mapping
     _wait()
     try:
-        resp1 = _session_get(session, _rebuild_url(url, {**all_params, param_name: canary}), req_kwargs)
+        resp1 = _session_get(
+            session,
+            _rebuild_url(url, {**all_params, param_name: probe_seed.reflection_value}),
+            req_kwargs,
+        )
     except Exception as exc:
-        return ProbeResult(param_name=param_name, original_value=original_value, error=str(exc))
+        return ProbeResult(
+            param_name=param_name,
+            original_value=original_value,
+            error=str(exc),
+            discovery_style=probe_seed.style,
+            probe_mode=probe_plan.mode,
+            tested_chars=probe_plan.chars,
+        )
 
     html1 = _resp_html(resp1)
     reflections = _find_reflections(html1, canary)
@@ -705,8 +821,7 @@ def _probe_param(
                 _sink_html = _resp_html(_sink_resp)
                 _sink_refs = _find_reflections(_sink_html, canary)
                 if _sink_refs:
-                    _char_probe = canary + _PROBE_OPEN + PROBE_CHARS + _PROBE_CLOSE
-                    _char_url = _rebuild_url(url, {**all_params, param_name: _char_probe})
+                    _char_url = _rebuild_url(url, {**all_params, param_name: probe_seed.char_probe_value})
                     _wait()
                     _session_get(session, _char_url, {"headers": {"User-Agent": next(ua_cycle)}})
                     _wait()
@@ -721,6 +836,10 @@ def _probe_param(
                     return ProbeResult(
                         param_name=param_name,
                         original_value=original_value,
+                        reflection_transform=_reflection_transform(_sink_html, canary),
+                        discovery_style=probe_seed.style,
+                        probe_mode=probe_plan.mode,
+                        tested_chars=probe_plan.chars,
                         reflections=[
                             ReflectionContext(
                                 context_type=ctx.context_type,
@@ -734,13 +853,26 @@ def _probe_param(
                     )
             except Exception as _exc:
                 log.debug("probe_url: sink_url check failed for %s: %s", sink_url, _exc)
-        return ProbeResult(param_name=param_name, original_value=original_value)
+        return ProbeResult(
+            param_name=param_name,
+            original_value=original_value,
+            reflection_transform=reflection_transform,
+            discovery_style=probe_seed.style,
+            probe_mode=probe_plan.mode,
+            tested_chars=probe_plan.chars,
+        )
 
     # Phase 2 — character survival
-    char_probe = canary + _PROBE_OPEN + PROBE_CHARS + _PROBE_CLOSE
     _wait()
     try:
-        resp2 = _session_get(session, _rebuild_url(url, {**all_params, param_name: char_probe}), req_kwargs)
+        resp2 = _session_get(
+            session,
+            _rebuild_url(
+                url,
+                {**all_params, param_name: probe_seed.reflection_value + probe_marker},
+            ),
+            req_kwargs,
+        )
         surviving = _analyze_char_survival(_resp_html(resp2), canary)
         if reflection_transform == "upper":
             surviving = surviving.union(frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZ"))
@@ -750,6 +882,10 @@ def _probe_param(
     return ProbeResult(
         param_name=param_name,
         original_value=original_value,
+        reflection_transform=reflection_transform,
+        discovery_style=probe_seed.style,
+        probe_mode=probe_plan.mode,
+        tested_chars=probe_plan.chars,
         reflections=[
             ReflectionContext(
                 context_type=ctx.context_type,
@@ -774,6 +910,7 @@ def _probe_param_playwright(
     delay: float,
     ua_cycle: Any,
     proxy_cycle: Any | None,
+    waf: str | None = None,
     auth_headers: dict[str, str] | None = None,
 ) -> ProbeResult:
     """Probe a single parameter using a shared Playwright page.
@@ -783,31 +920,56 @@ def _probe_param_playwright(
     preserved across every probe request.
     """
 
+    probe_seed = _probe_seed_for_param(param_name, canary, original_value)
+    probe_plan = _adaptive_probe_plan(
+        url=url,
+        waf=waf,
+        auth_headers=auth_headers,
+        param_name=param_name,
+        param_count=len(all_params),
+    )
+    probe_marker = _PROBE_OPEN + probe_plan.chars + _PROBE_CLOSE
     # Phase 1 — reflection mapping
     if delay > 0:
         time.sleep(delay)
     try:
         resp1_html = _page_fetch_html(
             page,
-            _rebuild_url(url, {**all_params, param_name: canary}),
+            _rebuild_url(url, {**all_params, param_name: probe_seed.reflection_value}),
         )
     except Exception as exc:
-        return ProbeResult(param_name=param_name, original_value=original_value, error=str(exc))
+        return ProbeResult(
+            param_name=param_name,
+            original_value=original_value,
+            error=str(exc),
+            discovery_style=probe_seed.style,
+            probe_mode=probe_plan.mode,
+            tested_chars=probe_plan.chars,
+        )
 
     html1 = resp1_html
     reflections = _find_reflections(html1, canary)
     reflection_transform = _reflection_transform(html1, canary)
     if not reflections:
-        return ProbeResult(param_name=param_name, original_value=original_value)
+        return ProbeResult(
+            param_name=param_name,
+            original_value=original_value,
+            reflection_transform=reflection_transform,
+            discovery_style=probe_seed.style,
+            probe_mode=probe_plan.mode,
+            tested_chars=probe_plan.chars,
+        )
 
     # Phase 2 — character survival
-    char_probe = canary + _PROBE_OPEN + PROBE_CHARS + _PROBE_CLOSE
     if delay > 0:
         time.sleep(delay)
     try:
         resp2_html = _page_fetch_html(
             page,
-            _rebuild_url(url, {**all_params, param_name: char_probe}),
+            _rebuild_url(
+                url,
+                {**all_params, param_name: probe_seed.reflection_value + probe_marker},
+            ),
         )
         surviving = _analyze_char_survival(resp2_html, canary)
         if reflection_transform == "upper":
@@ -818,6 +980,10 @@ def _probe_param_playwright(
     return ProbeResult(
         param_name=param_name,
         original_value=original_value,
+        reflection_transform=reflection_transform,
+        discovery_style=probe_seed.style,
+        probe_mode=probe_plan.mode,
+        tested_chars=probe_plan.chars,
         reflections=[
             ReflectionContext(
                 context_type=ctx.context_type,
@@ -934,9 +1100,18 @@ def probe_url(
                 page = context.new_page()
 
                 for param_name, original_value in flat_params.items():
+                    probe_seed = _probe_seed_for_param(param_name, canary, original_value)
+                    probe_plan = _adaptive_probe_plan(
+                        url=url,
+                        waf=waf,
+                        auth_headers=auth_headers,
+                        param_name=param_name,
+                        param_count=len(flat_params),
+                    )
                     result = _probe_param_playwright(
                         page, url, param_name, original_value, flat_params,
                         canary=canary, delay=delay, ua_cycle=ua_cycle, proxy_cycle=proxy_cycle,
+                        waf=waf,
                         auth_headers=auth_headers,
                     )
                     if sink_url and not result.reflections and not result.error:
@@ -946,8 +1121,18 @@ def probe_url(
                             _sink_html = _page_fetch_html(page, sink_url)
                             _sink_refs = _find_reflections(_sink_html, canary)
                             if _sink_refs:
-                                _char_probe = canary + _PROBE_OPEN + PROBE_CHARS + _PROBE_CLOSE
-                                _char_url = _rebuild_url(url, {**flat_params, param_name: _char_probe})
+                                _char_url = _rebuild_url(
+                                    url,
+                                    {
+                                        **flat_params,
+                                        param_name: (
+                                            probe_seed.reflection_value
+                                            + _PROBE_OPEN
+                                            + probe_plan.chars
+                                            + _PROBE_CLOSE
+                                        ),
+                                    },
+                                )
                                 if delay > 0:
                                     time.sleep(delay)
                                 _page_fetch_html(page, _char_url)
@@ -960,6 +1145,10 @@ def probe_url(
                                 result = ProbeResult(
                                     param_name=param_name,
                                     original_value=original_value,
+                                    reflection_transform=_reflection_transform(_sink_html, canary),
+                                    discovery_style=probe_seed.style,
+                                    probe_mode=probe_plan.mode,
+                                    tested_chars=probe_plan.chars,
                                     reflections=[
                                         ReflectionContext(
                                             context_type=ctx.context_type,
@@ -1007,6 +1196,7 @@ def probe_url(
                     canary=canary, delay=0,
                     ua_cycle=cycle([ua]),
                     proxy_cycle=cycle([proxy]) if proxy else None,
+                    waf=waf,
                     auth_headers=auth_headers,
                     rate_limiter=rl,
                     sink_url=sink_url,
@@ -1121,6 +1311,14 @@ def probe_post_form(
         retries=1,
     ) as session:
         for param_name in param_names:
+            probe_seed = _probe_seed_for_param(param_name, canary, "")
+            probe_plan = _adaptive_probe_plan(
+                url=action_url,
+                waf=waf,
+                auth_headers=auth_headers,
+                param_name=param_name,
+                param_count=len(param_names),
+            )
             merged_headers: dict[str, str] = {
                 **(auth_headers or {}),
                 "User-Agent": next(ua_cycle),
@@ -1167,11 +1365,20 @@ def probe_post_form(
             if delay > 0:
                 time.sleep(delay)
             try:
-                resp1 = session.post(action_url, data=_build_post_body(canary), **req_kwargs)
+                resp1 = session.post(
+                    action_url,
+                    data=_build_post_body(probe_seed.reflection_value),
+                    **req_kwargs,
+                )
                 html1 = _resp_html(resp1)
             except Exception as exc:
                 result = ProbeResult(
-                    param_name=param_name, original_value="", error=str(exc)
+                    param_name=param_name,
+                    original_value="",
+                    error=str(exc),
+                    discovery_style=probe_seed.style,
+                    probe_mode=probe_plan.mode,
+                    tested_chars=probe_plan.chars,
                 )
                 results.append(result)
                 if on_result:
@@ -1179,6 +1386,7 @@ def probe_post_form(
                 continue
 
             reflections = _find_reflections(html1, canary)
+            reflection_transform = _reflection_transform(html1, canary)
 
             # --- Follow-up page check for session-stored XSS ---
             # If the POST response itself doesn't reflect the canary, the input
@@ -1196,7 +1404,7 @@ def probe_post_form(
                 _follow_up_candidates = list(dict.fromkeys(
                     ([sink_url] if sink_url else [])
                     + [source_page_url, _origin_root]
-                    + list(crawled_pages or [])[:_FOLLOW_UP_CRAWLED_LIMIT]
+                    + list(crawled_pages or [])[:probe_plan.follow_up_limit]
                 ))
                 for _fu in _follow_up_candidates:
                     try:
@@ -1208,6 +1416,7 @@ def probe_post_form(
                         if _fu_refs:
                             reflections = _fu_refs
                             follow_up_url = _fu
+                            reflection_transform = _reflection_transform(_fu_html, canary)
                             log.debug(
                                 "POST probe: canary found on follow-up page %s (session-stored)",
                                 _fu,
@@ -1218,13 +1427,16 @@ def probe_post_form(
 
             if not reflections:
                 result = ProbeResult(param_name=param_name, original_value="")
+                result.discovery_style = probe_seed.style
+                result.reflection_transform = reflection_transform
+                result.probe_mode = probe_plan.mode
+                result.tested_chars = probe_plan.chars
                 results.append(result)
                 if on_result:
                     on_result(result)
                 continue
 
             # --- Step 3: Char survival probe ---
-            char_probe_val = canary + _PROBE_OPEN + PROBE_CHARS + _PROBE_CLOSE
             if delay > 0:
                 time.sleep(delay)
             surviving = frozenset()
@@ -1250,7 +1462,9 @@ def probe_post_form(
                         char_body[hname] = hval
                 if csrf_field and current_csrf is not None:
                     char_body[csrf_field] = current_csrf
-                char_body[param_name] = char_probe_val
+                char_body[param_name] = (
+                    probe_seed.reflection_value + _PROBE_OPEN + probe_plan.chars + _PROBE_CLOSE
+                )
 
                 resp2 = session.post(action_url, data=char_body, **req_kwargs)
 
@@ -1271,6 +1485,10 @@ def probe_post_form(
             result = ProbeResult(
                 param_name=param_name,
                 original_value="",
+                reflection_transform=reflection_transform,
+                discovery_style=probe_seed.style,
+                probe_mode=probe_plan.mode,
+                tested_chars=probe_plan.chars,
                 reflections=[
                     ReflectionContext(
                         context_type=ctx.context_type,
@@ -1310,9 +1528,11 @@ def enrich_context(context: ParsedContext, probe_results: list[ProbeResult]) -> 
         for ctx in result.reflections:
             chars_str = "".join(sorted(ctx.surviving_chars)) if ctx.surviving_chars else "?"
             status = "INJECTABLE" if ctx.is_exploitable else "chars filtered"
+            tested_chars = getattr(result, "tested_chars", PROBE_CHARS) or PROBE_CHARS
+            probe_mode = getattr(result, "probe_mode", "") or "standard"
             extra_notes.append(
                 f"[probe:CONFIRMED] '{result.param_name}' → {ctx.short_label} "
-                f"surviving={chars_str!r} [{status}]"
+                f"surviving={chars_str!r} tested={tested_chars!r} mode={probe_mode} [{status}]"
             )
 
     return dc_replace(

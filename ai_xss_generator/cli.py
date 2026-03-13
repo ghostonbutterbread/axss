@@ -7,7 +7,13 @@ from pathlib import Path
 from typing import Callable
 
 from ai_xss_generator import __version__
-from ai_xss_generator.config import APP_NAME, CONFIG_PATH, DEFAULT_MODEL, load_config
+from ai_xss_generator.config import (
+    APP_NAME,
+    CONFIG_PATH,
+    DEFAULT_MODEL,
+    load_config,
+    resolve_ai_config,
+)
 from ai_xss_generator.console import header, info, step, success, warn, waf_label
 from ai_xss_generator.findings import (
     export_yaml,
@@ -854,7 +860,7 @@ def _run_active_scan(
     from ai_xss_generator.active.reporter import write_report
     from ai_xss_generator.parser import read_url_list
 
-    use_cloud = config.use_cloud and not getattr(args, "no_cloud", False)
+    ai_config = resolve_ai_config(config, args=args)
 
     if args.urls:
         try:
@@ -963,11 +969,6 @@ def _run_active_scan(
     if sink_url:
         info(f"Sink URL: {sink_url} (checking this page after each injection)")
 
-    # Resolve CLI backend settings: CLI flag > config.json > hardcoded default
-    ai_backend = getattr(args, "backend", None) or config.ai_backend
-    cli_tool = getattr(args, "cli_tool", None) or config.cli_tool
-    cli_model = getattr(args, "cli_model", None) or config.cli_model
-
     # Session management: detect an existing in-progress/paused session for this
     # exact target + scan type combination; offer to resume or start fresh.
     session = _resolve_session(
@@ -983,9 +984,9 @@ def _run_active_scan(
     scan_config = ActiveScanConfig(
         rate=args.rate,
         workers=getattr(args, "workers", 1),
-        model=args.model or config.default_model,
-        cloud_model=config.cloud_model,
-        use_cloud=use_cloud,
+        model=ai_config.model,
+        cloud_model=ai_config.cloud_model,
+        use_cloud=ai_config.use_cloud,
         waf=waf,
         timeout_seconds=getattr(args, "timeout", 300),
         output_path=getattr(args, "json_out", None),
@@ -994,9 +995,9 @@ def _run_active_scan(
         scan_reflected=scan_reflected,
         scan_stored=scan_stored,
         scan_dom=scan_dom,
-        ai_backend=ai_backend,
-        cli_tool=cli_tool,
-        cli_model=cli_model,
+        ai_backend=ai_config.ai_backend,
+        cli_tool=ai_config.cli_tool,
+        cli_model=ai_config.cli_model,
         cloud_attempts=getattr(args, "attempts", 1),
     )
 
@@ -1239,12 +1240,13 @@ def main(argv: list[str] | None = None) -> int:
         return _handle_public_payloads(fetch_result, args.output, args.top, args.json_out)
 
     # --- Target-based modes below ---
-    selected_model = args.model or config.default_model
-    use_cloud = config.use_cloud and not getattr(args, "no_cloud", False)
-    cloud_model = config.cloud_model
-    ai_backend = getattr(args, "backend", None) or config.ai_backend
-    cli_tool = getattr(args, "cli_tool", None) or config.cli_tool
-    cli_model = getattr(args, "cli_model", None) or config.cli_model
+    ai_config = resolve_ai_config(config, args=args)
+    selected_model = ai_config.model
+    use_cloud = ai_config.use_cloud
+    cloud_model = ai_config.cloud_model
+    ai_backend = ai_config.ai_backend
+    cli_tool = ai_config.cli_tool
+    cli_model = ai_config.cli_model
     registry = PluginRegistry()
     registry.load_from(Path(__file__).resolve().parent.parent)
 
