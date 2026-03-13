@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from ai_xss_generator.active.worker import _build_cloud_feedback_lessons
+from ai_xss_generator.active.executor import ExecutionResult
 from ai_xss_generator.behavior import attach_behavior_profile, build_target_behavior_profile
 from ai_xss_generator.models import _cloud_prompt_for_context, _normalize_payloads
 from ai_xss_generator.types import ParsedContext
@@ -130,3 +131,42 @@ def test_cloud_prompt_includes_structured_execution_feedback_profile() -> None:
     assert '"required_delivery_shifts": [' in prompt
     assert '"creative_techniques": [' in prompt
     assert "Unicode-width variants" in prompt
+
+
+def test_cloud_feedback_prefers_executed_delivery_history_over_planned_only_modes() -> None:
+    context = ParsedContext(source="https://example.test/login?redirect=x", source_type="url")
+    profile = build_target_behavior_profile(
+        url=context.source,
+        delivery_mode="get",
+        waf_name="akamai",
+        auth_required=True,
+        context=context,
+    )
+    enriched = attach_behavior_profile(context, profile)
+    assert enriched is not None
+    failed_result = ExecutionResult(
+        confirmed=False,
+        method="",
+        detail="",
+        transform_name="cloud_model",
+        payload="javascript:alert(1)",
+        param_name="redirect",
+        fired_url="https://example.test/login?redirect=javascript:alert(1)#frag",
+        planned_delivery_modes=["get", "query", "fragment"],
+        executed_delivery_modes=["fragment"],
+    )
+
+    lessons = _build_cloud_feedback_lessons(
+        attempt_number=1,
+        total_attempts=2,
+        prompt_context=enriched,
+        delivery_mode="get",
+        context_type="html_attr_url",
+        sink_context="html_attr_url",
+        payloads_tried=["javascript:alert(1)"],
+        execution_results=[failed_result],
+        duplicate_payloads=[],
+        observation="No dialog, console, or network execution signal fired.",
+    )
+
+    assert lessons[0].metadata["attempted_delivery_modes"] == ["fragment"]

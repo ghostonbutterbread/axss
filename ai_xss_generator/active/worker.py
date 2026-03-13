@@ -230,6 +230,7 @@ def _build_cloud_feedback_lessons(
     context_type: str,
     sink_context: str,
     payloads_tried: list[Any],
+    execution_results: list[Any] | None = None,
     duplicate_payloads: list[str] | None = None,
     observation: str = "",
 ) -> list[Any]:
@@ -246,6 +247,7 @@ def _build_cloud_feedback_lessons(
     )
     attempted_delivery_modes = _infer_attempted_delivery_modes(
         payloads_tried,
+        execution_results=execution_results or [],
         default_delivery_mode=delivery_mode,
     )
     delivery_constraints = _infer_delivery_constraints(
@@ -475,6 +477,7 @@ def _infer_delivery_constraints(
 def _infer_attempted_delivery_modes(
     payloads_tried: list[Any],
     *,
+    execution_results: list[Any],
     default_delivery_mode: str = "",
 ) -> list[str]:
     modes: list[str] = []
@@ -494,6 +497,10 @@ def _infer_attempted_delivery_modes(
             _add("fragment")
         if "?" in test_vector:
             _add("query")
+
+    for result in execution_results:
+        for mode in getattr(result, "executed_delivery_modes", []) or []:
+            _add(mode)
 
     if not modes and default_delivery_mode:
         fallback_mode = default_delivery_mode.strip().lower()
@@ -985,6 +992,7 @@ def _run(
                             context_type=context_type,
                             sink_context=context_type,
                             payloads_tried=cloud_payloads,
+                            execution_results=failed_results,
                             duplicate_payloads=duplicate_payloads,
                             observation=_summarize_failed_execution_results(failed_results),
                         )
@@ -2003,6 +2011,7 @@ def _run_dom(
                                     context_type="dom_xss",
                                     sink_context=hit.sink,
                                     payloads_tried=cloud_payloads,
+                                    execution_results=[],
                                     duplicate_payloads=duplicate_payloads,
                                     observation="DOM sink stayed taint-only; no execution signal fired.",
                                 )
@@ -2775,6 +2784,7 @@ def _run_post(
                             context_type=context_type,
                             sink_context=context_type,
                             payloads_tried=cloud_payloads,
+                            execution_results=failed_results,
                             duplicate_payloads=duplicate_payloads,
                             observation=_summarize_failed_execution_results(failed_results),
                         )

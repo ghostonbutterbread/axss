@@ -60,6 +60,13 @@ class ExecutionResult:
     error: str | None = None
     """Any error that prevented the attempt."""
 
+    planned_delivery_modes: list[str] = field(default_factory=list)
+    executed_delivery_modes: list[str] = field(default_factory=list)
+    preflight_attempted: bool = False
+    preflight_succeeded: bool = False
+    follow_up_attempted: bool = False
+    follow_up_succeeded: bool = False
+
 
 @dataclass(slots=True)
 class DeliveryPlan:
@@ -68,6 +75,29 @@ class DeliveryPlan:
     param_overrides: dict[str, str] = field(default_factory=dict)
     preflight_urls: list[str] = field(default_factory=list)
     follow_up_urls: list[str] = field(default_factory=list)
+
+
+def _append_unique(items: list[str], value: str) -> None:
+    cleaned = str(value or "").strip().lower()
+    if cleaned and cleaned not in items:
+        items.append(cleaned)
+
+
+def _planned_delivery_modes(plan: DeliveryPlan, *, base_mode: str) -> list[str]:
+    modes: list[str] = []
+    _append_unique(modes, base_mode)
+    parsed = urllib.parse.urlparse(plan.fired_url or "")
+    if parsed.query:
+        _append_unique(modes, "query")
+    if parsed.fragment:
+        _append_unique(modes, "fragment")
+    if len(plan.param_overrides) > 1:
+        _append_unique(modes, "multi_param")
+    if plan.preflight_urls:
+        _append_unique(modes, "preflight")
+    if plan.follow_up_urls:
+        _append_unique(modes, "follow_up")
+    return modes
 
 
 class ActiveExecutor:
@@ -134,6 +164,12 @@ class ActiveExecutor:
 
         Returns an ExecutionResult regardless of whether execution was confirmed.
         """
+        planned_modes: list[str] = []
+        executed_modes: list[str] = []
+        preflight_attempted = False
+        preflight_succeeded = False
+        follow_up_attempted = False
+        follow_up_succeeded = False
         if not self._started or self._browser is None:
             return ExecutionResult(
                 confirmed=False,
@@ -155,6 +191,8 @@ class ActiveExecutor:
             payload_candidate=payload_candidate,
         )
         fired_url = plan.fired_url
+        planned_modes = _planned_delivery_modes(plan, base_mode="get")
+        preflight_attempted = bool(plan.preflight_urls)
 
         confirmed = False
         method = ""
@@ -225,6 +263,9 @@ class ActiveExecutor:
                 )
                 if not ok and nav_exc is not None:
                     log.debug("Preflight navigation error for %s after %s: %s", preflight_url, phases, nav_exc)
+                if ok:
+                    preflight_succeeded = True
+                    _append_unique(executed_modes, "preflight")
 
             # Navigate — use domcontentloaded so we don't wait for all assets
             ok, phases, nav_exc = goto_with_edge_recovery(
@@ -236,12 +277,17 @@ class ActiveExecutor:
                 # Navigation errors (timeout, net error) don't mean no execution —
                 # a dialog event may have already fired and been caught.
                 log.debug("Navigation error for %s after %s: %s", fired_url, phases, nav_exc)
+            if ok:
+                for mode in planned_modes:
+                    if mode not in {"preflight", "follow_up"}:
+                        _append_unique(executed_modes, mode)
 
             # --sink-url: navigate to the user-specified render page to catch
             # GET-based stored XSS where the payload shows up elsewhere.
             follow_ups = list(dict.fromkeys(
                 plan.follow_up_urls + ([sink_url] if sink_url else [])
             ))
+            follow_up_attempted = bool(follow_ups)
             for follow_up_url in follow_ups:
                 if confirmed:
                     break
@@ -252,6 +298,9 @@ class ActiveExecutor:
                 )
                 if not ok and _nav_exc is not None:
                     log.debug("fire: follow-up nav error for %s after %s: %s", follow_up_url, phases, _nav_exc)
+                if ok:
+                    follow_up_succeeded = True
+                    _append_unique(executed_modes, "follow_up")
 
         except Exception as exc:
             return ExecutionResult(
@@ -263,6 +312,12 @@ class ActiveExecutor:
                 param_name=param_name,
                 fired_url=fired_url,
                 error=str(exc),
+                planned_delivery_modes=planned_modes,
+                executed_delivery_modes=executed_modes,
+                preflight_attempted=preflight_attempted,
+                preflight_succeeded=preflight_succeeded,
+                follow_up_attempted=follow_up_attempted,
+                follow_up_succeeded=follow_up_succeeded,
             )
         finally:
             try:
@@ -278,6 +333,12 @@ class ActiveExecutor:
             payload=plan.payload_value,
             param_name=param_name,
             fired_url=fired_url,
+            planned_delivery_modes=planned_modes,
+            executed_delivery_modes=executed_modes,
+            preflight_attempted=preflight_attempted,
+            preflight_succeeded=preflight_succeeded,
+            follow_up_attempted=follow_up_attempted,
+            follow_up_succeeded=follow_up_succeeded,
         )
 
 
@@ -316,6 +377,10 @@ class ActiveExecutor:
         confirmed = False
         method = ""
         detail = ""
+        planned_modes: list[str] = []
+        executed_modes: list[str] = []
+        follow_up_attempted = False
+        follow_up_succeeded = False
         # Guard: only count execution events that happen AFTER the payload is
         # submitted.  Without this, console.log() calls on the form page itself
         # (e.g. analytics scripts) would fire _on_console and give a false positive
@@ -389,6 +454,7 @@ class ActiveExecutor:
                 payload_candidate=payload_candidate,
                 sink_url=sink_url,
             )
+            planned_modes = _planned_delivery_modes(plan, base_mode="post")
 
             # Step 2: Fill the target param with the payload
             try:
@@ -400,11 +466,13 @@ class ActiveExecutor:
                     confirmed=False,
                     method="",
                     detail="",
-                transform_name=transform_name,
-                payload=plan.payload_value,
-                param_name=param_name,
-                fired_url=source_page_url,
-                error=f"fill failed: {fill_exc}",
+                    transform_name=transform_name,
+                    payload=plan.payload_value,
+                    param_name=param_name,
+                    fired_url=source_page_url,
+                    error=f"fill failed: {fill_exc}",
+                    planned_delivery_modes=planned_modes,
+                    executed_delivery_modes=executed_modes,
                 )
 
             # Step 3: Submit the form — try submit button first, fall back to JS submit
@@ -416,6 +484,9 @@ class ActiveExecutor:
                     submit_btn.click(timeout=3000)
                 else:
                     page.evaluate("document.forms[0] && document.forms[0].submit()")
+                for mode in planned_modes:
+                    if mode != "follow_up":
+                        _append_unique(executed_modes, mode)
                 # Wait briefly for post-submit navigation / JS execution
                 try:
                     page.wait_for_load_state("domcontentloaded", timeout=_NAV_TIMEOUT_MS)
@@ -442,6 +513,7 @@ class ActiveExecutor:
                     + ([sink_url] if sink_url else [])
                     + [source_page_url, _origin_root]
                 ))
+                follow_up_attempted = bool(_follow_ups)
                 for _fu in _follow_ups:
                     if confirmed:
                         break
@@ -452,6 +524,9 @@ class ActiveExecutor:
                     )
                     if not ok and _nav_exc is not None:
                         log.debug("fire_post: follow-up nav error for %s after %s: %s", _fu, phases, _nav_exc)
+                    if ok:
+                        follow_up_succeeded = True
+                        _append_unique(executed_modes, "follow_up")
 
         except Exception as exc:
             return ExecutionResult(
@@ -463,6 +538,10 @@ class ActiveExecutor:
                 param_name=param_name,
                 fired_url=source_page_url,
                 error=str(exc),
+                planned_delivery_modes=planned_modes,
+                executed_delivery_modes=executed_modes,
+                follow_up_attempted=follow_up_attempted,
+                follow_up_succeeded=follow_up_succeeded,
             )
         finally:
             try:
@@ -478,6 +557,10 @@ class ActiveExecutor:
             payload=plan.payload_value,
             param_name=param_name,
             fired_url=source_page_url,
+            planned_delivery_modes=planned_modes,
+            executed_delivery_modes=executed_modes,
+            follow_up_attempted=follow_up_attempted,
+            follow_up_succeeded=follow_up_succeeded,
         )
 
     def fire_upload(
