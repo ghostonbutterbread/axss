@@ -21,6 +21,7 @@ from itertools import cycle
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote as url_quote
+import urllib.parse
 
 log = logging.getLogger(__name__)
 
@@ -95,6 +96,8 @@ _PROBE_MAX_WORKERS = 6
 
 # Max crawled pages to sweep for session-stored XSS (caps follow-up sweep cost)
 _FOLLOW_UP_CRAWLED_LIMIT = 30
+_BROWSER_PROBE_TIMEOUT_MS = 25_000
+_BROWSER_PROBE_SETTLE_SECONDS = 0.35
 
 
 class _RateLimiter:
@@ -530,6 +533,116 @@ def _rebuild_url(url: str, params: dict[str, str]) -> str:
     )
 
 
+def _browser_context_auth(
+    url: str,
+    auth_headers: dict[str, str] | None,
+    user_agent: str,
+) -> tuple[dict[str, str], list[dict[str, Any]], str]:
+    """Split auth headers into Playwright headers + cookies for *url*."""
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.hostname or ""
+    secure = parsed.scheme == "https"
+
+    extra_headers: dict[str, str] = {}
+    cookie_header = ""
+    for name, value in (auth_headers or {}).items():
+        if name.lower() == "cookie":
+            cookie_header = value
+            continue
+        extra_headers[name] = value
+
+    cookies: list[dict[str, Any]] = []
+    if cookie_header and host:
+        for raw_cookie in cookie_header.split(";"):
+            if "=" not in raw_cookie:
+                continue
+            cookie_name, cookie_value = raw_cookie.split("=", 1)
+            cookie_name = cookie_name.strip()
+            if not cookie_name:
+                continue
+            cookies.append({
+                "name": cookie_name,
+                "value": cookie_value.strip(),
+                "domain": host,
+                "path": "/",
+                "secure": secure,
+                "httpOnly": False,
+            })
+
+    return extra_headers, cookies, user_agent
+
+
+def _page_fetch_html(page: Any, url: str, timeout_ms: int = _BROWSER_PROBE_TIMEOUT_MS) -> str:
+    """Navigate a Playwright page and return rendered HTML."""
+    nav_error: Exception | None = None
+    for wait_until, current_timeout in (
+        ("domcontentloaded", timeout_ms),
+        ("commit", min(timeout_ms, 10_000)),
+    ):
+        try:
+            page.goto(url, wait_until=wait_until, timeout=current_timeout)
+            break
+        except Exception as exc:
+            nav_error = exc
+    time.sleep(_BROWSER_PROBE_SETTLE_SECONDS)
+    try:
+        return page.content()
+    except Exception:
+        if nav_error is not None:
+            raise nav_error
+        raise
+
+
+def fetch_html_with_browser(
+    url: str,
+    *,
+    auth_headers: dict[str, str] | None = None,
+    user_agent: str = "axss/0.1 (+authorized security testing; playwright)",
+    proxy: str | None = None,
+    timeout_ms: int = _BROWSER_PROBE_TIMEOUT_MS,
+) -> str:
+    """Fetch rendered HTML through a real Playwright browser context."""
+    from playwright.sync_api import sync_playwright
+
+    extra_headers, cookies, browser_user_agent = _browser_context_auth(
+        url,
+        auth_headers,
+        user_agent,
+    )
+    launch_kwargs: dict[str, Any] = {
+        "headless": True,
+        "args": ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+    }
+    if proxy:
+        launch_kwargs["proxy"] = {"server": proxy}
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(**launch_kwargs)
+        try:
+            context = browser.new_context(
+                ignore_https_errors=True,
+                extra_http_headers={**extra_headers, "Accept": "text/html,application/xhtml+xml"},
+                user_agent=browser_user_agent,
+            )
+            try:
+                if cookies:
+                    context.add_cookies(cookies)
+
+                def _route_handler(route: Any) -> None:
+                    if route.request.resource_type in {"image", "media", "font", "stylesheet"}:
+                        route.abort()
+                    else:
+                        route.continue_()
+
+                context.route("**/*", _route_handler)
+                page = context.new_page()
+                return _page_fetch_html(page, url, timeout_ms=timeout_ms)
+            finally:
+                context.close()
+        finally:
+            browser.close()
+
+
 def _session_get(session: Any, url: str, req_kwargs: dict[str, Any]) -> Any:
     """FetcherSession.get with automatic HTTP/1.1 retry on HTTP/2 stream reset."""
     try:
@@ -651,7 +764,7 @@ def _probe_param(
 
 
 def _probe_param_playwright(
-    dyn_session: Any,
+    page: Any,
     url: str,
     param_name: str,
     original_value: str,
@@ -663,29 +776,25 @@ def _probe_param_playwright(
     proxy_cycle: Any | None,
     auth_headers: dict[str, str] | None = None,
 ) -> ProbeResult:
-    """Probe a single parameter using a shared Playwright browser session.
+    """Probe a single parameter using a shared Playwright page.
 
-    Used when WAF detection indicates a real browser is required (akamai,
-    cloudflare, datadome, etc.). The caller holds the DynamicSession context
-    open across all parameter probes for the same URL so only one browser
-    launch is needed.
+    Used when WAF detection indicates a real browser is required. The caller
+    owns the Playwright browser context so session cookies and auth state are
+    preserved across every probe request.
     """
-    extra_headers: dict[str, str] = {**(auth_headers or {}), "User-Agent": next(ua_cycle)}
-    fetch_kwargs: dict[str, Any] = {"extra_headers": extra_headers}
-    if proxy_cycle:
-        fetch_kwargs["proxy"] = next(proxy_cycle)
 
     # Phase 1 — reflection mapping
     if delay > 0:
         time.sleep(delay)
     try:
-        resp1 = dyn_session.fetch(
-            _rebuild_url(url, {**all_params, param_name: canary}), **fetch_kwargs
+        resp1_html = _page_fetch_html(
+            page,
+            _rebuild_url(url, {**all_params, param_name: canary}),
         )
     except Exception as exc:
         return ProbeResult(param_name=param_name, original_value=original_value, error=str(exc))
 
-    html1 = _resp_html(resp1)
+    html1 = resp1_html
     reflections = _find_reflections(html1, canary)
     reflection_transform = _reflection_transform(html1, canary)
     if not reflections:
@@ -696,10 +805,11 @@ def _probe_param_playwright(
     if delay > 0:
         time.sleep(delay)
     try:
-        resp2 = dyn_session.fetch(
-            _rebuild_url(url, {**all_params, param_name: char_probe}), **fetch_kwargs
+        resp2_html = _page_fetch_html(
+            page,
+            _rebuild_url(url, {**all_params, param_name: char_probe}),
         )
-        surviving = _analyze_char_survival(_resp_html(resp2), canary)
+        surviving = _analyze_char_survival(resp2_html, canary)
         if reflection_transform == "upper":
             surviving = surviving.union(frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZ"))
     except Exception:
@@ -787,55 +897,92 @@ def probe_url(
 
     if needs_browser:
         log.info("WAF=%s — using Playwright for probe requests", waf)
-        from scrapling.fetchers import DynamicSession
-        with DynamicSession(headless=True, timeout=45_000) as dyn:
-            for param_name, original_value in flat_params.items():
-                result = _probe_param_playwright(
-                    dyn, url, param_name, original_value, flat_params,
-                    canary=canary, delay=delay, ua_cycle=ua_cycle, proxy_cycle=proxy_cycle,
-                    auth_headers=auth_headers,
-                )
-                # --sink-url: DynamicSession maintains cookies across fetch() calls
-                # within the same session, so the stored canary is visible on sink_url.
-                if sink_url and not result.reflections and not result.error:
-                    try:
-                        if delay > 0:
-                            time.sleep(delay)
-                        _sink_resp = dyn.fetch(sink_url)
-                        _sink_refs = _find_reflections(_resp_html(_sink_resp), canary)
-                        if _sink_refs:
-                            _char_probe = canary + _PROBE_OPEN + PROBE_CHARS + _PROBE_CLOSE
-                            _char_url = _rebuild_url(url, {**flat_params, param_name: _char_probe})
+        from playwright.sync_api import sync_playwright
+
+        proxy = next(proxy_cycle) if proxy_cycle else None
+        user_agent = next(ua_cycle)
+        extra_headers, cookies, browser_user_agent = _browser_context_auth(
+            url,
+            auth_headers,
+            user_agent,
+        )
+        launch_kwargs: dict[str, Any] = {
+            "headless": True,
+            "args": ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+        }
+        if proxy:
+            launch_kwargs["proxy"] = {"server": proxy}
+
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(**launch_kwargs)
+            context = browser.new_context(
+                ignore_https_errors=True,
+                extra_http_headers={**extra_headers, "Accept": "text/html,application/xhtml+xml"},
+                user_agent=browser_user_agent,
+            )
+            try:
+                if cookies:
+                    context.add_cookies(cookies)
+
+                def _route_handler(route: Any) -> None:
+                    if route.request.resource_type in {"image", "media", "font", "stylesheet"}:
+                        route.abort()
+                    else:
+                        route.continue_()
+
+                context.route("**/*", _route_handler)
+                page = context.new_page()
+
+                for param_name, original_value in flat_params.items():
+                    result = _probe_param_playwright(
+                        page, url, param_name, original_value, flat_params,
+                        canary=canary, delay=delay, ua_cycle=ua_cycle, proxy_cycle=proxy_cycle,
+                        auth_headers=auth_headers,
+                    )
+                    if sink_url and not result.reflections and not result.error:
+                        try:
                             if delay > 0:
                                 time.sleep(delay)
-                            dyn.fetch(_char_url)
-                            if delay > 0:
-                                time.sleep(delay)
-                            _sink_resp2 = dyn.fetch(sink_url)
-                            _surviving = _analyze_char_survival(_resp_html(_sink_resp2), canary)
-                            result = ProbeResult(
-                                param_name=param_name,
-                                original_value=original_value,
-                                reflections=[
-                                    ReflectionContext(
-                                        context_type=ctx.context_type,
-                                        attr_name=ctx.attr_name,
-                                        surviving_chars=_surviving,
-                                        snippet=ctx.snippet,
-                                        context_before=ctx.context_before,
-                                    )
-                                    for ctx in _sink_refs
-                                ],
-                            )
-                            log.debug(
-                                "probe_url (browser): canary found in sink_url %s for param %s",
-                                sink_url, param_name,
-                            )
-                    except Exception as _exc:
-                        log.debug("probe_url (browser): sink_url check failed: %s", _exc)
-                results.append(result)
-                if on_result:
-                    on_result(result)
+                            _sink_html = _page_fetch_html(page, sink_url)
+                            _sink_refs = _find_reflections(_sink_html, canary)
+                            if _sink_refs:
+                                _char_probe = canary + _PROBE_OPEN + PROBE_CHARS + _PROBE_CLOSE
+                                _char_url = _rebuild_url(url, {**flat_params, param_name: _char_probe})
+                                if delay > 0:
+                                    time.sleep(delay)
+                                _page_fetch_html(page, _char_url)
+                                if delay > 0:
+                                    time.sleep(delay)
+                                _sink_html2 = _page_fetch_html(page, sink_url)
+                                _surviving = _analyze_char_survival(_sink_html2, canary)
+                                if _reflection_transform(_sink_html, canary) == "upper":
+                                    _surviving = _surviving.union(frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZ"))
+                                result = ProbeResult(
+                                    param_name=param_name,
+                                    original_value=original_value,
+                                    reflections=[
+                                        ReflectionContext(
+                                            context_type=ctx.context_type,
+                                            attr_name=ctx.attr_name,
+                                            surviving_chars=_surviving,
+                                            snippet=ctx.snippet,
+                                            context_before=ctx.context_before,
+                                        )
+                                        for ctx in _sink_refs
+                                    ],
+                                )
+                                log.debug(
+                                    "probe_url (browser): canary found in sink_url %s for param %s",
+                                    sink_url, param_name,
+                                )
+                        except Exception as _exc:
+                            log.debug("probe_url (browser): sink_url check failed: %s", _exc)
+                    results.append(result)
+                    if on_result:
+                        on_result(result)
+            finally:
+                context.close()
+                browser.close()
     else:
         # Parallel probe: each thread gets its own FetcherSession; the shared
         # token-bucket rate limiter ensures the global req/s cap is respected.

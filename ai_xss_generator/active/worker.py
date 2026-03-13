@@ -390,18 +390,26 @@ def _run(
     # real page content.
     _prefetched_html: str | None = None
     try:
-        from scrapling.fetchers import FetcherSession as _FS
-        with _FS(impersonate="chrome", stealthy_headers=True, timeout=20,
-                 follow_redirects=True, retries=1) as _fs:
-            _clean_resp = _fs.get(
+        from ai_xss_generator.probe import _BROWSER_REQUIRED_WAFS, fetch_html_with_browser
+        if waf_hint is not None and waf_hint.lower() in _BROWSER_REQUIRED_WAFS:
+            _prefetched_html = fetch_html_with_browser(
                 url,
-                headers={**(auth_headers or {}),
-                         "User-Agent": "axss/0.1 (+authorized security testing; scrapling)"},
+                auth_headers=auth_headers,
+                user_agent="axss/0.1 (+authorized security testing; playwright-prefetch)",
             )
-            _prefetched_html = _clean_resp.text or (
-                _clean_resp.body.decode("utf-8", errors="replace")
-                if _clean_resp.body else None
-            )
+        else:
+            from scrapling.fetchers import FetcherSession as _FS
+            with _FS(impersonate="chrome", stealthy_headers=True, timeout=20,
+                     follow_redirects=True, retries=1) as _fs:
+                _clean_resp = _fs.get(
+                    url,
+                    headers={**(auth_headers or {}),
+                             "User-Agent": "axss/0.1 (+authorized security testing; scrapling)"},
+                )
+                _prefetched_html = _clean_resp.text or (
+                    _clean_resp.body.decode("utf-8", errors="replace")
+                    if _clean_resp.body else None
+                )
     except Exception as _exc:
         log.debug("Pre-fetch of %s failed (parse_target will re-fetch): %s", url, _exc)
 
