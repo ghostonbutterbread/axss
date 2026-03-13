@@ -356,12 +356,16 @@ def _infer_strategy_constraints(
     delivery_mode: str,
     context_type: str,
     sink_context: str,
-    payloads_tried: list[str],
+    payloads_tried: list[Any],
     duplicate_payloads: list[str],
     observation: str,
 ) -> list[str]:
     constraints: list[str] = []
-    lowered_payloads = [payload.lower() for payload in payloads_tried if payload]
+    lowered_payloads = [
+        _payload_text(payload).strip().lower()
+        for payload in payloads_tried
+        if _payload_text(payload).strip()
+    ]
     normalized_context = context_type.strip().lower()
     normalized_sink = sink_context.strip().lower()
 
@@ -424,12 +428,16 @@ def _infer_failed_families(
     delivery_mode: str,
     context_type: str,
     sink_context: str,
-    payloads_tried: list[str],
+    payloads_tried: list[Any],
 ) -> list[str]:
     families: list[str] = []
     normalized_context = context_type.strip().lower()
     normalized_sink = sink_context.strip().lower()
-    lowered_payloads = [payload.lower() for payload in payloads_tried if payload]
+    lowered_payloads = [
+        _payload_text(payload).strip().lower()
+        for payload in payloads_tried
+        if _payload_text(payload).strip()
+    ]
 
     def _add(name: str) -> None:
         if name and name not in families:

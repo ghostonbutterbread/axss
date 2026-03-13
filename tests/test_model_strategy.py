@@ -13,6 +13,7 @@ from ai_xss_generator.models import (
     _prompt_for_generation_phase,
 )
 from ai_xss_generator.types import ParsedContext
+from ai_xss_generator.types import PayloadCandidate
 
 
 def test_normalize_payloads_keeps_strategy_and_bypass_family() -> None:
@@ -277,6 +278,50 @@ def test_cloud_prompt_includes_edge_execution_feedback_details() -> None:
     assert '"fragment_dropped"' in prompt
     assert '"delivery_outcomes": [' in prompt
     assert '"query_preserved"' in prompt
+
+
+def test_cloud_feedback_accepts_payload_candidates_for_dom_paths() -> None:
+    context = ParsedContext(source="https://example.test/dom#x", source_type="url")
+    profile = build_target_behavior_profile(
+        url=context.source,
+        delivery_mode="dom",
+        waf_name="",
+        auth_required=False,
+        context=context,
+    )
+    enriched = attach_behavior_profile(context, profile)
+    assert enriched is not None
+
+    lessons = _build_cloud_feedback_lessons(
+        attempt_number=1,
+        total_attempts=2,
+        prompt_context=enriched,
+        delivery_mode="dom",
+        context_type="dom_xss",
+        sink_context="document.write",
+        payloads_tried=[
+            PayloadCandidate(
+                payload="'onload='alert(1)",
+                title="same-tag",
+                explanation="",
+                test_vector="#'onload='alert(1)",
+                bypass_family="quote_closure",
+            ),
+            PayloadCandidate(
+                payload="'srcdoc='&#x3C;svg/onload=alert(1)&#x3E;'",
+                title="srcdoc",
+                explanation="",
+                test_vector="#'srcdoc='&#x3C;svg/onload=alert(1)&#x3E;'",
+                bypass_family="srcdoc_pivot",
+            ),
+        ],
+        duplicate_payloads=[],
+        observation="DOM sink stayed taint-only; no execution signal fired.",
+    )
+
+    metadata = lessons[0].metadata
+    assert "document_write_markup_escape" in metadata["failed_families"]
+    assert any("same-tag attribute pivots" in item for item in metadata["strategy_constraints"])
 
 
 def test_generation_output_schema_scout_is_minimal() -> None:
