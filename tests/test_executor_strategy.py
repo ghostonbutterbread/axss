@@ -53,6 +53,26 @@ def test_build_delivery_plan_applies_multi_param_test_vector() -> None:
     assert "second=onload%3Dalert%281%29%3E" in plan.fired_url
 
 
+def test_build_delivery_plan_adds_preflight_for_navigate_then_fire() -> None:
+    candidate = PayloadCandidate(
+        payload="alert(1)",
+        title="stateful",
+        explanation="",
+        test_vector="",
+        strategy=StrategyProfile(session_hint="navigate_then_fire"),
+    )
+
+    plan = _build_delivery_plan(
+        url="https://example.test/account/view?id=7",
+        param_name="id",
+        payload=candidate.payload,
+        all_params={"id": "7"},
+        payload_candidate=candidate,
+    )
+
+    assert plan.preflight_urls == ["https://example.test/"]
+
+
 def test_build_post_delivery_plan_applies_multi_param_test_vector() -> None:
     candidate = PayloadCandidate(
         payload="ignored",
@@ -63,6 +83,7 @@ def test_build_post_delivery_plan_applies_multi_param_test_vector() -> None:
     )
 
     plan = _build_post_delivery_plan(
+        source_page_url="https://example.test/profile",
         param_name="first",
         payload=candidate.payload,
         payload_candidate=candidate,
@@ -72,3 +93,26 @@ def test_build_post_delivery_plan_applies_multi_param_test_vector() -> None:
         "first": "<details/open",
         "second": "ontoggle=alert(1)>",
     }
+
+
+def test_build_post_delivery_plan_adds_sink_follow_up_for_post_then_sink() -> None:
+    candidate = PayloadCandidate(
+        payload="ignored",
+        title="stored",
+        explanation="",
+        test_vector="name=test",
+        strategy=StrategyProfile(
+            session_hint="post_then_sink",
+            follow_up_hint="/profile/avatar",
+        ),
+    )
+
+    plan = _build_post_delivery_plan(
+        source_page_url="https://example.test/settings/avatar",
+        param_name="name",
+        payload=candidate.payload,
+        payload_candidate=candidate,
+        sink_url=None,
+    )
+
+    assert plan.follow_up_urls == ["https://example.test/profile/avatar"]

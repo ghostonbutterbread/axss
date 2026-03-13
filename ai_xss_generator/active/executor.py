@@ -65,6 +65,8 @@ class DeliveryPlan:
     fired_url: str
     payload_value: str
     param_overrides: dict[str, str] = field(default_factory=dict)
+    preflight_urls: list[str] = field(default_factory=list)
+    follow_up_urls: list[str] = field(default_factory=list)
 
 
 class ActiveExecutor:
@@ -212,6 +214,14 @@ class ActiveExecutor:
 
             page.on("request", _on_request)
 
+            for preflight_url in plan.preflight_urls:
+                if confirmed:
+                    break
+                try:
+                    page.goto(preflight_url, timeout=_NAV_TIMEOUT_MS, wait_until="domcontentloaded")
+                except Exception as nav_exc:
+                    log.debug("Preflight navigation error for %s: %s", preflight_url, nav_exc)
+
             # Navigate — use domcontentloaded so we don't wait for all assets
             try:
                 page.goto(fired_url, timeout=_NAV_TIMEOUT_MS, wait_until="domcontentloaded")
@@ -223,11 +233,16 @@ class ActiveExecutor:
 
             # --sink-url: navigate to the user-specified render page to catch
             # GET-based stored XSS where the payload shows up elsewhere.
-            if sink_url and not confirmed:
+            follow_ups = list(dict.fromkeys(
+                plan.follow_up_urls + ([sink_url] if sink_url else [])
+            ))
+            for follow_up_url in follow_ups:
+                if confirmed:
+                    break
                 try:
-                    page.goto(sink_url, timeout=_NAV_TIMEOUT_MS, wait_until="domcontentloaded")
+                    page.goto(follow_up_url, timeout=_NAV_TIMEOUT_MS, wait_until="domcontentloaded")
                 except Exception as _nav_exc:
-                    log.debug("fire: sink_url nav error for %s: %s", sink_url, _nav_exc)
+                    log.debug("fire: follow-up nav error for %s: %s", follow_up_url, _nav_exc)
 
         except Exception as exc:
             return ExecutionResult(
@@ -235,7 +250,7 @@ class ActiveExecutor:
                 method="",
                 detail="",
                 transform_name=transform_name,
-                payload=payload,
+                payload=plan.payload_value,
                 param_name=param_name,
                 fired_url=fired_url,
                 error=str(exc),
@@ -251,7 +266,7 @@ class ActiveExecutor:
             method=method,
             detail=detail,
             transform_name=transform_name,
-            payload=payload,
+            payload=plan.payload_value,
             param_name=param_name,
             fired_url=fired_url,
         )
@@ -355,10 +370,12 @@ class ActiveExecutor:
                 log.debug("fire_post: source page load error for %s: %s", source_page_url, nav_exc)
 
             plan = _build_post_delivery_plan(
+                source_page_url=source_page_url,
                 param_name=param_name,
                 payload=payload,
                 payload_overrides=payload_overrides,
                 payload_candidate=payload_candidate,
+                sink_url=sink_url,
             )
 
             # Step 2: Fill the target param with the payload
@@ -409,7 +426,9 @@ class ActiveExecutor:
                 _origin_root = f"{_pp.scheme}://{_pp.netloc}/"
                 # sink_url (manually specified) is first — highest priority
                 _follow_ups = list(dict.fromkeys(
-                    ([sink_url] if sink_url else []) + [source_page_url, _origin_root]
+                    list(plan.follow_up_urls)
+                    + ([sink_url] if sink_url else [])
+                    + [source_page_url, _origin_root]
                 ))
                 for _fu in _follow_ups:
                     if confirmed:
@@ -455,6 +474,26 @@ def _strategy_value(strategy: Any, key: str) -> str:
     return str(getattr(strategy, key, "") or "").strip()
 
 
+def _candidate_follow_up_target(url: str, payload_candidate: Any = None, sink_url: str | None = None) -> str:
+    if sink_url:
+        return sink_url
+    follow_up_hint = str(getattr(getattr(payload_candidate, "strategy", None), "follow_up_hint", "") or "").strip()
+    if not follow_up_hint:
+        return ""
+    parsed = urllib.parse.urlparse(follow_up_hint)
+    if parsed.scheme and parsed.netloc:
+        return follow_up_hint
+    if follow_up_hint.startswith("/"):
+        base = urllib.parse.urlparse(url)
+        return urllib.parse.urlunparse(base._replace(path=follow_up_hint, query="", fragment=""))
+    return ""
+
+
+def _same_origin_root(url: str) -> str:
+    parsed = urllib.parse.urlparse(url)
+    return urllib.parse.urlunparse(parsed._replace(path="/", query="", fragment=""))
+
+
 def _parse_test_vector(test_vector: str) -> tuple[dict[str, str], str]:
     test_vector = (test_vector or "").strip()
     if not test_vector:
@@ -490,6 +529,7 @@ def _build_delivery_plan(
     strategy = getattr(payload_candidate, "strategy", None)
     test_vector = str(getattr(payload_candidate, "test_vector", "") or "")
     delivery_hint = _strategy_value(strategy, "delivery_mode_hint").lower()
+    session_hint = _strategy_value(strategy, "session_hint").lower()
     coordination_hint = _strategy_value(strategy, "coordination_hint").lower()
 
     overrides = dict(payload_overrides or {})
@@ -510,22 +550,35 @@ def _build_delivery_plan(
 
     new_query = urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
     fired_url = urllib.parse.urlunparse(parsed._replace(query=new_query, fragment=fragment))
+    preflight_urls: list[str] = []
+    follow_up_urls: list[str] = []
+    if session_hint in {"navigate_then_fire", "authenticated_follow_up"}:
+        preflight_urls.append(_same_origin_root(url))
+    if session_hint in {"authenticated_follow_up"}:
+        follow_up = _candidate_follow_up_target(url, payload_candidate)
+        if follow_up:
+            follow_up_urls.append(follow_up)
     return DeliveryPlan(
         fired_url=fired_url,
         payload_value=str(params.get(param_name, payload)),
         param_overrides=params,
+        preflight_urls=list(dict.fromkeys(preflight_urls)),
+        follow_up_urls=list(dict.fromkeys(follow_up_urls)),
     )
 
 
 def _build_post_delivery_plan(
     *,
+    source_page_url: str,
     param_name: str,
     payload: str,
     payload_overrides: dict[str, str] | None = None,
     payload_candidate: Any = None,
+    sink_url: str | None = None,
 ) -> DeliveryPlan:
     strategy = getattr(payload_candidate, "strategy", None)
     coordination_hint = _strategy_value(strategy, "coordination_hint").lower()
+    session_hint = _strategy_value(strategy, "session_hint").lower()
     test_vector = str(getattr(payload_candidate, "test_vector", "") or "")
 
     overrides = {param_name: payload}
@@ -534,10 +587,16 @@ def _build_post_delivery_plan(
     vector_params, _ = _parse_test_vector(test_vector)
     if vector_params and (coordination_hint == "multi_param" or len(vector_params) >= 1):
         overrides.update(vector_params)
+    follow_up_urls: list[str] = []
+    if session_hint in {"post_then_sink", "authenticated_follow_up"}:
+        follow_up = _candidate_follow_up_target(source_page_url, payload_candidate, sink_url)
+        if follow_up:
+            follow_up_urls.append(follow_up)
     return DeliveryPlan(
         fired_url="",
         payload_value=str(overrides.get(param_name, payload)),
         param_overrides=overrides,
+        follow_up_urls=list(dict.fromkeys(follow_up_urls)),
     )
 
 
