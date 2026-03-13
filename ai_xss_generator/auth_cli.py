@@ -7,21 +7,21 @@ from pathlib import Path
 
 from ai_xss_generator.auth import describe_auth
 from ai_xss_generator.auth_profiles import (
+    AuthImportPreview,
     AuthProfile,
     AUTH_PROFILES_PATH,
+    apply_import_preview,
     build_headers_from_profile,
     clear_active_profile,
     delete_profile,
     get_active_profile,
-    import_auth_profile,
     list_auth_profiles,
     load_auth_store,
+    preview_auth_import,
     purge_invalid_profiles,
     resolve_profile_ref,
-    save_auth_store,
     set_active_profile,
     touch_profile_last_used,
-    upsert_profile,
     validate_profile,
 )
 from ai_xss_generator.console import info, success, warn
@@ -62,6 +62,17 @@ def build_auth_parser() -> argparse.ArgumentParser:
     )
     import_parser.add_argument("--notes", default="", help="Optional notes to store with the profile.")
     import_parser.add_argument("--activate", action="store_true", help="Set the imported profile as active immediately.")
+    import_parser.add_argument(
+        "--mode",
+        choices=["ask", "save", "replace", "merge"],
+        default="ask",
+        help="How to store the imported profile when the target ref already exists.",
+    )
+    import_parser.add_argument(
+        "--preview-only",
+        action="store_true",
+        help="Parse the auth material and print the preview without saving.",
+    )
 
     test_parser = sub.add_parser("test", help="Validate one auth profile against its base URL.")
     test_parser.add_argument("profile", help="Profile ref: program/name or a unique profile name")
@@ -104,6 +115,39 @@ def _print_grouped_profiles(store: dict) -> None:
         info("Active profile: none")
 
 
+def _render_import_preview(preview: AuthImportPreview) -> str:
+    lines = [
+        f"Import preview for {preview.profile.ref}",
+        f"  source:   {preview.source_label}",
+        f"  base_url: {preview.profile.base_url or 'n/a'}",
+        f"  domains:  {preview.domains_preview}",
+        f"  headers:  {preview.header_count}",
+        f"  cookies:  {preview.cookie_count}",
+    ]
+    auth_lines = describe_auth(build_headers_from_profile(preview.profile))
+    if auth_lines:
+        lines.append("  auth:")
+        lines.extend([f"    - {line}" for line in auth_lines])
+    if preview.existing_profile is not None:
+        lines.append(f"  existing: {preview.existing_profile.ref}")
+    return "\n".join(lines)
+
+
+def _prompt_import_mode(preview: AuthImportPreview) -> str:
+    if preview.existing_profile is None:
+        return "save"
+    while True:
+        answer = input("Save mode [s]ave/[m]erge/[r]eplace/[c]ancel: ").strip().lower()
+        if answer in {"s", "save"}:
+            return "save"
+        if answer in {"m", "merge"}:
+            return "merge"
+        if answer in {"r", "replace"}:
+            return "replace"
+        if answer in {"c", "cancel", ""}:
+            return "cancel"
+
+
 def handle_auth_command(argv: list[str]) -> int:
     parser = build_auth_parser()
     args = parser.parse_args(argv)
@@ -121,21 +165,33 @@ def handle_auth_command(argv: list[str]) -> int:
         return 0
 
     if command == "import":
-        profile = import_auth_profile(
+        preview = preview_auth_import(
             source=args.source,
             program=args.program,
             profile_name=args.profile,
             source_type=args.type,
             notes=args.notes,
         )
-        store = upsert_profile(profile)
+        print(_render_import_preview(preview))
+        if args.preview_only:
+            return 0
+        mode = args.mode
+        if mode == "ask":
+            mode = _prompt_import_mode(preview)
+        if mode == "cancel":
+            info("Import cancelled.")
+            return 0
+        try:
+            store, profile = apply_import_preview(preview, mode=mode)
+        except ValueError as exc:
+            parser.error(str(exc))
         if args.activate:
             store, resolved = set_active_profile(profile.ref, store)
             if resolved is not None:
                 touch_profile_last_used(resolved.ref, store)
                 success(f"Imported and activated {resolved.ref}")
         else:
-            success(f"Imported {profile.ref}")
+            success(f"Imported {profile.ref} ({mode})")
         print(_render_profile(profile, active_ref=str(store.get("active_profile", "") or "")))
         return 0
 

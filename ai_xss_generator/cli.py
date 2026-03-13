@@ -905,6 +905,7 @@ def _run_active_scan(
     config: Any,
     resolved_waf: str | None,
     auth_headers: dict[str, str] | None = None,
+    auth_profile_ref: str = "",
     scan_reflected: bool = True,
     scan_stored: bool = True,
     scan_uploads: bool = True,
@@ -1083,6 +1084,8 @@ def _run_active_scan(
     sink_url = getattr(args, "sink_url", None)
     if sink_url:
         info(f"Sink URL: {sink_url} (checking this page after each injection)")
+    if auth_profile_ref:
+        info(f"Active scan auth profile: {auth_profile_ref}")
 
     # Session management: detect an existing in-progress/paused session for this
     # exact target + scan type combination; offer to resume or start fresh.
@@ -1132,7 +1135,12 @@ def _run_active_scan(
         f"model={scan_config.model} | waf={waf or 'none'} | "
         f"cloud_attempts={scan_config.cloud_attempts}"
     )
-    report_path = write_report(results, config_summary=config_summary)
+    auth_summary = auth_profile_ref or ("ad hoc headers/cookies" if auth_headers else "none")
+    report_path = write_report(
+        results,
+        config_summary=config_summary,
+        auth_summary=auth_summary,
+    )
     success(f"Report written to: {report_path}")
 
     return 0
@@ -1330,6 +1338,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # --- Build auth headers from --header / --cookies ---
     auth_headers: dict[str, str] = {}
+    auth_profile_ref = ""
     if args.headers or args.cookies or args.profile:
         from ai_xss_generator.auth import describe_auth
         from ai_xss_generator.auth_profiles import (
@@ -1360,6 +1369,7 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(str(exc))
 
         if selected_profile is not None and profile_source:
+            auth_profile_ref = selected_profile.ref
             touch_profile_last_used(selected_profile.ref)
             info(f"Auth profile: {selected_profile.ref} ({profile_source})")
         if auth_headers:
@@ -1492,6 +1502,7 @@ def main(argv: list[str] | None = None) -> int:
         return _run_active_scan(
             args, config, resolved_waf,
             auth_headers=auth_headers,
+            auth_profile_ref=auth_profile_ref,
             scan_reflected=_want_reflected,
             scan_stored=_want_stored,
             scan_uploads=_want_uploads,

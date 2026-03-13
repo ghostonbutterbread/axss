@@ -81,6 +81,7 @@ def test_report_moves_dom_taint_out_of_confirmed_section() -> None:
     report = _build_report(
         [WorkerResult(url="https://example.test/target", status="confirmed", confirmed_findings=[dom_xss, dom_taint])],
         config_summary="",
+        auth_summary="demo/admin",
     )
 
     assert "## ✅ Confirmed Findings (1)" in report
@@ -113,9 +114,11 @@ def test_report_includes_pilot_summary_and_budget_table() -> None:
             ),
         ],
         config_summary="rate=5",
+        auth_summary="demo/admin",
     )
 
     assert "## Pilot Summary" in report
+    assert "**Auth:** demo/admin" in report
     assert "hard-dead `1`" in report
     assert "live `1`" in report
     assert "Model rounds: local `1`, cloud `2`" in report

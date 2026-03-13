@@ -25,6 +25,7 @@ _REPORTS_DIR = CONFIG_DIR / "reports"
 def write_report(
     results: Sequence[WorkerResult],
     config_summary: str = "",
+    auth_summary: str = "",
     output_path: str | None = None,
 ) -> str:
     """Write a markdown report of active scan results.
@@ -43,12 +44,12 @@ def write_report(
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         output_path = str(_REPORTS_DIR / f"{domain_slug}_{ts}.md")
 
-    content = _build_report(results, config_summary)
+    content = _build_report(results, config_summary, auth_summary)
     Path(output_path).write_text(content, encoding="utf-8")
     return output_path
 
 
-def _build_report(results: Sequence[WorkerResult], config_summary: str) -> str:
+def _build_report(results: Sequence[WorkerResult], config_summary: str, auth_summary: str = "") -> str:
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     confirmed_results = [r for r in results if r.status == "confirmed"]
@@ -83,6 +84,8 @@ def _build_report(results: Sequence[WorkerResult], config_summary: str) -> str:
     ]
     if config_summary:
         lines.append(f"**Config:** {config_summary}  ")
+    if auth_summary:
+        lines.append(f"**Auth:** {auth_summary}  ")
     lines += ["", "---", ""]
 
     pilot_summary = _pilot_summary(results)

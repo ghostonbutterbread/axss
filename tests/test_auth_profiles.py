@@ -4,9 +4,11 @@ from types import SimpleNamespace
 
 from ai_xss_generator.auth_profiles import (
     AuthProfile,
+    apply_import_preview,
     import_auth_profile,
     load_auth_store,
     merge_scan_auth_headers,
+    preview_auth_import,
     purge_invalid_profiles,
     resolve_scan_profile,
     set_active_profile,
@@ -38,6 +40,49 @@ def test_import_burp_request_extracts_headers_and_cookies(tmp_path, monkeypatch)
     assert profile.headers["Authorization"] == "Bearer secret"
     assert profile.headers["X-CSRF-Token"] == "token123"
     assert profile.domains == ["example.test"]
+
+
+def test_preview_and_merge_import_combines_existing_profile(tmp_path, monkeypatch) -> None:
+    auth_path = tmp_path / "auth_profiles.json"
+    monkeypatch.setattr("ai_xss_generator.auth_profiles.AUTH_PROFILES_PATH", auth_path)
+
+    upsert_profile(AuthProfile(
+        program="demo",
+        name="admin",
+        source_type="burp_request",
+        base_url="https://example.test/account",
+        domains=["example.test"],
+        headers={"Authorization": "Bearer old"},
+        cookies={"session": "abc"},
+        notes="existing note",
+    ))
+    request_path = tmp_path / "request.txt"
+    request_path.write_text(
+        "GET /admin HTTP/2\n"
+        "Host: example.test\n"
+        "Cookie: pref=1\n"
+        "X-CSRF-Token: token123\n\n",
+        encoding="utf-8",
+    )
+
+    preview = preview_auth_import(
+        source=str(request_path),
+        program="demo",
+        profile_name="admin",
+        source_type="auto",
+        notes="new note",
+    )
+
+    assert preview.existing_profile is not None
+    store, merged = apply_import_preview(preview, mode="merge")
+
+    assert merged.headers["Authorization"] == "Bearer old"
+    assert merged.headers["X-CSRF-Token"] == "token123"
+    assert merged.cookies["session"] == "abc"
+    assert merged.cookies["pref"] == "1"
+    assert "existing note" in merged.notes
+    assert "new note" in merged.notes
+    assert store["profiles"][0]["name"] == "admin"
 
 
 def test_purge_invalid_profiles_removes_only_clear_invalid_profiles(tmp_path, monkeypatch) -> None:
@@ -207,3 +252,30 @@ def test_auth_command_without_subcommand_opens_tui_when_interactive(monkeypatch)
     monkeypatch.setattr("ai_xss_generator.auth_tui.run_auth_tui", lambda: 7)
 
     assert handle_auth_command([]) == 7
+
+
+def test_auth_import_preview_only_prints_preview(tmp_path, monkeypatch, capsys) -> None:
+    from ai_xss_generator.auth_cli import handle_auth_command
+
+    auth_path = tmp_path / "auth_profiles.json"
+    monkeypatch.setattr("ai_xss_generator.auth_profiles.AUTH_PROFILES_PATH", auth_path)
+    monkeypatch.setattr("ai_xss_generator.auth_cli.AUTH_PROFILES_PATH", auth_path)
+    request_path = tmp_path / "request.txt"
+    request_path.write_text(
+        "GET /account HTTP/2\nHost: example.test\nCookie: session=abc\n\n",
+        encoding="utf-8",
+    )
+
+    rc = handle_auth_command([
+        "import",
+        str(request_path),
+        "--program", "demo",
+        "--profile", "admin",
+        "--preview-only",
+    ])
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "Import preview for demo/admin" in output
+    assert "cookies:  1" in output
+    assert load_auth_store()["profiles"] == []

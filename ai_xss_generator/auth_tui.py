@@ -6,13 +6,15 @@ from pathlib import Path
 
 from ai_xss_generator.auth import describe_auth
 from ai_xss_generator.auth_profiles import (
+    AuthImportPreview,
+    apply_import_preview,
     AuthProfile,
     build_headers_from_profile,
     clear_active_profile,
     delete_profile,
-    import_auth_profile,
     list_auth_profiles,
     load_auth_store,
+    preview_auth_import,
     purge_invalid_profiles,
     record_profile_validation,
     resolve_profile_ref,
@@ -111,6 +113,17 @@ class _AuthTui:
         answer = self._prompt(f"{label} [y/N]").lower()
         return answer in {"y", "yes"}
 
+    def _choose_import_mode(self, preview: AuthImportPreview) -> str:
+        if preview.existing_profile is None:
+            return "save"
+        answer = self._prompt(
+            "Save mode [save/merge/replace/cancel]",
+            "merge",
+        ).lower()
+        if answer in {"save", "merge", "replace"}:
+            return answer
+        return "cancel"
+
     def _render_details(self, profile: AuthProfile | None, width: int) -> list[str]:
         if profile is None:
             return [
@@ -170,7 +183,7 @@ class _AuthTui:
         type_hint = self._prompt("Type [auto/burp_request/curl/cookies_txt/header_block]", "auto") or "auto"
         notes = self._prompt("Notes")
         try:
-            profile = import_auth_profile(
+            preview = preview_auth_import(
                 source=source,
                 program=program,
                 profile_name=name,
@@ -180,9 +193,19 @@ class _AuthTui:
         except Exception as exc:
             self.message = f"Import failed: {exc}"
             return
-        upsert_profile(profile)
+        self.message = (
+            f"Preview {preview.profile.ref}: headers={preview.header_count} "
+            f"cookies={preview.cookie_count} domains={preview.domains_preview}"
+            + (f" existing={preview.existing_profile.ref}" if preview.existing_profile else "")
+        )
+        self.render()
+        mode = self._choose_import_mode(preview)
+        if mode == "cancel":
+            self.message = "Import cancelled."
+            return
+        _, profile = apply_import_preview(preview, mode=mode)
         self._load_store(validate=False)
-        self.message = f"Imported {profile.ref}"
+        self.message = f"Imported {profile.ref} ({mode})"
         if profile.program in self.programs:
             self.program_index = self.programs.index(profile.program)
         selected = resolve_profile_ref(profile.ref, self.store)

@@ -76,6 +76,25 @@ class AuthValidationResult:
     status_code: int | None = None
 
 
+@dataclass(slots=True)
+class AuthImportPreview:
+    profile: AuthProfile
+    existing_profile: AuthProfile | None = None
+    source_label: str = ""
+
+    @property
+    def cookie_count(self) -> int:
+        return len(self.profile.cookies)
+
+    @property
+    def header_count(self) -> int:
+        return len(self.profile.headers)
+
+    @property
+    def domains_preview(self) -> str:
+        return ", ".join(self.profile.domains) if self.profile.domains else "n/a"
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -362,6 +381,80 @@ def import_auth_profile(
         cookies=cookies,
         notes=notes.strip(),
     )
+
+
+def preview_auth_import(
+    *,
+    source: str,
+    program: str,
+    profile_name: str,
+    source_type: str = "auto",
+    notes: str = "",
+    store: dict[str, Any] | None = None,
+) -> AuthImportPreview:
+    profile = import_auth_profile(
+        source=source,
+        program=program,
+        profile_name=profile_name,
+        source_type=source_type,
+        notes=notes,
+    )
+    active_store = store or load_auth_store()
+    existing = resolve_profile_ref(profile.ref, active_store)
+    return AuthImportPreview(
+        profile=profile,
+        existing_profile=existing,
+        source_label=profile.source_type,
+    )
+
+
+def merge_profiles(existing: AuthProfile, incoming: AuthProfile) -> AuthProfile:
+    merged_headers = {**existing.headers, **incoming.headers}
+    merged_cookies = {**existing.cookies, **incoming.cookies}
+    merged_domains = sorted(set(existing.domains) | set(incoming.domains))
+    merged_notes = existing.notes.strip()
+    incoming_notes = incoming.notes.strip()
+    if incoming_notes and incoming_notes not in merged_notes:
+        merged_notes = f"{merged_notes}\n{incoming_notes}".strip()
+    return AuthProfile(
+        program=existing.program,
+        name=existing.name,
+        source_type=incoming.source_type or existing.source_type,
+        base_url=incoming.base_url or existing.base_url,
+        domains=merged_domains,
+        headers=merged_headers,
+        cookies=merged_cookies,
+        notes=merged_notes,
+        created_at=existing.created_at,
+        updated_at=existing.updated_at,
+        last_used_at=existing.last_used_at,
+        last_validated_at=existing.last_validated_at,
+        invalid_reason="",
+    )
+
+
+def apply_import_preview(
+    preview: AuthImportPreview,
+    *,
+    mode: str = "save",
+    store: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], AuthProfile]:
+    active_store = store or load_auth_store()
+    if mode not in {"save", "replace", "merge"}:
+        raise ValueError(f"Unsupported import mode: {mode}")
+    target = preview.profile
+    if mode == "merge":
+        if preview.existing_profile is None:
+            raise ValueError("Merge requested but no existing profile matched the target ref.")
+        target = merge_profiles(preview.existing_profile, preview.profile)
+    elif mode == "replace":
+        if preview.existing_profile is not None:
+            target.created_at = preview.existing_profile.created_at
+            target.last_used_at = preview.existing_profile.last_used_at
+            target.last_validated_at = preview.existing_profile.last_validated_at
+    updated_store = upsert_profile(target, active_store)
+    resolved = resolve_profile_ref(target.ref, updated_store) or target
+    return updated_store, resolved
 
 
 def build_headers_from_profile(profile: AuthProfile) -> dict[str, str]:

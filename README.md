@@ -122,6 +122,15 @@ Goal: scan a live web target for XSS
   │     (or let it auto-detect — WAF is fingerprinted from the crawl seed response)
   │
   ├── Target requires authentication
+  │     axss auth
+  │     axss auth import request.txt --program target --profile admin --activate
+  │     axss -u "https://target.com" --active --profile target/admin
+  │
+  ├── You want to clear auth explicitly
+  │     axss auth none
+  │     axss -u "https://target.com" --active --profile none
+  │
+  ├── You want ad hoc auth without saving a profile
   │     axss -u "https://target.com" --active \
   │          --header "Authorization: Bearer TOKEN"
   │     axss -u "https://target.com" --active \
@@ -224,6 +233,21 @@ Each GET URL, POST form, upload workflow, and DOM XSS runtime target gets an iso
 
 Confirmed findings are printed to the CLI with the exact fired URL, then written to `~/.axss/reports/<domain>_<timestamp>.md`.
 The scan summary also prints pilot tier counts and aggregate local/cloud/fallback rounds for the whole run.
+When auth is active, scan startup prints the selected profile and the report header records the auth profile or ad hoc auth source used for the run.
+
+### Auth profiles
+
+`axss` includes an auth manager for reusable authenticated sessions:
+
+- `axss auth` opens the interactive TUI in a real terminal
+- `axss auth import SOURCE --program P --profile NAME` parses Burp/raw requests, `curl` commands, cookies.txt, or header blocks
+- imports now show a parsed preview before saving, and can `save`, `merge`, or `replace` an existing profile
+- `axss auth use PROGRAM/NAME` sets the persistent active profile
+- `axss auth none` clears the persistent active profile
+- `axss -u https://target --profile PROGRAM/NAME` uses a profile for one run only
+- `axss -u https://target --profile none` forces one run to stay unauthenticated
+
+Auth cleanup is scoped to auth-management flows only. `axss auth`, `axss auth list`, and related auth commands may prune clearly expired profiles; normal scans never auto-delete profiles.
 
 Targets that do not produce enough technical signal are explicitly classified and reported:
 - **hard-dead** — no reflection / no DOM taint path during bounded discovery
