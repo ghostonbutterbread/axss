@@ -84,9 +84,58 @@ def test_report_moves_dom_taint_out_of_confirmed_section() -> None:
         auth_summary="demo/admin",
     )
 
-    assert "## ✅ Confirmed Findings (1)" in report
+    assert "## ✅ Confirmed Findings (1 area(s), 1 variant(s))" in report
     assert "## ℹ️ DOM Taint Only (1)" in report
     assert "DOM taint only." in report
+
+
+def test_report_groups_multiple_confirmed_variants_for_same_area() -> None:
+    finding_one = ConfirmedFinding(
+        url="https://example.test/search?q=test",
+        param_name="q",
+        context_type="html_body",
+        sink_context="html_body",
+        payload="<svg/onload=alert(1)>",
+        transform_name="svg_tag",
+        execution_method="dialog",
+        execution_detail="Dialog fired.",
+        waf="akamai",
+        surviving_chars="<>/",
+        fired_url="https://example.test/search?q=%3Csvg%2Fonload%3Dalert(1)%3E",
+        source="cloud_model",
+        cloud_escalated=True,
+        bypass_family="tag_injection",
+    )
+    finding_two = ConfirmedFinding(
+        url="https://example.test/search?q=test",
+        param_name="q",
+        context_type="html_body",
+        sink_context="html_body",
+        payload="<img src=x onerror=alert(1)>",
+        transform_name="img_onerror",
+        execution_method="dialog",
+        execution_detail="Dialog fired.",
+        waf="akamai",
+        surviving_chars="<>/=",
+        fired_url="https://example.test/search?q=%3Cimg%20src%3Dx%20onerror%3Dalert(1)%3E",
+        source="phase1_transform",
+        cloud_escalated=True,
+        bypass_family="event_handler_injection",
+    )
+
+    report = _build_report(
+        [WorkerResult(url="https://example.test/search?q=test", status="confirmed", confirmed_findings=[finding_one, finding_two])],
+        config_summary="",
+        auth_summary="demo/admin",
+    )
+
+    assert "## ✅ Confirmed Findings (1 area(s), 2 variant(s))" in report
+    assert "**Confirmed variants:** `2` distinct payload/result combinations for this same area." in report
+    assert "**Additional confirmed variants:**" in report
+    assert report.count("### Finding 1") == 1
+    assert "<svg/onload=alert(1)>" in report
+    assert "<img src=x onerror=alert(1)>" in report
+    assert "event_handler_injection" in report
 
 
 def test_report_includes_pilot_summary_and_budget_table() -> None:

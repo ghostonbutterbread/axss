@@ -117,13 +117,16 @@ def _build_report(results: Sequence[WorkerResult], config_summary: str, auth_sum
         lines += ["", "---", ""]
 
     # ── Confirmed Findings ────────────────────────────────────────────────────
+    grouped_findings = _group_confirmed_findings(all_findings)
+
     if all_findings:
+        area_count = len(grouped_findings)
         lines += [
-            f"## ✅ Confirmed Findings ({len(all_findings)})",
+            f"## ✅ Confirmed Findings ({area_count} area(s), {len(all_findings)} variant(s))",
             "",
         ]
-        for i, f in enumerate(all_findings, 1):
-            lines += _format_finding(i, f)
+        for i, findings in enumerate(grouped_findings, 1):
+            lines += _format_grouped_finding(i, findings)
     else:
         lines += [
             "## ✅ Confirmed Findings",
@@ -259,23 +262,91 @@ def _pilot_reasoning(result: WorkerResult) -> str:
     return "No special escalation note recorded."
 
 
-def _format_finding(index: int, f: ConfirmedFinding) -> list[str]:
-    parsed = urllib.parse.urlparse(f.url)
-    endpoint = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-    is_dom = f.context_type == "dom_xss"
-    source_label = {
+def _group_confirmed_findings(findings: Sequence[ConfirmedFinding]) -> list[list[ConfirmedFinding]]:
+    grouped: dict[tuple[str, str, str, str], list[ConfirmedFinding]] = {}
+    order: list[tuple[str, str, str, str]] = []
+    for finding in findings:
+        key = (finding.url, finding.param_name, finding.context_type, finding.sink_context)
+        if key not in grouped:
+            grouped[key] = []
+            order.append(key)
+        grouped[key].append(finding)
+    return [grouped[key] for key in order]
+
+
+def _source_label(source: str) -> str:
+    return {
         "phase1_transform": "Deterministic fallback transform",
         "phase1_waf_fallback": "WAF-specific deterministic fallback",
-        "local_model":      "Local AI model payload",
-        "cloud_model":      "Cloud model payload (escalated)",
-        "dom_xss_runtime":  "DOM XSS runtime sink hooking",
-    }.get(f.source, f.source)
+        "local_model": "Local AI model payload",
+        "cloud_model": "Cloud model payload (escalated)",
+        "dom_xss_runtime": "DOM XSS runtime sink hooking",
+    }.get(source, source)
 
-    why = _explain_why(f)
 
+def _format_grouped_finding(index: int, findings: Sequence[ConfirmedFinding]) -> list[str]:
+    primary = findings[0]
+    parsed = urllib.parse.urlparse(primary.url)
+    endpoint = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
     lines = [
         f"### Finding {index} — `{endpoint}`",
         "",
+    ]
+
+    if len(findings) > 1:
+        lines += [
+            f"**Confirmed variants:** `{len(findings)}` distinct payload/result combinations for this same area.",
+            "",
+        ]
+
+    lines += _format_finding_detail(primary, include_heading=False, include_separator=len(findings) == 1)
+
+    if len(findings) > 1:
+        lines += [
+            "**Additional confirmed variants:**",
+            "",
+            "| Payload | Source | Confirmed by | Transform | Bypass family |",
+            "|---------|--------|--------------|-----------|---------------|",
+        ]
+        for finding in findings[1:]:
+            payload = finding.payload.replace("|", "\\|") if finding.payload else "—"
+            source_label = _source_label(finding.source).replace("|", "\\|")
+            transform = (finding.transform_name or "—").replace("|", "\\|")
+            family = (finding.bypass_family or "—").replace("|", "\\|")
+            lines.append(
+                f"| `{payload}` | {source_label} | `{finding.execution_method}` | `{transform}` | `{family}` |"
+            )
+        lines += ["", "---", ""]
+
+    return lines
+
+
+def _format_finding(index: int, f: ConfirmedFinding) -> list[str]:
+    return _format_finding_detail(f, include_heading=True, index=index, include_separator=True)
+
+
+def _format_finding_detail(
+    f: ConfirmedFinding,
+    *,
+    include_heading: bool,
+    index: int = 0,
+    include_separator: bool,
+) -> list[str]:
+    parsed = urllib.parse.urlparse(f.url)
+    endpoint = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+    is_dom = f.context_type == "dom_xss"
+    source_label = _source_label(f.source)
+
+    why = _explain_why(f)
+
+    lines: list[str] = []
+    if include_heading:
+        lines += [
+            f"### Finding {index} — `{endpoint}`",
+            "",
+        ]
+
+    lines += [
         "| Field | Value |",
         "|-------|-------|",
         f"| **Parameter / Source** | `{f.param_name}` |",
@@ -285,6 +356,8 @@ def _format_finding(index: int, f: ConfirmedFinding) -> list[str]:
         f"| **Confirmed by** | `{f.execution_method}` |",
         f"| **Source** | {source_label} |",
     ]
+    if f.bypass_family:
+        lines.append(f"| **Bypass family** | `{f.bypass_family}` |")
 
     if f.ai_engine:
         lines.append(f"| **AI engine** | `{f.ai_engine}` |")
@@ -333,9 +406,9 @@ def _format_finding(index: int, f: ConfirmedFinding) -> list[str]:
         "**Why it worked:**",
         f"{why}",
         "",
-        "---",
-        "",
     ]
+    if include_separator:
+        lines += ["---", ""]
     return lines
 
 
