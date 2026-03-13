@@ -25,6 +25,7 @@ class CliHelpTest(unittest.TestCase):
         self.assertIn("--merge-batch", help_text)
         self.assertIn("--attempts N", help_text)
         self.assertIn("--extreme", help_text)
+        self.assertIn("--research", help_text)
         self.assertIn("--keep-searching", help_text)
         self.assertIn("--waf-source PATH", help_text)
         self.assertIn("--memory-list", help_text)
@@ -115,6 +116,25 @@ class CliHelpTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(captured["attempts"], 3)
         self.assertEqual(captured["timeout"], 600)
+
+    def test_main_research_profile_raises_default_attempts_and_timeout(self) -> None:
+        captured: dict[str, object] = {}
+
+        def _fake_run_active_scan(*args, **kwargs):
+            captured.update(kwargs)
+            captured["timeout"] = args[0].timeout
+            captured["attempts"] = args[0].attempts
+            return 0
+
+        with (
+            patch.object(cli, "_run_active_scan", side_effect=_fake_run_active_scan),
+            patch("ai_xss_generator.ai_capabilities.choose_generation_tool", return_value=("claude", "")),
+        ):
+            rc = cli.main(["-u", "https://example.test/profile", "--research"])
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(captured["attempts"], 5)
+        self.assertEqual(captured["timeout"], 1200)
 
 
 if __name__ == "__main__":

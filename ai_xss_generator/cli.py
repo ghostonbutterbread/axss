@@ -465,6 +465,18 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--research",
+        "--patient",
+        dest="research",
+        action="store_true",
+        default=False,
+        help=(
+            "--research  Use a patient, outcome-first scan profile. Keeps the phased remote workflow "
+            "but gives later contextual/research passes much longer budgets. Raises attempts and "
+            "timeout defaults when you did not override them explicitly."
+        ),
+    )
+    parser.add_argument(
         "--keep-searching",
         action="store_true",
         default=False,
@@ -1156,6 +1168,8 @@ def _run_active_scan(
         info(f"Active scan auth profile: {auth_profile_ref}")
     if getattr(args, "extreme", False):
         info("Active scan profile: extreme")
+    if getattr(args, "research", False):
+        info("Active scan profile: research")
     if getattr(args, "keep_searching", False):
         info("Post-confirmation mode: keep searching for distinct variants")
     if getattr(args, "waf_source", None):
@@ -1199,6 +1213,7 @@ def _run_active_scan(
         waf_source=getattr(args, "waf_source", None),
         keep_searching=getattr(args, "keep_searching", False),
         extreme=getattr(args, "extreme", False),
+        research=getattr(args, "research", False),
     )
 
     results = run_active_scan(
@@ -1214,6 +1229,7 @@ def _run_active_scan(
         f"model={scan_config.model} | waf={waf or 'none'} | "
         f"cloud_attempts={scan_config.cloud_attempts}"
         + (" | profile=extreme" if getattr(args, "extreme", False) else "")
+        + (" | profile=research" if getattr(args, "research", False) else "")
         + (" | keep_searching=true" if getattr(args, "keep_searching", False) else "")
         + (f" | waf_source={Path(args.waf_source).name}" if getattr(args, "waf_source", None) else "")
     )
@@ -1332,6 +1348,11 @@ def main(argv: list[str] | None = None) -> int:
             args.attempts = 3
         if getattr(args, "timeout", 300) == 300:
             args.timeout = 600
+    if getattr(args, "research", False):
+        if getattr(args, "attempts", 1) <= 3:
+            args.attempts = 5
+        if getattr(args, "timeout", 300) <= 600:
+            args.timeout = 1200
     if getattr(args, "attempts", 1) < 1:
         parser.error("--attempts must be >= 1")
 

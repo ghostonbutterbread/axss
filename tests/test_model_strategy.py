@@ -391,7 +391,7 @@ def test_generate_with_cli_escalates_from_scout_to_contextual(monkeypatch) -> No
     monkeypatch.setattr("ai_xss_generator.cli_runner.generate_via_cli_with_tool", fake_generate)
     monkeypatch.setattr(
         "ai_xss_generator.ai_capabilities.recommended_timeout_seconds_for_phase",
-        lambda tool, role, phase, fallback: {"scout": 20, "contextual": 45, "research": 90}[phase],
+        lambda tool, role, phase, fallback, profile="normal": {"scout": 20, "contextual": 45, "research": 90}[phase],
     )
 
     payloads, actual_tool = _generate_with_cli(context, "claude", None)
@@ -407,3 +407,18 @@ def test_generate_with_cli_escalates_from_scout_to_contextual(monkeypatch) -> No
         "test_vector",
         "bypass_family",
     ]
+
+
+def test_recommended_timeout_seconds_for_phase_respects_research_profile() -> None:
+    from ai_xss_generator.ai_capabilities import recommended_timeout_seconds_for_phase
+
+    normal = recommended_timeout_seconds_for_phase("claude", "xss_payload_generation", "research", 60)
+    research = recommended_timeout_seconds_for_phase(
+        "claude",
+        "xss_payload_generation",
+        "research",
+        60,
+        profile="research",
+    )
+
+    assert research > normal

@@ -485,15 +485,40 @@ def recommended_timeout_seconds(tool: str, role: str, fallback: int) -> int:
     return fallback
 
 
-def recommended_timeout_seconds_for_phase(tool: str, role: str, phase: str, fallback: int) -> int:
-    base = recommended_timeout_seconds(tool, role, fallback)
+def _phase_timeout_with_profile(base: int, phase: str, profile: str, *, api: bool = False) -> int:
     if phase == "scout":
-        return max(15, min(base, max(15, base // 2)))
-    if phase == "contextual":
-        return max(30, base)
-    if phase == "research":
-        return max(60, min(180, int(base * 2)))
-    return fallback
+        phase_timeout = max(20 if api else 15, min(base, max(20 if api else 15, base // 2)))
+    elif phase == "contextual":
+        phase_timeout = max(45 if api else 30, base)
+    elif phase == "research":
+        phase_timeout = max(75 if api else 60, min(240 if api else 180, int(base * 2)))
+    else:
+        phase_timeout = base
+
+    normalized = (profile or "normal").strip().lower()
+    if normalized == "extreme":
+        multiplier = {"scout": 1.0, "contextual": 1.5, "research": 2.0}.get(phase, 1.0)
+        cap = 360 if api else 300
+    elif normalized == "research":
+        multiplier = {"scout": 1.5, "contextual": 2.5, "research": 4.0}.get(phase, 1.0)
+        cap = 600
+    else:
+        multiplier = 1.0
+        cap = 240 if api else 180
+
+    return max(phase_timeout, min(cap, int(phase_timeout * multiplier)))
+
+
+def recommended_timeout_seconds_for_phase(
+    tool: str,
+    role: str,
+    phase: str,
+    fallback: int,
+    *,
+    profile: str = "normal",
+) -> int:
+    base = recommended_timeout_seconds(tool, role, fallback)
+    return _phase_timeout_with_profile(base, phase, profile, api=False)
 
 
 def recommended_api_timeout_seconds(model: str, role: str, fallback: int) -> int:
@@ -507,15 +532,16 @@ def recommended_api_timeout_seconds(model: str, role: str, fallback: int) -> int
     return fallback
 
 
-def recommended_api_timeout_seconds_for_phase(model: str, role: str, phase: str, fallback: int) -> int:
+def recommended_api_timeout_seconds_for_phase(
+    model: str,
+    role: str,
+    phase: str,
+    fallback: int,
+    *,
+    profile: str = "normal",
+) -> int:
     base = recommended_api_timeout_seconds(model, role, fallback)
-    if phase == "scout":
-        return max(20, min(base, max(20, base // 2)))
-    if phase == "contextual":
-        return max(45, base)
-    if phase == "research":
-        return max(75, min(240, int(base * 2)))
-    return fallback
+    return _phase_timeout_with_profile(base, phase, profile, api=True)
 
 
 def choose_generation_tool(

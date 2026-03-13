@@ -33,13 +33,24 @@ from ai_xss_generator.findings import infer_bypass_family
 log = logging.getLogger(__name__)
 
 _ACTIVE_LOCAL_MODEL_TIMEOUT_SECONDS = 60
+_RESEARCH_LOCAL_MODEL_TIMEOUT_SECONDS = 120
 _ACTIVE_CLOUD_GRACE_SECONDS = 60
 _DOM_CLOUD_START_AFTER_SECONDS = 30
 
 
-def _keep_searching_hit_cap(enabled: bool, extreme: bool) -> int:
+def _phase_profile_name(extreme: bool, research: bool) -> str:
+    if research:
+        return "research"
+    if extreme:
+        return "extreme"
+    return "normal"
+
+
+def _keep_searching_hit_cap(enabled: bool, extreme: bool, research: bool = False) -> int:
     if not enabled:
         return 1
+    if research:
+        return 7
     return 5 if extreme else 3
 
 
@@ -660,6 +671,7 @@ def run_worker(
     waf_source: str | None = None,
     keep_searching: bool = False,
     extreme: bool = False,
+    research: bool = False,
 ) -> None:
     """Target function for multiprocessing.Process.
 
@@ -697,6 +709,7 @@ def run_worker(
             waf_source=waf_source,
             keep_searching=keep_searching,
             extreme=extreme,
+            research=research,
         )
     except Exception as exc:
         log.exception("Worker crashed for %s", url)
@@ -727,6 +740,7 @@ def _run(
     waf_source: str | None = None,
     keep_searching: bool = False,
     extreme: bool = False,
+    research: bool = False,
 ) -> None:
     deadline = start_time + active_worker_timeout_budget(
         timeout_seconds,
@@ -734,8 +748,11 @@ def _run(
         ai_backend,
         cloud_attempts=cloud_attempts,
     )
-    local_model_timeout_seconds = _ACTIVE_LOCAL_MODEL_TIMEOUT_SECONDS
-    context_hit_cap = _keep_searching_hit_cap(keep_searching, extreme)
+    local_model_timeout_seconds = (
+        _RESEARCH_LOCAL_MODEL_TIMEOUT_SECONDS if research else _ACTIVE_LOCAL_MODEL_TIMEOUT_SECONDS
+    )
+    context_hit_cap = _keep_searching_hit_cap(keep_searching, extreme, research)
+    phase_profile = _phase_profile_name(extreme, research)
 
     def _timed_out() -> bool:
         return time.monotonic() > deadline
@@ -1042,6 +1059,7 @@ def _run(
                             delivery_mode="get",
                             session_lessons=session_lessons,
                             feedback_lessons=cloud_feedback_lessons,
+                            phase_profile=phase_profile,
                         ))
                         cloud_payloads, duplicate_payloads = _unique_new_payloads(
                             cloud_plan.payloads,
@@ -1748,6 +1766,7 @@ def _get_dom_cloud_payloads(
     cli_model: str | None = None,
     session_lessons: list[Any] | None = None,
     feedback_lessons: list[Any] | None = None,
+    phase_profile: str = "normal",
 ) -> CloudPayloadPlan:
     """Call the cloud model once per unique DOM source → sink fingerprint."""
     use_dedup = not feedback_lessons
@@ -1780,6 +1799,7 @@ def _get_dom_cloud_payloads(
             cli_tool=cli_tool,
             cli_model=cli_model,
             memory_profile=memory_profile,
+            phase_profile=phase_profile,
         )
         result_plan = CloudPayloadPlan(
             payloads=[p for p in payloads if getattr(p, "payload", "")],
@@ -1829,6 +1849,7 @@ def run_dom_worker(
     waf_source: str | None = None,
     keep_searching: bool = False,
     extreme: bool = False,
+    research: bool = False,
 ) -> None:
     """Worker entry point for DOM XSS runtime scanning.
 
@@ -1861,6 +1882,7 @@ def run_dom_worker(
             waf_source=waf_source,
             keep_searching=keep_searching,
             extreme=extreme,
+            research=research,
         )
     except Exception as exc:
         log.exception("DOM worker crashed for %s", url)
@@ -1886,6 +1908,7 @@ def _run_dom(
     waf_source: str | None = None,
     keep_searching: bool = False,
     extreme: bool = False,
+    research: bool = False,
 ) -> None:
     from playwright.sync_api import sync_playwright
     from ai_xss_generator.active.dom_xss import (
@@ -1908,8 +1931,11 @@ def _run_dom(
 
     # Cap per-navigation timeout to 15 s regardless of the overall worker timeout
     nav_timeout_ms = min(timeout_seconds * 1_000, 15_000)
-    local_model_timeout_seconds = _ACTIVE_LOCAL_MODEL_TIMEOUT_SECONDS
-    context_hit_cap = _keep_searching_hit_cap(keep_searching, extreme)
+    local_model_timeout_seconds = (
+        _RESEARCH_LOCAL_MODEL_TIMEOUT_SECONDS if research else _ACTIVE_LOCAL_MODEL_TIMEOUT_SECONDS
+    )
+    context_hit_cap = _keep_searching_hit_cap(keep_searching, extreme, research)
+    phase_profile = _phase_profile_name(extreme, research)
     _cached_context: Any = None
     try:
         _cached_context = _parse_target(
@@ -2136,6 +2162,7 @@ def _run_dom(
                                 cli_model=cli_model,
                                 session_lessons=dom_session_lessons,
                                 feedback_lessons=cloud_feedback_lessons,
+                                phase_profile=phase_profile,
                             ))
 
                     if cloud_stage is not None:
@@ -2463,6 +2490,7 @@ def _get_cloud_payloads(
     delivery_mode: str = "get",
     session_lessons: list[Any] | None = None,
     feedback_lessons: list[Any] | None = None,
+    phase_profile: str = "normal",
 ) -> CloudPayloadPlan:
     """Check dedup registry; call cloud model if this is a novel fingerprint.
 
@@ -2503,6 +2531,7 @@ def _get_cloud_payloads(
             cli_tool=cli_tool,
             cli_model=cli_model,
             memory_profile=memory_profile,
+            phase_profile=phase_profile,
         )
         result_plan = CloudPayloadPlan(
             payloads=[p.payload for p in payloads if p.payload],
@@ -2554,6 +2583,7 @@ def run_post_worker(
     waf_source: str | None = None,
     keep_searching: bool = False,
     extreme: bool = False,
+    research: bool = False,
 ) -> None:
     """Worker entry point for POST form targets. Mirrors run_worker() for GET URLs."""
     start_time = time.monotonic()
@@ -2586,6 +2616,7 @@ def run_post_worker(
             waf_source=waf_source,
             keep_searching=keep_searching,
             extreme=extreme,
+            research=research,
         )
     except Exception as exc:
         log.exception("POST worker crashed for %s", post_form.action_url)
@@ -2618,6 +2649,7 @@ def _run_post(
     waf_source: str | None = None,
     keep_searching: bool = False,
     extreme: bool = False,
+    research: bool = False,
 ) -> None:
     from ai_xss_generator.probe import probe_post_form
     from ai_xss_generator.active.executor import ActiveExecutor
@@ -2630,8 +2662,11 @@ def _run_post(
         ai_backend,
         cloud_attempts=cloud_attempts,
     )
-    local_model_timeout_seconds = _ACTIVE_LOCAL_MODEL_TIMEOUT_SECONDS
-    context_hit_cap = _keep_searching_hit_cap(keep_searching, extreme)
+    local_model_timeout_seconds = (
+        _RESEARCH_LOCAL_MODEL_TIMEOUT_SECONDS if research else _ACTIVE_LOCAL_MODEL_TIMEOUT_SECONDS
+    )
+    context_hit_cap = _keep_searching_hit_cap(keep_searching, extreme, research)
+    phase_profile = _phase_profile_name(extreme, research)
 
     def _timed_out() -> bool:
         return time.monotonic() > deadline
@@ -2892,6 +2927,7 @@ def _run_post(
                             delivery_mode="post",
                             session_lessons=post_session_lessons,
                             feedback_lessons=cloud_feedback_lessons,
+                            phase_profile=phase_profile,
                         ))
                         cloud_payloads, duplicate_payloads = _unique_new_payloads(
                             cloud_plan.payloads,

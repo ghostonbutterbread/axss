@@ -70,6 +70,7 @@ class ActiveScanConfig:
     waf_source: str | None = None # local path to open-source WAF/filter code for planning hints
     keep_searching: bool = False
     extreme: bool = False
+    research: bool = False
 
 
 def _auto_workers(rate: float, explicit_workers: int) -> int:
@@ -387,6 +388,7 @@ def run_active_scan(
                                 "waf_source": config.waf_source,
                                 "keep_searching": config.keep_searching,
                                 "extreme": config.extreme,
+                                "research": config.research,
                                 **_cli_kwargs,
                             },
                             daemon=True,
@@ -410,6 +412,7 @@ def run_active_scan(
                                 "waf_source": config.waf_source,
                                 "keep_searching": config.keep_searching,
                                 "extreme": config.extreme,
+                                "research": config.research,
                                 **_cli_kwargs,
                             },
                             daemon=True,
@@ -452,6 +455,7 @@ def run_active_scan(
                                 "waf_source": config.waf_source,
                                 "keep_searching": config.keep_searching,
                                 "extreme": config.extreme,
+                                "research": config.research,
                                 **_cli_kwargs,
                             },
                             daemon=True,

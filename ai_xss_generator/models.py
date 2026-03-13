@@ -1524,6 +1524,7 @@ def _generate_with_cli(
     waf: str | None = None,
     past_findings: list[Finding] | None = None,
     past_lessons: list[Any] | None = None,
+    phase_profile: str = "normal",
 ) -> tuple[list[PayloadCandidate], str]:
     """Generate payloads by calling the CLI backend, with cross-tool failover."""
     from ai_xss_generator.cli_runner import _trace_preview, generate_via_cli_with_tool
@@ -1540,7 +1541,13 @@ def _generate_with_cli(
             past_findings=past_findings,
             past_lessons=past_lessons,
         )
-        timeout_seconds = recommended_timeout_seconds_for_phase(tool, GENERATION_ROLE, phase, 60)
+        timeout_seconds = recommended_timeout_seconds_for_phase(
+            tool,
+            GENERATION_ROLE,
+            phase,
+            60,
+            profile=phase_profile,
+        )
         schema = _generation_output_schema(phase)
         try:
             raw, actual_tool = generate_via_cli_with_tool(
@@ -1585,6 +1592,7 @@ def _try_cloud(
     ai_backend: str = "api",
     cli_tool: str = "claude",
     cli_model: str | None = None,
+    phase_profile: str = "normal",
 ) -> tuple[list[PayloadCandidate], str]:
     """Attempt cloud generation. Returns (payloads, engine_label).
 
@@ -1602,7 +1610,13 @@ def _try_cloud(
     # ── CLI backend ──────────────────────────────────────────────────────────
     if ai_backend == "cli":
         try:
-            payloads, actual_tool = _generate_with_cli(context, cli_tool, cli_model, **kwargs)
+            payloads, actual_tool = _generate_with_cli(
+                context,
+                cli_tool,
+                cli_model,
+                phase_profile=phase_profile,
+                **kwargs,
+            )
             return payloads, f"cli:{actual_tool}"
         except Exception as exc:
             log.debug("CLI backend (%s) failed: %s", cli_tool, exc)
@@ -1612,7 +1626,13 @@ def _try_cloud(
     from ai_xss_generator.config import load_api_key
     from ai_xss_generator.ai_capabilities import GENERATION_ROLE, recommended_api_timeout_seconds_for_phase
     for phase in _GENERATION_PHASES:
-        api_timeout_seconds = recommended_api_timeout_seconds_for_phase(cloud_model, GENERATION_ROLE, phase, 120)
+        api_timeout_seconds = recommended_api_timeout_seconds_for_phase(
+            cloud_model,
+            GENERATION_ROLE,
+            phase,
+            120,
+            profile=phase_profile,
+        )
         if os.environ.get("OPENROUTER_API_KEY") or load_api_key("openrouter_api_key"):
             try:
                 payloads = _generate_with_openrouter(
@@ -1771,6 +1791,7 @@ def generate_cloud_payloads(
     cli_tool: str = "claude",
     cli_model: str | None = None,
     memory_profile: dict[str, Any] | None = None,
+    phase_profile: str = "normal",
     # Legacy params — accepted but ignored
     allowed_memory_tiers: "Any" = None,
     allowed_lesson_tiers: "Any" = None,
@@ -1809,6 +1830,7 @@ def generate_cloud_payloads(
         ai_backend=ai_backend,
         cli_tool=cli_tool,
         cli_model=cli_model,
+        phase_profile=phase_profile,
     )
 
     return payloads, engine

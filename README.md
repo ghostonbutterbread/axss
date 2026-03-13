@@ -350,8 +350,11 @@ axss -u "https://target.com" --active --extreme
 # Keep searching after the first hit for additional distinct exploit classes
 axss -u "https://target.com" --active --keep-searching
 
-# Research mode: deeper learning plus bounded post-confirmation searching
-axss -u "https://target.com" --active --extreme --keep-searching
+# Patient research mode: outcome-first, longer later-phase reasoning budgets
+axss -u "https://target.com" --active --research
+
+# Deepest operator-assisted mode
+axss -u "https://target.com" --active --research --keep-searching
 ```
 
 ### Active scan — SPA / Angular / React / Vue target
@@ -474,6 +477,7 @@ axss --help
 | `--timeout N` | 300 | Per-URL worker timeout in seconds |
 | `--attempts N` | 1 | Cloud reasoning rounds per execution context before deterministic fallback |
 | `--extreme` | off | More aggressive active-scan profile. Raises cloud reasoning rounds and timeout defaults when you did not override them explicitly |
+| `--research` | off | Patient, outcome-first profile. Keeps phased remote generation but gives later contextual/research passes much longer budgets and raises attempts/timeout defaults when you did not override them explicitly |
 | `--keep-searching` | off | After the first confirmed hit on a context, keep searching within a bounded budget for additional distinct exploit classes |
 | `--waf NAME` | auto | Set WAF context (auto-detected if omitted) |
 | `--waf-source PATH` | — | Analyze an open-source WAF/filter codebase and inject a compact knowledge profile into model reasoning. Accepts a local path or Git repo URL; remote sources are cloned locally first |
