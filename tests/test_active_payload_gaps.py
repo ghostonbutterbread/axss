@@ -9,7 +9,7 @@ from ai_xss_generator.active.generator import (
     html_attr_url_payloads,
     html_body_payloads,
 )
-from ai_xss_generator.active.reporter import _build_report
+from ai_xss_generator.active.reporter import _build_report, write_report
 from ai_xss_generator.active.worker import (
     ConfirmedFinding,
     WorkerResult,
@@ -136,6 +136,42 @@ def test_report_groups_multiple_confirmed_variants_for_same_area() -> None:
     assert "<svg/onload=alert(1)>" in report
     assert "<img src=x onerror=alert(1)>" in report
     assert "event_handler_injection" in report
+
+
+def test_write_report_emits_html_companion(tmp_path) -> None:
+    report_path = tmp_path / "scan.md"
+    finding = ConfirmedFinding(
+        url="https://example.test/search?q=test",
+        param_name="q",
+        context_type="html_body",
+        sink_context="html_body",
+        payload="<svg/onload=alert(1)>",
+        transform_name="svg_tag",
+        execution_method="dialog",
+        execution_detail="Dialog fired.",
+        waf="akamai",
+        surviving_chars="<>/",
+        fired_url="https://example.test/search?q=%3Csvg%2Fonload%3Dalert(1)%3E",
+        source="cloud_model",
+        cloud_escalated=True,
+        bypass_family="tag_injection",
+    )
+
+    written = write_report(
+        [WorkerResult(url="https://example.test/search?q=test", status="confirmed", confirmed_findings=[finding])],
+        config_summary="rate=5",
+        auth_summary="demo/admin",
+        output_path=str(report_path),
+    )
+
+    html_path = report_path.with_suffix(".html")
+    assert written == str(report_path)
+    assert html_path.exists()
+    html_report = html_path.read_text(encoding="utf-8")
+    assert "axss Active Scan Report" in html_report
+    assert "Confirmed Findings" in html_report
+    assert "badge-confirmed" in html_report
+    assert "tag_injection" in html_report
 
 
 def test_report_includes_pilot_summary_and_budget_table() -> None:

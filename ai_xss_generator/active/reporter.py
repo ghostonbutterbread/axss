@@ -11,6 +11,7 @@ Report structure:
 from __future__ import annotations
 
 import datetime
+import html
 import urllib.parse
 from pathlib import Path
 from typing import Sequence
@@ -45,7 +46,9 @@ def write_report(
         output_path = str(_REPORTS_DIR / f"{domain_slug}_{ts}.md")
 
     content = _build_report(results, config_summary, auth_summary)
-    Path(output_path).write_text(content, encoding="utf-8")
+    output = Path(output_path)
+    output.write_text(content, encoding="utf-8")
+    _write_html_report(output, results, config_summary, auth_summary)
     return output_path
 
 
@@ -205,6 +208,191 @@ def _build_report(results: Sequence[WorkerResult], config_summary: str, auth_sum
     return "\n".join(lines)
 
 
+def _write_html_report(
+    markdown_path: Path,
+    results: Sequence[WorkerResult],
+    config_summary: str,
+    auth_summary: str,
+) -> Path:
+    html_path = markdown_path.with_suffix(".html")
+    html_path.write_text(_build_html_report(results, config_summary, auth_summary), encoding="utf-8")
+    return html_path
+
+
+def _build_html_report(results: Sequence[WorkerResult], config_summary: str, auth_summary: str = "") -> str:
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    confirmed_results = [r for r in results if r.status == "confirmed"]
+    taint_results = [r for r in results if r.status == "taint_only"]
+    error_results = [r for r in results if r.status == "error"]
+    dead_results = [r for r in results if r.dead_target]
+    all_findings = [
+        f
+        for r in confirmed_results
+        for f in r.confirmed_findings
+        if f.execution_method != "dom_taint"
+    ]
+    taint_findings = [
+        f
+        for r in (*confirmed_results, *taint_results)
+        for f in r.confirmed_findings
+        if f.execution_method == "dom_taint"
+    ]
+    grouped_findings = _group_confirmed_findings(all_findings)
+    domains = sorted({urllib.parse.urlparse(r.url).netloc for r in results if r.url})
+    pilot_summary = _pilot_summary(results)
+
+    parts = [
+        "<!doctype html>",
+        "<html lang='en'>",
+        "<head>",
+        "<meta charset='utf-8'>",
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>",
+        "<title>axss Active Scan Report</title>",
+        "<style>",
+        _HTML_REPORT_CSS,
+        "</style>",
+        "</head>",
+        "<body>",
+        "<main class='page'>",
+        "<section class='hero card'>",
+        "<div class='hero-title-row'>",
+        "<h1>axss Active Scan Report</h1>",
+        "<span class='badge badge-confirmed'>Active Scan</span>",
+        "</div>",
+        "<div class='meta-grid'>",
+        f"<div><span class='meta-label'>Generated</span><span>{_h(now)}</span></div>",
+        f"<div><span class='meta-label'>Targets scanned</span><span>{len(results)} target(s)</span></div>",
+        f"<div><span class='meta-label'>Domains</span><span>{_h(', '.join(domains) if domains else 'n/a')}</span></div>",
+        f"<div><span class='meta-label'>Config</span><span>{_h(config_summary or 'n/a')}</span></div>",
+        f"<div><span class='meta-label'>Auth</span><span>{_h(auth_summary or 'none')}</span></div>",
+        "</div>",
+        "</section>",
+        "<section class='card'>",
+        "<h2>Pilot Summary</h2>",
+        "<div class='summary-grid'>",
+        _summary_tile("Hard Dead", str(pilot_summary["hard_dead"]), "dead"),
+        _summary_tile("Soft Dead", str(pilot_summary["soft_dead"]), "soft"),
+        _summary_tile("Live", str(pilot_summary["live"]), "live"),
+        _summary_tile("High Value", str(pilot_summary["high_value"]), "value"),
+        _summary_tile("Local Rounds", str(pilot_summary["local_rounds"]), "local"),
+        _summary_tile("Cloud Rounds", str(pilot_summary["cloud_rounds"]), "cloud"),
+        _summary_tile("Fallback Rounds", str(pilot_summary["fallback_rounds"]), "fallback"),
+        _summary_tile("Cloud Targets", f"{pilot_summary['cloud_targets']} / {len(results)}", "cloud"),
+        "</div>",
+        "</section>",
+    ]
+
+    if results:
+        parts += [
+            "<section class='card'>",
+            f"<h2>Pilot Budget By Target <span class='badge'>{len(results)}</span></h2>",
+            "<div class='table-wrap'>",
+            "<table>",
+            "<thead><tr><th>URL</th><th>Kind</th><th>Tier</th><th>Status</th><th>Local</th><th>Cloud</th><th>Fallback</th><th>Signal</th><th>Reasoning</th></tr></thead>",
+            "<tbody>",
+        ]
+        for result in results:
+            parts.append(
+                "<tr>"
+                f"<td><code>{_h(result.url)}</code></td>"
+                f"<td><code>{_h(getattr(result, 'kind', 'get'))}</code></td>"
+                f"<td>{_tier_badge(_result_tier(result))}</td>"
+                f"<td>{_status_badge(result.status)}</td>"
+                f"<td><code>{int(getattr(result, 'local_model_rounds', 0) or 0)}</code></td>"
+                f"<td><code>{int(getattr(result, 'cloud_model_rounds', 0) or 0)}</code></td>"
+                f"<td><code>{int(getattr(result, 'fallback_rounds', 0) or 0)}</code></td>"
+                f"<td>{_h(_pilot_signal(result))}</td>"
+                f"<td>{_h(_pilot_reasoning(result))}</td>"
+                "</tr>"
+            )
+        parts += ["</tbody></table></div></section>"]
+
+    parts += [
+        "<section class='card'>",
+        f"<h2>Confirmed Findings <span class='badge badge-confirmed'>{len(grouped_findings)} area(s)</span> <span class='badge'>{len(all_findings)} variant(s)</span></h2>",
+    ]
+    if grouped_findings:
+        for index, findings in enumerate(grouped_findings, 1):
+            parts.append(_format_grouped_finding_html(index, findings))
+    else:
+        parts.append("<p class='empty'>No confirmed XSS execution was detected.</p>")
+    parts.append("</section>")
+
+    if taint_findings:
+        parts += [
+            "<section class='card'>",
+            f"<h2>DOM Taint Only <span class='badge badge-soft'>{len(taint_findings)}</span></h2>",
+            "<div class='table-wrap'>",
+            "<table>",
+            "<thead><tr><th>URL</th><th>Parameter</th><th>Sink</th><th>Detail</th><th>Test URL</th></tr></thead>",
+            "<tbody>",
+        ]
+        for finding in taint_findings:
+            parts.append(
+                "<tr>"
+                f"<td><code>{_h(finding.url)}</code></td>"
+                f"<td><code>{_h(finding.param_name)}</code></td>"
+                f"<td><code>{_h(finding.sink_context)}</code></td>"
+                f"<td>{_h(finding.execution_detail)}</td>"
+                f"<td><code>{_h(finding.fired_url)}</code></td>"
+                "</tr>"
+            )
+        parts += ["</tbody></table></div></section>"]
+
+    if error_results:
+        parts += [
+            "<section class='card'>",
+            f"<h2>Errors <span class='badge badge-dead'>{len(error_results)}</span></h2>",
+            "<div class='table-wrap'>",
+            "<table>",
+            "<thead><tr><th>URL</th><th>Error</th></tr></thead>",
+            "<tbody>",
+        ]
+        for result in error_results:
+            parts.append(
+                "<tr>"
+                f"<td><code>{_h(result.url)}</code></td>"
+                f"<td>{_h(result.error or 'unknown error')}</td>"
+                "</tr>"
+            )
+        parts += ["</tbody></table></div></section>"]
+
+    if dead_results:
+        parts += [
+            "<section class='card'>",
+            f"<h2>Dead Targets <span class='badge badge-dead'>{len(dead_results)}</span></h2>",
+            "<div class='table-wrap'>",
+            "<table>",
+            "<thead><tr><th>URL</th><th>Status</th><th>Reason</th></tr></thead>",
+            "<tbody>",
+        ]
+        for result in dead_results:
+            parts.append(
+                "<tr>"
+                f"<td><code>{_h(result.url)}</code></td>"
+                f"<td>{_status_badge(result.status)}</td>"
+                f"<td>{_h(result.dead_reason or 'No further technical signal justified more budget.')}</td>"
+                "</tr>"
+            )
+        parts += ["</tbody></table></div></section>"]
+
+    parts += [
+        "<section class='card'>",
+        "<h2>Known Limitations</h2>",
+        "<ul class='limitations'>",
+        "<li><strong>Stored XSS (partial):</strong> Post-injection sweep checks all pages visited during crawl. Payloads stored and rendered on pages outside the crawl boundary require <code>--sink-url</code> or blind XSS to detect.</li>",
+        "<li><strong>DOM XSS (CSP-blocked payloads):</strong> When taint flow is confirmed but execution fails (<code>dom_taint</code>), a strict Content Security Policy is the most likely cause. Manual verification with a CSP-aware payload is recommended.</li>",
+        "<li><strong>DOM XSS (external JS bundles):</strong> The runtime hook covers inline scripts and dynamically evaluated code. Sinks inside lazy-loaded chunk bundles may not be reached if they load after the hook fires.</li>",
+        "<li><strong>Cloud model web search:</strong> Bypass reasoning is based on the cloud model's training knowledge only. Novel WAF bypasses published after the training cutoff may be missed.</li>",
+        "</ul>",
+        "</section>",
+        "</main>",
+        "</body>",
+        "</html>",
+    ]
+    return "".join(parts)
+
+
 def _result_tier(result: WorkerResult) -> str:
     tier = str(getattr(result, "target_tier", "") or "").strip().lower()
     return tier or "unknown"
@@ -282,6 +470,315 @@ def _source_label(source: str) -> str:
         "cloud_model": "Cloud model payload (escalated)",
         "dom_xss_runtime": "DOM XSS runtime sink hooking",
     }.get(source, source)
+
+
+def _h(value: str) -> str:
+    return html.escape(str(value), quote=True)
+
+
+def _summary_tile(label: str, value: str, tone: str) -> str:
+    return (
+        f"<article class='summary-tile tone-{_h(tone)}'>"
+        f"<span class='summary-label'>{_h(label)}</span>"
+        f"<strong>{_h(value)}</strong>"
+        "</article>"
+    )
+
+
+def _status_badge(status: str) -> str:
+    tone = {
+        "confirmed": "confirmed",
+        "taint_only": "soft",
+        "error": "dead",
+        "no_execution": "neutral",
+        "no_reflection": "dead",
+        "no_params": "dead",
+    }.get(status, "neutral")
+    return f"<span class='badge badge-{tone}'>{_h(status)}</span>"
+
+
+def _tier_badge(tier: str) -> str:
+    tone = {
+        "hard_dead": "dead",
+        "soft_dead": "soft",
+        "live": "live",
+        "high_value": "value",
+    }.get(tier, "neutral")
+    return f"<span class='badge badge-{tone}'>{_h(tier)}</span>"
+
+
+def _format_grouped_finding_html(index: int, findings: Sequence[ConfirmedFinding]) -> str:
+    primary = findings[0]
+    parsed = urllib.parse.urlparse(primary.url)
+    endpoint = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+    detail_rows = [
+        ("Parameter / Source", primary.param_name),
+        ("Sink", primary.sink_context),
+        ("Context type", primary.context_type),
+        ("WAF", primary.waf or "—"),
+        ("Confirmed by", primary.execution_method),
+        ("Source", _source_label(primary.source)),
+    ]
+    if primary.bypass_family:
+        detail_rows.append(("Bypass family", primary.bypass_family))
+    if primary.ai_engine:
+        detail_rows.append(("AI engine", primary.ai_engine))
+    if primary.ai_note:
+        detail_rows.append(("AI note", primary.ai_note))
+    if primary.context_type != "dom_xss":
+        detail_rows.append(("Transform", primary.transform_name))
+        detail_rows.append(("Surviving chars", primary.surviving_chars or "?"))
+
+    details_html = "".join(
+        f"<div class='detail-row'><span>{_h(label)}</span><code>{_h(value)}</code></div>"
+        for label, value in detail_rows
+    )
+
+    parts = [
+        "<article class='finding-card'>",
+        "<div class='finding-head'>",
+        f"<h3>Finding {index} <span class='endpoint'>{_h(endpoint)}</span></h3>",
+        f"<div class='finding-badges'>{_status_badge('confirmed')}<span class='badge'>{len(findings)} variant(s)</span></div>",
+        "</div>",
+        "<div class='detail-grid'>",
+        details_html,
+        "</div>",
+    ]
+
+    if primary.payload:
+        parts += [
+            "<section class='block'>",
+            "<h4>Primary Payload</h4>",
+            f"<pre>{_h(primary.payload)}</pre>",
+            "</section>",
+        ]
+
+    parts += [
+        "<section class='block'>",
+        "<h4>Test URL</h4>",
+        f"<pre>{_h(urllib.parse.unquote(primary.fired_url))}</pre>",
+        "</section>",
+    ]
+
+    if primary.context_type == "dom_xss" and primary.code_location:
+        parts += [
+            "<section class='block'>",
+            "<h4>JS Sink Location</h4>",
+            f"<pre>{_h(primary.code_location)}</pre>",
+            "</section>",
+        ]
+
+    parts += [
+        "<section class='callout'>",
+        "<h4>Detail</h4>",
+        f"<p>{_h(primary.execution_detail)}</p>",
+        "<h4>Why it worked</h4>",
+        f"<p>{_h(_explain_why(primary))}</p>",
+        "</section>",
+    ]
+
+    if len(findings) > 1:
+        parts += [
+            "<section class='block'>",
+            "<h4>Additional Confirmed Variants</h4>",
+            "<div class='table-wrap'>",
+            "<table>",
+            "<thead><tr><th>Payload</th><th>Source</th><th>Confirmed by</th><th>Transform</th><th>Bypass family</th></tr></thead>",
+            "<tbody>",
+        ]
+        for finding in findings[1:]:
+            parts.append(
+                "<tr>"
+                f"<td><code>{_h(finding.payload or '—')}</code></td>"
+                f"<td>{_h(_source_label(finding.source))}</td>"
+                f"<td><code>{_h(finding.execution_method)}</code></td>"
+                f"<td><code>{_h(finding.transform_name or '—')}</code></td>"
+                f"<td><code>{_h(finding.bypass_family or '—')}</code></td>"
+                "</tr>"
+            )
+        parts += ["</tbody></table></div></section>"]
+
+    parts += ["</article>"]
+    return "".join(parts)
+
+
+_HTML_REPORT_CSS = """
+:root {
+  --bg: #f4efe4;
+  --paper: #fffdf8;
+  --ink: #182022;
+  --muted: #5f6a6d;
+  --line: #d8d0c2;
+  --accent: #005f73;
+  --confirmed: #1b7f5a;
+  --soft: #8d6b19;
+  --dead: #a33636;
+  --live: #1d6d86;
+  --value: #7b3fa0;
+  --fallback: #8b5a2b;
+  --local: #3c6e71;
+  --cloud: #355070;
+  --neutral: #6c757d;
+  --code: #f1ede4;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+  color: var(--ink);
+  background:
+    radial-gradient(circle at top left, rgba(0,95,115,0.12), transparent 32%),
+    linear-gradient(180deg, #efe8d8 0%, var(--bg) 100%);
+}
+.page {
+  width: min(1200px, calc(100vw - 32px));
+  margin: 24px auto 48px;
+}
+.card, .finding-card {
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  box-shadow: 0 12px 34px rgba(24, 32, 34, 0.08);
+  padding: 20px 22px;
+  margin-bottom: 18px;
+}
+.hero-title-row, .finding-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 16px;
+}
+h1, h2, h3, h4 {
+  margin: 0 0 12px;
+  font-family: "IBM Plex Serif", Georgia, serif;
+}
+h1 { font-size: 2rem; }
+h2 { font-size: 1.4rem; margin-bottom: 14px; }
+h3 { font-size: 1.1rem; }
+h4 { font-size: 0.95rem; margin-bottom: 8px; }
+.endpoint {
+  display: inline-block;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.85rem;
+  color: var(--muted);
+  margin-left: 8px;
+}
+.meta-grid, .summary-grid, .detail-grid {
+  display: grid;
+  gap: 12px;
+}
+.meta-grid { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+.summary-grid { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+.detail-grid { grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); margin-bottom: 16px; }
+.meta-label, .summary-label, .detail-row span {
+  display: block;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+.summary-tile {
+  border-radius: 14px;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  background: #f8f4eb;
+}
+.summary-tile strong {
+  font-size: 1.35rem;
+  display: block;
+}
+.tone-dead { border-color: rgba(163,54,54,0.25); }
+.tone-soft { border-color: rgba(141,107,25,0.25); }
+.tone-live { border-color: rgba(29,109,134,0.25); }
+.tone-value { border-color: rgba(123,63,160,0.25); }
+.tone-local { border-color: rgba(60,110,113,0.25); }
+.tone-cloud { border-color: rgba(53,80,112,0.25); }
+.tone-fallback { border-color: rgba(139,90,43,0.25); }
+.badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: #ece7dc;
+  color: var(--ink);
+  font-size: 0.78rem;
+  font-weight: 600;
+  border: 1px solid var(--line);
+}
+.finding-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.badge-confirmed { background: rgba(27,127,90,0.12); color: var(--confirmed); border-color: rgba(27,127,90,0.25); }
+.badge-soft { background: rgba(141,107,25,0.12); color: var(--soft); border-color: rgba(141,107,25,0.25); }
+.badge-dead { background: rgba(163,54,54,0.12); color: var(--dead); border-color: rgba(163,54,54,0.25); }
+.badge-live { background: rgba(29,109,134,0.12); color: var(--live); border-color: rgba(29,109,134,0.25); }
+.badge-value { background: rgba(123,63,160,0.12); color: var(--value); border-color: rgba(123,63,160,0.25); }
+.badge-neutral { background: rgba(108,117,125,0.12); color: var(--neutral); border-color: rgba(108,117,125,0.25); }
+.detail-row {
+  padding: 10px 12px;
+  background: #faf6ee;
+  border: 1px solid #ece4d6;
+  border-radius: 12px;
+}
+.detail-row code, td code, pre, .endpoint {
+  font-family: "IBM Plex Mono", monospace;
+}
+.block, .callout {
+  margin-top: 14px;
+}
+.callout {
+  border-left: 4px solid var(--accent);
+  padding-left: 14px;
+}
+pre {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: var(--code);
+  border: 1px solid #e3dccd;
+  border-radius: 12px;
+  padding: 12px 14px;
+}
+.table-wrap {
+  overflow-x: auto;
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.92rem;
+}
+th, td {
+  text-align: left;
+  vertical-align: top;
+  padding: 10px 12px;
+  border-bottom: 1px solid #e7e0d3;
+}
+thead th {
+  background: #f6f0e4;
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+.empty {
+  color: var(--muted);
+}
+.limitations {
+  margin: 0;
+  padding-left: 20px;
+}
+.limitations li {
+  margin-bottom: 10px;
+}
+@media (max-width: 720px) {
+  .page { width: min(100vw - 20px, 100%); margin-top: 12px; }
+  .card, .finding-card { padding: 16px; border-radius: 14px; }
+  .hero-title-row, .finding-head { flex-direction: column; }
+}
+"""
 
 
 def _format_grouped_finding(index: int, findings: Sequence[ConfirmedFinding]) -> list[str]:

@@ -1210,6 +1210,7 @@ def _run_active_scan(
         auth_summary=auth_summary,
     )
     success(f"Report written to: {report_path}")
+    success(f"HTML report written to: {Path(report_path).with_suffix('.html')}")
 
     return 0
 
