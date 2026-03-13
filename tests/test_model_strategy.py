@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from ai_xss_generator.active.worker import _build_cloud_feedback_lessons
 from ai_xss_generator.behavior import attach_behavior_profile, build_target_behavior_profile
-from ai_xss_generator.models import _normalize_payloads
+from ai_xss_generator.models import _cloud_prompt_for_context, _normalize_payloads
 from ai_xss_generator.types import ParsedContext
 
 
@@ -90,3 +90,37 @@ def test_cloud_feedback_lessons_include_strategy_shift_constraints() -> None:
     assert "Do not repeat plain javascript: URIs" in summary
     assert "Do not repeat prior payloads" in summary
     assert "switch attack families" in summary.lower()
+    metadata = lessons[0].metadata
+    assert "plain_javascript_uri" in metadata["failed_families"]
+    assert any("Do not repeat plain javascript: URIs" in item for item in metadata["strategy_constraints"])
+
+
+def test_cloud_prompt_includes_structured_execution_feedback_profile() -> None:
+    context = ParsedContext(source="https://example.test/login?redirect=x", source_type="url")
+    profile = build_target_behavior_profile(
+        url=context.source,
+        delivery_mode="get",
+        waf_name="akamai",
+        auth_required=True,
+        context=context,
+    )
+    enriched = attach_behavior_profile(context, profile)
+    assert enriched is not None
+    lessons = _build_cloud_feedback_lessons(
+        attempt_number=1,
+        total_attempts=2,
+        prompt_context=enriched,
+        delivery_mode="get",
+        context_type="html_attr_url",
+        sink_context="html_attr_url",
+        payloads_tried=["javascript:alert(1)", "javascript:confirm(1)"],
+        duplicate_payloads=["javascript:alert(1)"],
+        observation="No dialog, console, or network execution signal fired.",
+    )
+
+    prompt = _cloud_prompt_for_context(enriched, past_lessons=lessons, waf="akamai")
+
+    assert "EXECUTION FEEDBACK PROFILE" in prompt
+    assert '"failed_families": [' in prompt
+    assert '"plain_javascript_uri"' in prompt
+    assert '"required_strategy_shifts": [' in prompt

@@ -262,6 +262,12 @@ def _build_cloud_feedback_lessons(
             "Strategy shifts for the next batch: " + " ".join(strategy_constraints)
         )
     summary_parts.append("Return a materially different next batch and avoid near-duplicates.")
+    failed_families = _infer_failed_families(
+        delivery_mode=delivery_mode,
+        context_type=context_type,
+        sink_context=sink_context,
+        payloads_tried=payloads_tried,
+    )
 
     return [
         Lesson(
@@ -276,6 +282,17 @@ def _build_cloud_feedback_lessons(
             frameworks=[str(item).lower() for item in getattr(prompt_context, "frameworks", [])[:3]],
             auth_required=bool(getattr(prompt_context, "auth_notes", [])),
             confidence=0.83,
+            metadata={
+                "attempt_number": attempt_number,
+                "total_attempts": total_attempts,
+                "delivery_mode": delivery_mode,
+                "context_type": context_type,
+                "sink_context": sink_context,
+                "failed_families": failed_families,
+                "strategy_constraints": strategy_constraints[:4],
+                "observation": observation.strip(),
+                "duplicate_payloads": [payload for payload in (duplicate_payloads or []) if payload][:4],
+            },
         )
     ]
 
@@ -347,6 +364,38 @@ def _infer_strategy_constraints(
         _add("Treat runtime errors as a hint that the syntax shape was wrong; change syntax family rather than repeating the same wrapper.")
 
     return constraints[:4]
+
+
+def _infer_failed_families(
+    *,
+    delivery_mode: str,
+    context_type: str,
+    sink_context: str,
+    payloads_tried: list[str],
+) -> list[str]:
+    families: list[str] = []
+    normalized_context = context_type.strip().lower()
+    normalized_sink = sink_context.strip().lower()
+    lowered_payloads = [payload.lower() for payload in payloads_tried if payload]
+
+    def _add(name: str) -> None:
+        if name and name not in families:
+            families.append(name)
+
+    if lowered_payloads and all("<" in payload and ">" in payload for payload in lowered_payloads):
+        _add("full_tag_injection")
+    if lowered_payloads and all("javascript:" in payload for payload in lowered_payloads):
+        _add("plain_javascript_uri")
+    if lowered_payloads and all("alert(" in payload for payload in lowered_payloads):
+        _add("single_execution_primitive")
+    if normalized_context.startswith("js_string_"):
+        _add("js_string_breakout")
+    if normalized_context == "html_attr_url":
+        _add("url_attribute_execution")
+    if delivery_mode == "dom" and normalized_sink in {"document.write", "document.writeln"}:
+        _add("document_write_markup_escape")
+
+    return families[:4]
 
 
 # ---------------------------------------------------------------------------

@@ -159,7 +159,11 @@ def _waf_knowledge_section(context: ParsedContext) -> str:
     )
 
 
-def _effective_constraints_section(context: ParsedContext, waf: str | None = None) -> str:
+def _effective_constraints_section(
+    context: ParsedContext,
+    waf: str | None = None,
+    past_lessons: list[Any] | None = None,
+) -> str:
     behavior = extract_behavior_profile(context) or {}
     knowledge = getattr(context, "waf_knowledge", None) or {}
     sink_type, context_type, surviving_chars = _extract_probe_context(context)
@@ -178,6 +182,22 @@ def _effective_constraints_section(context: ParsedContext, waf: str | None = Non
     observed_transforms = list(behavior.get("reflection_transforms", []) or [])[:4]
     recommended_families = list(knowledge.get("preferred_strategies", []) or [])[:5]
     deprioritized_families = list(knowledge.get("avoid_strategies", []) or [])[:5]
+    failed_families: list[str] = []
+    strategy_shifts: list[str] = []
+
+    if past_lessons:
+        for lesson in past_lessons:
+            if getattr(lesson, "lesson_type", "") != "execution_feedback":
+                continue
+            metadata = getattr(lesson, "metadata", {}) or {}
+            for family in metadata.get("failed_families", []) or []:
+                family_text = str(family or "").strip()
+                if family_text and family_text not in failed_families:
+                    failed_families.append(family_text)
+            for shift in metadata.get("strategy_constraints", []) or []:
+                shift_text = str(shift or "").strip()
+                if shift_text and shift_text not in strategy_shifts:
+                    strategy_shifts.append(shift_text)
 
     if context_type == "html_attr_url":
         if "scheme_fragmentation" not in recommended_families:
@@ -189,6 +209,9 @@ def _effective_constraints_section(context: ParsedContext, waf: str | None = Non
         deprioritized_families.append("plain_script_tag")
     if observed_transforms and "mixed_case_markup" not in recommended_families:
         recommended_families.append("mixed_case_markup")
+    for family in failed_families:
+        if family not in deprioritized_families:
+            deprioritized_families.append(family)
 
     compact = {
         "confirmed_sink": sink_type or dom_runtime.get("sink", ""),
@@ -197,8 +220,51 @@ def _effective_constraints_section(context: ParsedContext, waf: str | None = Non
         "observed_transforms": observed_transforms,
         "recommended_families": recommended_families[:5],
         "deprioritized_families": deprioritized_families[:5],
+        "required_strategy_shifts": strategy_shifts[:4],
     }
     return "EFFECTIVE CONSTRAINTS:\n" + json.dumps(compact, indent=2) + "\n"
+
+
+def _execution_feedback_section(past_lessons: list[Any] | None) -> str:
+    if not past_lessons:
+        return ""
+
+    failed_families: list[str] = []
+    strategy_constraints: list[str] = []
+    duplicate_payloads: list[str] = []
+    observations: list[str] = []
+
+    def _extend_unique(target: list[str], values: list[Any], limit: int) -> None:
+        for value in values:
+            text = str(value or "").strip()
+            if text and text not in target:
+                target.append(text)
+            if len(target) >= limit:
+                break
+
+    for lesson in past_lessons:
+        if getattr(lesson, "lesson_type", "") != "execution_feedback":
+            continue
+        metadata = getattr(lesson, "metadata", {}) or {}
+        _extend_unique(failed_families, metadata.get("failed_families", []) or [], 5)
+        _extend_unique(strategy_constraints, metadata.get("strategy_constraints", []) or [], 5)
+        _extend_unique(duplicate_payloads, metadata.get("duplicate_payloads", []) or [], 4)
+        observation = str(metadata.get("observation", "") or "").strip()
+        if observation and observation not in observations:
+            observations.append(observation)
+        if len(observations) >= 2:
+            break
+
+    if not any((failed_families, strategy_constraints, duplicate_payloads, observations)):
+        return ""
+
+    compact = {
+        "failed_families": failed_families[:5],
+        "strategy_shifts": strategy_constraints[:5],
+        "duplicate_payloads": duplicate_payloads[:4],
+        "observations": observations[:2],
+    }
+    return "EXECUTION FEEDBACK PROFILE:\n" + json.dumps(compact, indent=2) + "\n"
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +336,12 @@ def _prompt_for_context(
         lessons_section = lessons_prompt_section(past_lessons) + "\n"
     behavior_section = _behavior_profile_section(context)
     waf_knowledge_section = _waf_knowledge_section(context)
-    effective_constraints_section = _effective_constraints_section(context, waf=waf)
+    effective_constraints_section = _effective_constraints_section(
+        context,
+        waf=waf,
+        past_lessons=past_lessons,
+    )
+    execution_feedback_section = _execution_feedback_section(past_lessons)
 
     # ── Section 2b: Auth context ──────────────────────────────────────────────
     auth_section = ""
@@ -342,7 +413,7 @@ Requirements:
 - Prefer compact, self-contained payloads with no external dependencies.
 - Include a compact `strategy` object per payload so the scanner can reason about delivery shape, encoding style, and what to pivot to next if the attempt fails.
 
-{probe_section}{dom_section}{behavior_section}{waf_knowledge_section}{effective_constraints_section}{lessons_section}{findings_section}{auth_section}{waf_section}{reference_section}Full parsed context:
+{probe_section}{dom_section}{behavior_section}{waf_knowledge_section}{effective_constraints_section}{execution_feedback_section}{lessons_section}{findings_section}{auth_section}{waf_section}{reference_section}Full parsed context:
 {context_blob}""".strip()
 
 
@@ -420,7 +491,12 @@ def _compact_dom_prompt_for_local(
             lessons_section = "Runtime lessons:\n" + "\n".join(lesson_lines) + "\n"
     behavior_section = _behavior_profile_section(context)
     waf_knowledge_section = _waf_knowledge_section(context)
-    effective_constraints_section = _effective_constraints_section(context, waf=waf)
+    effective_constraints_section = _effective_constraints_section(
+        context,
+        waf=waf,
+        past_lessons=past_lessons,
+    )
+    execution_feedback_section = _execution_feedback_section(past_lessons)
 
     context_summary = {
         "source": context.source,
@@ -472,7 +548,7 @@ Requirements:
 
 DOM runtime:
 {json.dumps(dom_runtime, indent=2)}
-{waf_line}{behavior_section}{waf_knowledge_section}{effective_constraints_section}{lessons_section}{findings_section}Context summary:
+{waf_line}{behavior_section}{waf_knowledge_section}{effective_constraints_section}{execution_feedback_section}{lessons_section}{findings_section}Context summary:
 {json.dumps(context_summary, indent=2)}""".strip()
 
 
@@ -622,7 +698,12 @@ def _compact_dom_prompt_for_cloud(
             lessons_section = "Runtime lessons:\n" + "\n".join(lesson_lines) + "\n"
     behavior_section = _behavior_profile_section(context)
     waf_knowledge_section = _waf_knowledge_section(context)
-    effective_constraints_section = _effective_constraints_section(context, waf=waf)
+    effective_constraints_section = _effective_constraints_section(
+        context,
+        waf=waf,
+        past_lessons=past_lessons,
+    )
+    execution_feedback_section = _execution_feedback_section(past_lessons)
 
     context_summary = {
         "source": context.source,
@@ -676,7 +757,7 @@ Requirements:
 
 DOM runtime:
 {json.dumps(dom_runtime, indent=2)}
-{waf_line}{behavior_section}{waf_knowledge_section}{effective_constraints_section}{lessons_section}{findings_section}{seed_section}Context summary:
+{waf_line}{behavior_section}{waf_knowledge_section}{effective_constraints_section}{execution_feedback_section}{lessons_section}{findings_section}{seed_section}Context summary:
 {json.dumps(context_summary, indent=2)}""".strip()
 
 
@@ -702,7 +783,12 @@ def _document_write_prompt_for_cloud(
             lessons_section = "Runtime lessons:\n" + "\n".join(lesson_lines) + "\n"
     behavior_section = _behavior_profile_section(context)
     waf_knowledge_section = _waf_knowledge_section(context)
-    effective_constraints_section = _effective_constraints_section(context, waf=waf)
+    effective_constraints_section = _effective_constraints_section(
+        context,
+        waf=waf,
+        past_lessons=past_lessons,
+    )
+    execution_feedback_section = _execution_feedback_section(past_lessons)
 
     targeted_examples = [
         {
@@ -775,7 +861,7 @@ Document.write subcontext:
 {json.dumps(subcontext, indent=2)}
 Recommended payload families:
 {recommended}
-{waf_line}{behavior_section}{waf_knowledge_section}{effective_constraints_section}{lessons_section}Targeted examples:
+{waf_line}{behavior_section}{waf_knowledge_section}{effective_constraints_section}{execution_feedback_section}{lessons_section}Targeted examples:
 {json.dumps(targeted_examples, indent=2)}
 Context summary:
 {json.dumps(context_summary, indent=2)}""".strip()

@@ -10,6 +10,7 @@ Nothing in this module touches disk.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 
 LESSON_TYPE_MAPPING  = "mapping"
@@ -43,6 +44,7 @@ class Lesson:
     frameworks: list[str] = field(default_factory=list)
     auth_required: bool = False
     confidence: float = 0.0
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
