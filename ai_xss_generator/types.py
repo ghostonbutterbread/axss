@@ -17,6 +17,7 @@ class FormField:
 class FormContext:
     action: str
     method: str
+    enctype: str = ""
     fields: list[FormField] = field(default_factory=list)
 
 
@@ -108,6 +109,29 @@ class PostFormTarget:
     hidden_defaults: dict[str, str]
     """All hidden field name→value pairs from the form as discovered.
     Used as fallback when a fresh CSRF fetch fails."""
+
+
+@dataclass(slots=True)
+class UploadTarget:
+    """A multipart/form-data upload form discovered during crawling."""
+
+    action_url: str
+    """Absolute URL to submit the upload form to."""
+
+    source_page_url: str
+    """Page where the upload form was found."""
+
+    file_field_names: list[str]
+    """File input names present in the form."""
+
+    companion_field_names: list[str]
+    """Non-file injectable companion fields submitted alongside the file."""
+
+    csrf_field: str | None
+    """Detected CSRF token field, if present."""
+
+    hidden_defaults: dict[str, str]
+    """Hidden field defaults captured from the form."""
 
 
 @dataclass(slots=True)

@@ -465,6 +465,168 @@ class ActiveExecutor:
             fired_url=source_page_url,
         )
 
+    def fire_upload(
+        self,
+        source_page_url: str,
+        action_url: str,
+        file_field_names: list[str],
+        companion_overrides: dict[str, str],
+        file_name: str,
+        file_content: str,
+        transform_name: str,
+        sink_url: str | None = None,
+    ) -> "ExecutionResult":
+        """Load an upload form page, submit a crafted file, and watch follow-up pages."""
+        if not self._started or self._browser is None:
+            return ExecutionResult(
+                confirmed=False,
+                method="",
+                detail="",
+                transform_name=transform_name,
+                payload=file_name,
+                param_name=file_field_names[0] if file_field_names else "file",
+                fired_url=source_page_url,
+                error="Executor not started",
+            )
+
+        confirmed = False
+        method = ""
+        detail = ""
+        payload_submitted = False
+        extra_headers = {**self._auth_headers, "Accept": "text/html,application/xhtml+xml"}
+        context = self._browser.new_context(
+            ignore_https_errors=True,
+            extra_http_headers=extra_headers,
+        )
+        try:
+            page = context.new_page()
+            page.add_init_script(console_init_script())
+
+            page.route(
+                "**/*",
+                lambda route: route.abort()
+                if route.request.resource_type in {"image", "media", "font", "stylesheet"}
+                else route.continue_(),
+            )
+
+            def _on_dialog(dialog):
+                nonlocal confirmed, method, detail
+                if payload_submitted:
+                    confirmed = True
+                    method = "dialog"
+                    detail = f"alert() dialog triggered — message: {dialog.message!r}"
+                try:
+                    dialog.dismiss()
+                except Exception:
+                    pass
+
+            page.on("dialog", _on_dialog)
+
+            def _on_console(msg):
+                nonlocal confirmed, method, detail
+                if payload_submitted and not confirmed and is_execution_console_text(msg.text):
+                    confirmed = True
+                    method = "console"
+                    detail = (
+                        f"console.{msg.type}() fired — "
+                        f"text: {strip_execution_console_text(msg.text)!r}"
+                    )
+
+            page.on("console", _on_console)
+
+            def _on_request(req):
+                nonlocal confirmed, method, detail
+                if payload_submitted and not confirmed and _BEACON_HOST in req.url:
+                    confirmed = True
+                    method = "network"
+                    detail = f"OOB network request detected: {req.url!r}"
+
+            page.on("request", _on_request)
+
+            try:
+                page.goto(source_page_url, timeout=_NAV_TIMEOUT_MS, wait_until="domcontentloaded")
+            except Exception as nav_exc:
+                log.debug("fire_upload: source page load error for %s: %s", source_page_url, nav_exc)
+
+            for field_name, field_value in companion_overrides.items():
+                try:
+                    page.fill(f'[name="{field_name}"]', field_value, timeout=3000)
+                except Exception as fill_exc:
+                    log.debug("fire_upload: companion fill failed for %s: %s", field_name, fill_exc)
+
+            file_spec = _upload_file_spec(file_name, file_content)
+            for file_field_name in file_field_names or ["file"]:
+                try:
+                    page.set_input_files(f'[name="{file_field_name}"]', file_spec, timeout=3000)
+                except Exception as set_exc:
+                    log.debug("fire_upload: file set failed for %s: %s", file_field_name, set_exc)
+                    return ExecutionResult(
+                        confirmed=False,
+                        method="",
+                        detail="",
+                        transform_name=transform_name,
+                        payload=file_name,
+                        param_name=file_field_name,
+                        fired_url=source_page_url,
+                        error=f"file set failed: {set_exc}",
+                    )
+
+            payload_submitted = True
+            try:
+                submit_btn = page.locator('[type="submit"]').first
+                if submit_btn.count() > 0:
+                    submit_btn.click(timeout=3000)
+                else:
+                    page.evaluate("document.forms[0] && document.forms[0].submit()")
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=_NAV_TIMEOUT_MS)
+                except Exception:
+                    pass
+            except Exception as submit_exc:
+                log.debug("fire_upload: submit error: %s", submit_exc)
+                payload_submitted = False
+
+            if not confirmed:
+                origin_root = _same_origin_root(source_page_url)
+                follow_ups = list(dict.fromkeys(
+                    ([sink_url] if sink_url else [])
+                    + [source_page_url, action_url, origin_root]
+                ))
+                for follow_up_url in follow_ups:
+                    if confirmed:
+                        break
+                    try:
+                        page.goto(follow_up_url, timeout=_NAV_TIMEOUT_MS, wait_until="domcontentloaded")
+                    except Exception as nav_exc:
+                        log.debug("fire_upload: follow-up nav error for %s: %s", follow_up_url, nav_exc)
+
+        except Exception as exc:
+            return ExecutionResult(
+                confirmed=False,
+                method="",
+                detail="",
+                transform_name=transform_name,
+                payload=file_name,
+                param_name=file_field_names[0] if file_field_names else "file",
+                fired_url=source_page_url,
+                error=str(exc),
+            )
+        finally:
+            try:
+                context.close()
+            except Exception:
+                pass
+
+        return ExecutionResult(
+            confirmed=confirmed,
+            method=method,
+            detail=detail,
+            transform_name=transform_name,
+            payload=file_name,
+            param_name=file_field_names[0] if file_field_names else "file",
+            fired_url=source_page_url,
+        )
+
 
 def _strategy_value(strategy: Any, key: str) -> str:
     if strategy is None:
@@ -598,6 +760,14 @@ def _build_post_delivery_plan(
         param_overrides=overrides,
         follow_up_urls=list(dict.fromkeys(follow_up_urls)),
     )
+
+
+def _upload_file_spec(filename: str, content: str, mime_type: str = "image/svg+xml") -> dict[str, Any]:
+    return {
+        "name": filename,
+        "mimeType": mime_type,
+        "buffer": content.encode("utf-8"),
+    }
 
 
 def _build_url(

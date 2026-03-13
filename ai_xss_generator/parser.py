@@ -125,6 +125,7 @@ class _MiniHTMLParser(HTMLParser):
             self._current_form = FormContext(
                 action=attr_map.get("action", ""),
                 method=(attr_map.get("method", "get") or "get").upper(),
+                enctype=(attr_map.get("enctype", "") or "").lower(),
             )
             self.forms.append(self._current_form)
         elif tag in {"input", "textarea", "select", "button"}:
@@ -195,6 +196,7 @@ def _extract_with_selectors(selector: Any) -> MarkupExtraction:
         form_context = FormContext(
             action=form.attrib.get("action", ""),
             method=(form.attrib.get("method", "get") or "get").upper(),
+            enctype=(form.attrib.get("enctype", "") or "").lower(),
         )
         for field in form.css("input, textarea, select, button"):
             form_context.fields.append(_field_from_attrs(field.tag, dict(field.attrib)))

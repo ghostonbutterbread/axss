@@ -27,12 +27,13 @@ from dataclasses import dataclass, field
 from typing import Any, Sequence, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from ai_xss_generator.types import PostFormTarget
+    from ai_xss_generator.types import PostFormTarget, UploadTarget
 
 from ai_xss_generator.active.worker import (
     WorkerResult,
     active_worker_timeout_budget,
     run_dom_worker,
+    run_upload_worker,
     run_worker,
 )
 from ai_xss_generator.console import (
@@ -77,10 +78,19 @@ def _domain(url: str) -> str:
     return urllib.parse.urlparse(url).netloc or url
 
 
+def _work_item_url(kind: str, item: Any) -> str:
+    return item if kind in {"get", "dom"} else item.action_url
+
+
+def _work_item_key(kind: str, item: Any) -> str:
+    return f"{kind}:{_work_item_url(kind, item)}"
+
+
 def run_active_scan(
     urls: Sequence[str],
     config: ActiveScanConfig,
     post_forms: "Sequence[PostFormTarget]" = (),
+    upload_targets: "Sequence[UploadTarget]" = (),
     crawled_pages: Sequence[str] = (),
     session: "Any | None" = None,
 ) -> list[WorkerResult]:
@@ -94,6 +104,7 @@ def run_active_scan(
     from ai_xss_generator.active.worker import run_post_worker
     url_list = [u.strip() for u in urls if u and u.strip()]
     post_form_list = list(post_forms)
+    upload_target_list = list(upload_targets)
     crawled_pages_list = list(crawled_pages)
 
     # Build work items filtered by enabled scan types
@@ -102,6 +113,7 @@ def run_active_scan(
         work_items += [("get", u) for u in url_list]
     if config.scan_stored:
         work_items += [("post", pf) for pf in post_form_list]
+        work_items += [("upload", ut) for ut in upload_target_list]
 
     if config.scan_dom:
         work_items += [("dom", u) for u in url_list]
@@ -116,7 +128,7 @@ def run_active_scan(
             before = len(work_items)
             work_items = [
                 (kind, item) for kind, item in work_items
-                if (item if kind == "get" else item.action_url) not in done_urls
+                if _work_item_key(kind, item) not in done_urls
             ]
             skipped = before - len(work_items)
             if skipped:
@@ -133,8 +145,8 @@ def run_active_scan(
             return prior_results
         if config.scan_reflected and not url_list:
             _reasons.append("no GET URLs with testable query parameters")
-        if config.scan_stored and not post_form_list:
-            _reasons.append("no POST forms discovered (try without --no-crawl)")
+        if config.scan_stored and not post_form_list and not upload_target_list:
+            _reasons.append("no POST or upload forms discovered (try without --no-crawl)")
         if _reasons:
             info(f"Active scan: nothing to test — {'; '.join(_reasons)}")
         return []
@@ -146,10 +158,11 @@ def run_active_scan(
     ]))
     n_get = sum(1 for kind, _ in work_items if kind == "get")
     n_post = sum(1 for kind, _ in work_items if kind == "post")
+    n_upload = sum(1 for kind, _ in work_items if kind == "upload")
 
     n_workers = _auto_workers(config.rate, config.workers)
     step(
-        f"Active scan [{_active_types}]: {n_get} GET URL(s) + {n_post} POST form(s) | "
+        f"Active scan [{_active_types}]: {n_get} GET URL(s) + {n_post} POST form(s) + {n_upload} upload form(s) | "
         f"{n_workers} worker(s) | "
         f"{config.rate:g} req/s rate | "
         f"{config.timeout_seconds}s timeout"
@@ -215,6 +228,8 @@ def run_active_scan(
                 pills.append(f"{GREEN}GET●{RESET}")
             elif _kind == "post":
                 pills.append(f"{CYAN}POST●{RESET}")
+            elif _kind == "upload":
+                pills.append(f"{GREEN}UP●{RESET}")
             else:
                 pills.append(f"{_MAGENTA}DOM●{RESET}")
         for _ in range(max(0, n_workers - len(active_procs))):
@@ -386,6 +401,21 @@ def run_active_scan(
                             daemon=True,
                         )
                         log_label = f"[DOM] {next_url}"
+                    elif kind == "upload":
+                        ut = item
+                        proc = multiprocessing.Process(
+                            target=run_upload_worker,
+                            kwargs={
+                                "upload_target": ut,
+                                "waf_hint": config.waf,
+                                "timeout_seconds": config.timeout_seconds,
+                                "result_queue": result_queue,
+                                "auth_headers": config.auth_headers,
+                                "sink_url": config.sink_url,
+                            },
+                            daemon=True,
+                        )
+                        log_label = f"[UPLOAD] {ut.action_url}"
                     else:
                         pf = item
                         proc = multiprocessing.Process(
@@ -411,7 +441,7 @@ def run_active_scan(
                         )
                         log_label = f"[POST] {pf.action_url}"
                     proc.start()
-                    result_url = next_url if kind != "post" else pf.action_url
+                    result_url = _work_item_url(kind, item)
                     active_procs.append((proc, log_label, kind, time.monotonic(), result_url))
                     info(f"[worker] started → {log_label}")
 

@@ -1,0 +1,136 @@
+from __future__ import annotations
+
+from ai_xss_generator.browser_crawler import _process_raw_forms
+from ai_xss_generator.crawler import _extract_links
+from ai_xss_generator.session import compute_seed_hash
+from ai_xss_generator.types import PostFormTarget, UploadTarget
+
+
+def test_browser_process_raw_forms_discovers_upload_targets() -> None:
+    seen_post_keys: set[str] = set()
+    post_forms: list[PostFormTarget] = []
+    upload_targets: list[UploadTarget] = []
+
+    _process_raw_forms(
+        raw_forms=[{
+            "action": "/profile/avatar",
+            "method": "POST",
+            "enctype": "multipart/form-data",
+            "fields": [
+                ["_csrf", "hidden", "token123"],
+                ["avatar", "file", ""],
+                ["displayName", "text", ""],
+            ],
+        }],
+        final_url="https://example.test/account",
+        seen_post_keys=seen_post_keys,
+        post_forms=post_forms,
+        upload_targets=upload_targets,
+    )
+
+    assert len(upload_targets) == 1
+    assert upload_targets[0].action_url == "https://example.test/profile/avatar"
+    assert upload_targets[0].file_field_names == ["avatar"]
+    assert upload_targets[0].companion_field_names == ["displayName"]
+    assert upload_targets[0].csrf_field == "_csrf"
+
+    assert len(post_forms) == 1
+    assert post_forms[0].param_names == ["displayName"]
+
+
+def test_http_crawler_preserves_real_file_field_names() -> None:
+    _, raw_forms = _extract_links(
+        """
+        <form action="/profile/avatar" method="post" enctype="multipart/form-data">
+          <input type="hidden" name="_csrf" value="token123">
+          <input type="file" name="avatar">
+          <input type="text" name="displayName">
+        </form>
+        """,
+        "https://example.test/account",
+    )
+
+    assert len(raw_forms) == 1
+    assert ("avatar", "file", "") in raw_forms[0]["fields"]
+
+
+def test_seed_hash_includes_upload_targets() -> None:
+    base = compute_seed_hash(
+        urls=["https://example.test/account"],
+        post_forms=[],
+        upload_targets=[],
+        scan_reflected=False,
+        scan_stored=True,
+        scan_dom=False,
+    )
+    upload_hash = compute_seed_hash(
+        urls=["https://example.test/account"],
+        post_forms=[],
+        upload_targets=[UploadTarget(
+            action_url="https://example.test/upload",
+            source_page_url="https://example.test/account",
+            file_field_names=["avatar"],
+            companion_field_names=["displayName"],
+            csrf_field=None,
+            hidden_defaults={},
+        )],
+        scan_reflected=False,
+        scan_stored=True,
+        scan_dom=False,
+    )
+
+    assert base != upload_hash
+
+
+def test_run_upload_worker_confirms_when_executor_fires(monkeypatch) -> None:
+    from ai_xss_generator.active.worker import _run_upload
+    from ai_xss_generator.active.executor import ExecutionResult
+
+    class FakeExecutor:
+        def __init__(self, auth_headers=None):
+            self.auth_headers = auth_headers
+
+        def start(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+        def fire_upload(self, **kwargs):
+            return ExecutionResult(
+                confirmed=True,
+                method="dialog",
+                detail="alert fired",
+                transform_name=kwargs["transform_name"],
+                payload=kwargs["file_name"],
+                param_name=kwargs["file_field_names"][0],
+                fired_url=kwargs["source_page_url"],
+            )
+
+    monkeypatch.setattr("ai_xss_generator.active.executor.ActiveExecutor", FakeExecutor)
+
+    collected = []
+    _run_upload(
+        upload_target=UploadTarget(
+            action_url="https://example.test/upload",
+            source_page_url="https://example.test/account/avatar",
+            file_field_names=["avatar"],
+            companion_field_names=["displayName"],
+            csrf_field=None,
+            hidden_defaults={},
+        ),
+        waf_hint="akamai",
+        timeout_seconds=30,
+        put_result=collected.append,
+        auth_headers={"Authorization": "Bearer token"},
+        sink_url="https://example.test/profile/avatar",
+    )
+
+    assert len(collected) == 1
+    result = collected[0]
+    assert result.status == "confirmed"
+    assert result.kind == "upload"
+    assert result.target_tier == "high_value"
+    assert result.fallback_rounds == 1
+    assert result.confirmed_findings[0].context_type == "stored_upload"
+    assert result.confirmed_findings[0].sink_context == "upload_render"

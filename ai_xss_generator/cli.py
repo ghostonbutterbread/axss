@@ -926,6 +926,7 @@ def _run_active_scan(
     crawl_depth = getattr(args, "depth", 2)
     use_browser_crawl = getattr(args, "browser_crawl", False)
     post_forms: list = []
+    upload_targets: list = []
     crawled_pages: list = []
     if args.url and not no_crawl:
         from ai_xss_generator.console import (
@@ -983,19 +984,28 @@ def _run_active_scan(
                 clear_status_bar()
 
         post_forms = crawl_result.post_forms
+        upload_targets = getattr(crawl_result, "upload_targets", [])
         crawled_pages = crawl_result.visited_urls
         if crawl_result.get_urls:
             msg = f"Crawl complete: {len(crawl_result.get_urls)} GET URL(s) with testable params"
             if post_forms:
                 msg += f" + {len(post_forms)} POST form(s) discovered"
+            if upload_targets:
+                msg += f" + {len(upload_targets)} upload form(s) discovered"
             success(msg)
             urls = crawl_result.get_urls
-        elif post_forms:
-            success(f"Crawl complete: {len(post_forms)} POST form(s) discovered (no GET params)")
+        elif post_forms or upload_targets:
+            parts = []
+            if post_forms:
+                parts.append(f"{len(post_forms)} POST form(s) discovered")
+            if upload_targets:
+                parts.append(f"{len(upload_targets)} upload form(s) discovered")
+            success(f"Crawl complete: {' + '.join(parts)} (no GET params)")
             # urls stays as [args.url] — original URL is still needed for report labeling
         else:
             info("Crawl found no URLs with testable params — testing provided URL directly")
             post_forms = []
+            upload_targets = []
 
         # Use WAF detected from crawl seed if auto-detect hasn't found one yet
         if not waf and crawl_result.detected_waf:
@@ -1012,6 +1022,7 @@ def _run_active_scan(
         args=args,
         urls=list(urls),
         post_forms=list(post_forms),
+        upload_targets=list(upload_targets),
         scan_reflected=scan_reflected,
         scan_stored=scan_stored,
         scan_dom=scan_dom,
@@ -1041,6 +1052,7 @@ def _run_active_scan(
     results = run_active_scan(
         urls, scan_config,
         post_forms=post_forms,
+        upload_targets=upload_targets,
         crawled_pages=crawled_pages,
         session=session,
     )
@@ -1060,6 +1072,7 @@ def _resolve_session(
     args: Any,
     urls: list[str],
     post_forms: list,
+    upload_targets: list,
     scan_reflected: bool,
     scan_stored: bool,
     scan_dom: bool,
@@ -1084,6 +1097,7 @@ def _resolve_session(
     seed_hash = compute_seed_hash(
         urls=urls,
         post_forms=post_forms,
+        upload_targets=upload_targets,
         scan_reflected=scan_reflected,
         scan_stored=scan_stored,
         scan_dom=scan_dom,
@@ -1119,7 +1133,11 @@ def _resolve_session(
         f"rate={rate:g} req/s | "
         f"reflected={scan_reflected} stored={scan_stored}"
     )
-    total_items = (len(urls) if scan_reflected else 0) + (len(post_forms) if scan_stored else 0)
+    total_items = (
+        (len(urls) if scan_reflected else 0)
+        + ((len(post_forms) + len(upload_targets)) if scan_stored else 0)
+        + (len(urls) if scan_dom else 0)
+    )
     session = create_session(
         seed_hash=seed_hash,
         config_summary=config_summary,

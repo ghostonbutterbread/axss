@@ -16,7 +16,7 @@ Atomicity:
   crash mid-write never leaves a corrupted session file.
 
 Session identity (seed_hash):
-  SHA-256 of sorted URL list + sorted POST form keys + scan type flags.
+  SHA-256 of sorted URL list + sorted POST/upload target keys + scan type flags.
   This is deterministic for --urls FILE mode and deterministic per-crawl for
   -u URL mode (same crawl → same URLs → same hash).  Auth headers and rate
   are deliberately excluded so users can tweak them on resume.
@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from ai_xss_generator.active.worker import ConfirmedFinding, WorkerResult
-    from ai_xss_generator.types import PostFormTarget
+    from ai_xss_generator.types import PostFormTarget, UploadTarget
 
 from ai_xss_generator.config import CONFIG_DIR
 
@@ -50,6 +50,7 @@ SESSIONS_DIR = CONFIG_DIR / "sessions"
 def compute_seed_hash(
     urls: list[str],
     post_forms: "list[PostFormTarget]",
+    upload_targets: "list[UploadTarget]",
     scan_reflected: bool,
     scan_stored: bool,
     scan_dom: bool,
@@ -63,6 +64,17 @@ def compute_seed_hash(
                 for pf in post_forms
             ],
             key=lambda d: (d["action_url"], d["params"]),
+        ),
+        "upload_targets": sorted(
+            [
+                {
+                    "action_url": ut.action_url,
+                    "files": sorted(ut.file_field_names),
+                    "fields": sorted(ut.companion_field_names),
+                }
+                for ut in upload_targets
+            ],
+            key=lambda d: (d["action_url"], d["files"], d["fields"]),
         ),
         "reflected": scan_reflected,
         "stored": scan_stored,
@@ -246,12 +258,13 @@ def checkpoint(session: dict, url: str, result: "WorkerResult") -> None:
     Safe to call from within the orchestrator drain loop — the atomic write
     ensures a crash mid-write never corrupts the session.
     """
-    session.setdefault("completed", {})[url] = _result_to_dict(result)
+    result_key = f"{getattr(result, 'kind', 'get')}:{result.url}"
+    session.setdefault("completed", {})[result_key] = _result_to_dict(result)
     session["updated_at"] = _now_iso()
     try:
         _atomic_write(_session_path(session["seed_hash"]), session)
     except Exception as exc:
-        log.debug("Session checkpoint failed for %s: %s", url, exc)
+        log.debug("Session checkpoint failed for %s: %s", result_key, exc)
 
 
 def mark_status(session: dict, status: str) -> None:
@@ -266,8 +279,16 @@ def mark_status(session: dict, status: str) -> None:
 
 
 def completed_urls(session: dict) -> set[str]:
-    """Return the set of URLs already completed in this session."""
-    return set(session.get("completed", {}).keys())
+    """Return the set of completed work-item keys ('kind:url')."""
+    completed = set()
+    for key, entry in session.get("completed", {}).items():
+        if ":" in key:
+            completed.add(key)
+            continue
+        kind = str(entry.get("kind", "get"))
+        url = str(entry.get("url", key))
+        completed.add(f"{kind}:{url}")
+    return completed
 
 
 def restore_results(session: dict) -> "list[WorkerResult]":
