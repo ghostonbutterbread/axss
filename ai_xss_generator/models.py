@@ -159,6 +159,48 @@ def _waf_knowledge_section(context: ParsedContext) -> str:
     )
 
 
+def _effective_constraints_section(context: ParsedContext, waf: str | None = None) -> str:
+    behavior = extract_behavior_profile(context) or {}
+    knowledge = getattr(context, "waf_knowledge", None) or {}
+    sink_type, context_type, surviving_chars = _extract_probe_context(context)
+    dom_runtime = _extract_dom_runtime_context(context)
+
+    observed_blockers: list[str] = []
+    if behavior.get("browser_required"):
+        observed_blockers.append("browser_required")
+    if behavior.get("auth_required"):
+        observed_blockers.append("authenticated_state")
+    if surviving_chars:
+        observed_blockers.append("restricted_surviving_chars")
+    if waf:
+        observed_blockers.append(f"waf:{waf}")
+
+    observed_transforms = list(behavior.get("reflection_transforms", []) or [])[:4]
+    recommended_families = list(knowledge.get("preferred_strategies", []) or [])[:5]
+    deprioritized_families = list(knowledge.get("avoid_strategies", []) or [])[:5]
+
+    if context_type == "html_attr_url":
+        if "scheme_fragmentation" not in recommended_families:
+            recommended_families.append("scheme_fragmentation")
+    if context_type in {"html_attr_value", "html_body"} or dom_runtime.get("sink") == "document.write":
+        if "quote_closure" not in recommended_families:
+            recommended_families.append("quote_closure")
+    if surviving_chars and "<" not in surviving_chars and "plain_script_tag" not in deprioritized_families:
+        deprioritized_families.append("plain_script_tag")
+    if observed_transforms and "mixed_case_markup" not in recommended_families:
+        recommended_families.append("mixed_case_markup")
+
+    compact = {
+        "confirmed_sink": sink_type or dom_runtime.get("sink", ""),
+        "reflection_context": context_type or "",
+        "observed_blockers": observed_blockers[:5],
+        "observed_transforms": observed_transforms,
+        "recommended_families": recommended_families[:5],
+        "deprioritized_families": deprioritized_families[:5],
+    }
+    return "EFFECTIVE CONSTRAINTS:\n" + json.dumps(compact, indent=2) + "\n"
+
+
 # ---------------------------------------------------------------------------
 # Prompt construction
 # ---------------------------------------------------------------------------
@@ -228,6 +270,7 @@ def _prompt_for_context(
         lessons_section = lessons_prompt_section(past_lessons) + "\n"
     behavior_section = _behavior_profile_section(context)
     waf_knowledge_section = _waf_knowledge_section(context)
+    effective_constraints_section = _effective_constraints_section(context, waf=waf)
 
     # ── Section 2b: Auth context ──────────────────────────────────────────────
     auth_section = ""
@@ -299,7 +342,7 @@ Requirements:
 - Prefer compact, self-contained payloads with no external dependencies.
 - Include a compact `strategy` object per payload so the scanner can reason about delivery shape, encoding style, and what to pivot to next if the attempt fails.
 
-{probe_section}{dom_section}{behavior_section}{waf_knowledge_section}{lessons_section}{findings_section}{auth_section}{waf_section}{reference_section}Full parsed context:
+{probe_section}{dom_section}{behavior_section}{waf_knowledge_section}{effective_constraints_section}{lessons_section}{findings_section}{auth_section}{waf_section}{reference_section}Full parsed context:
 {context_blob}""".strip()
 
 
@@ -377,6 +420,7 @@ def _compact_dom_prompt_for_local(
             lessons_section = "Runtime lessons:\n" + "\n".join(lesson_lines) + "\n"
     behavior_section = _behavior_profile_section(context)
     waf_knowledge_section = _waf_knowledge_section(context)
+    effective_constraints_section = _effective_constraints_section(context, waf=waf)
 
     context_summary = {
         "source": context.source,
@@ -428,7 +472,7 @@ Requirements:
 
 DOM runtime:
 {json.dumps(dom_runtime, indent=2)}
-{waf_line}{behavior_section}{waf_knowledge_section}{lessons_section}{findings_section}Context summary:
+{waf_line}{behavior_section}{waf_knowledge_section}{effective_constraints_section}{lessons_section}{findings_section}Context summary:
 {json.dumps(context_summary, indent=2)}""".strip()
 
 
@@ -578,6 +622,7 @@ def _compact_dom_prompt_for_cloud(
             lessons_section = "Runtime lessons:\n" + "\n".join(lesson_lines) + "\n"
     behavior_section = _behavior_profile_section(context)
     waf_knowledge_section = _waf_knowledge_section(context)
+    effective_constraints_section = _effective_constraints_section(context, waf=waf)
 
     context_summary = {
         "source": context.source,
@@ -631,7 +676,7 @@ Requirements:
 
 DOM runtime:
 {json.dumps(dom_runtime, indent=2)}
-{waf_line}{behavior_section}{waf_knowledge_section}{lessons_section}{findings_section}{seed_section}Context summary:
+{waf_line}{behavior_section}{waf_knowledge_section}{effective_constraints_section}{lessons_section}{findings_section}{seed_section}Context summary:
 {json.dumps(context_summary, indent=2)}""".strip()
 
 
@@ -657,6 +702,7 @@ def _document_write_prompt_for_cloud(
             lessons_section = "Runtime lessons:\n" + "\n".join(lesson_lines) + "\n"
     behavior_section = _behavior_profile_section(context)
     waf_knowledge_section = _waf_knowledge_section(context)
+    effective_constraints_section = _effective_constraints_section(context, waf=waf)
 
     targeted_examples = [
         {
@@ -729,7 +775,7 @@ Document.write subcontext:
 {json.dumps(subcontext, indent=2)}
 Recommended payload families:
 {recommended}
-{waf_line}{behavior_section}{waf_knowledge_section}{lessons_section}Targeted examples:
+{waf_line}{behavior_section}{waf_knowledge_section}{effective_constraints_section}{lessons_section}Targeted examples:
 {json.dumps(targeted_examples, indent=2)}
 Context summary:
 {json.dumps(context_summary, indent=2)}""".strip()

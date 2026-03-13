@@ -1,7 +1,10 @@
 from __future__ import annotations
 
-import os
+import hashlib
 import re
+import shutil
+import subprocess
+import tempfile
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -15,6 +18,7 @@ _TEXT_EXTENSIONS = {
 }
 _MAX_FILES = 120
 _MAX_BYTES_PER_FILE = 256 * 1024
+_REMOTE_CACHE_ROOT = Path(tempfile.gettempdir()) / "axss_waf_sources"
 
 
 def _iter_text_files(root: Path) -> list[Path]:
@@ -108,12 +112,43 @@ def _first_int_match(text: str, patterns: list[tuple[str, int]]) -> int:
     return detected
 
 
+def _is_remote_source(source_path: str) -> bool:
+    source = source_path.strip()
+    return source.startswith(("http://", "https://", "git@")) or source.endswith(".git")
+
+
+def _materialize_source_path(source_path: str) -> tuple[Path, str]:
+    if not _is_remote_source(source_path):
+        root = Path(source_path).expanduser().resolve()
+        if not root.exists():
+            raise FileNotFoundError(f"WAF source path does not exist: {source_path}")
+        return root, "local_repo"
+
+    git_path = shutil.which("git")
+    if not git_path:
+        raise RuntimeError(
+            "git is required to use a remote --waf-source repository URL. "
+            "Install git or provide a local cloned path instead."
+        )
+
+    _REMOTE_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+    cache_key = hashlib.sha256(source_path.encode("utf-8")).hexdigest()[:16]
+    clone_dir = _REMOTE_CACHE_ROOT / cache_key
+
+    if not clone_dir.exists():
+        subprocess.run(
+            [git_path, "clone", "--depth", "1", source_path, str(clone_dir)],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+    return clone_dir.resolve(), "remote_git_clone"
+
+
 def analyze_waf_source(source_path: str) -> WafKnowledgeProfile:
-    if str(source_path).startswith(("http://", "https://", "git@")):
-        raise ValueError("Remote WAF source ingestion is not implemented yet. Use a local path.")
-    root = Path(source_path).expanduser().resolve()
-    if not root.exists():
-        raise FileNotFoundError(f"WAF source path does not exist: {source_path}")
+    root, source_type = _materialize_source_path(source_path)
 
     files = _iter_text_files(root)
     if not files:
@@ -210,7 +245,7 @@ def analyze_waf_source(source_path: str) -> WafKnowledgeProfile:
         notes.append("Matching appears to include parser/token-aware logic, not only regex signatures.")
 
     return WafKnowledgeProfile(
-        source_type="local_repo",
+        source_type=source_type,
         source_ref=str(root),
         engine_name=engine_name,
         confidence=round(confidence, 2),

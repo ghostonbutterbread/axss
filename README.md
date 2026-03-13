@@ -315,6 +315,10 @@ axss -u "https://target.com" --active --waf cloudflare
 axss -u "https://target.com" --active \
      --waf-source ~/src/coreruleset
 
+# Or point directly at a Git repo URL (axss clones it locally first)
+axss -u "https://target.com" --active \
+     --waf-source https://github.com/coreruleset/coreruleset.git
+
 # Deeper crawl (default depth is 2)
 axss -u "https://target.com" --active --depth 3
 
@@ -461,7 +465,7 @@ axss --help
 | `--timeout N` | 300 | Per-URL worker timeout in seconds |
 | `--attempts N` | 1 | Cloud reasoning rounds per execution context before deterministic fallback |
 | `--waf NAME` | auto | Set WAF context (auto-detected if omitted) |
-| `--waf-source PATH` | — | Analyze a local open-source WAF/filter codebase and inject a compact knowledge profile into model reasoning. Manual local paths only; remote repo discovery is future work |
+| `--waf-source PATH` | — | Analyze an open-source WAF/filter codebase and inject a compact knowledge profile into model reasoning. Accepts a local path or Git repo URL; remote sources are cloned locally first |
 | `--header 'Name: Value'` | — | Add a request header (repeatable) |
 | `--cookies FILE` | — | Load session cookies from Netscape cookies.txt |
 | `-m, --model MODEL` | config | Override local Ollama model |

@@ -226,9 +226,9 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
         "--waf-source",
         metavar="PATH",
         help=(
-            "--waf-source PATH  Analyze a local open-source WAF/filter codebase and add a compact "
-            "knowledge profile to model reasoning. Use a local directory or file path; remote repo "
-            "ingestion is a future feature."
+            "--waf-source PATH  Analyze an open-source WAF/filter codebase and add a compact "
+            "knowledge profile to model reasoning. Accepts a local directory/file path or a Git "
+            "repository URL (cloned locally first)."
         ),
     )
 

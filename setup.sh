@@ -271,6 +271,10 @@ KEYS
 }
 
 find_python
+if ! have_cmd git; then
+  echo "Warning: git is not installed; remote --waf-source repository URLs will be unavailable." >&2
+  echo "Install it with your package manager (e.g. apt install git, brew install git)." >&2
+fi
 echo "Detected RAM: $(ram_summary)"
 echo "Detected GPU: $(gpu_summary)"
 select_model_profile
