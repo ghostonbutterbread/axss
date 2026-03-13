@@ -465,6 +465,15 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--keep-searching",
+        action="store_true",
+        default=False,
+        help=(
+            "--keep-searching  After the first confirmed hit on a context, keep searching for "
+            "additional distinct exploit classes within a bounded per-context budget."
+        ),
+    )
+    parser.add_argument(
         "--no-crawl",
         action="store_true",
         default=False,
@@ -1133,6 +1142,8 @@ def _run_active_scan(
         info(f"Active scan auth profile: {auth_profile_ref}")
     if getattr(args, "extreme", False):
         info("Active scan profile: extreme")
+    if getattr(args, "keep_searching", False):
+        info("Post-confirmation mode: keep searching for distinct variants")
     if getattr(args, "waf_source", None):
         info(f"WAF source knowledge: {args.waf_source}")
         if waf_knowledge:
@@ -1172,6 +1183,8 @@ def _run_active_scan(
         cli_model=ai_config.cli_model,
         cloud_attempts=getattr(args, "attempts", 1),
         waf_source=getattr(args, "waf_source", None),
+        keep_searching=getattr(args, "keep_searching", False),
+        extreme=getattr(args, "extreme", False),
     )
 
     results = run_active_scan(
@@ -1187,6 +1200,7 @@ def _run_active_scan(
         f"model={scan_config.model} | waf={waf or 'none'} | "
         f"cloud_attempts={scan_config.cloud_attempts}"
         + (" | profile=extreme" if getattr(args, "extreme", False) else "")
+        + (" | keep_searching=true" if getattr(args, "keep_searching", False) else "")
         + (f" | waf_source={Path(args.waf_source).name}" if getattr(args, "waf_source", None) else "")
     )
     auth_summary = auth_profile_ref or ("ad hoc headers/cookies" if auth_headers else "none")

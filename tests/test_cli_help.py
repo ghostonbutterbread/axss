@@ -25,6 +25,7 @@ class CliHelpTest(unittest.TestCase):
         self.assertIn("--merge-batch", help_text)
         self.assertIn("--attempts N", help_text)
         self.assertIn("--extreme", help_text)
+        self.assertIn("--keep-searching", help_text)
         self.assertIn("--waf-source PATH", help_text)
         self.assertIn("--memory-list", help_text)
         self.assertIn("--memory-stats", help_text)

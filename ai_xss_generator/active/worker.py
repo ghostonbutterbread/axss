@@ -28,11 +28,30 @@ if TYPE_CHECKING:
     import multiprocessing
     from ai_xss_generator.types import PostFormTarget, UploadTarget
 
+from ai_xss_generator.findings import infer_bypass_family
+
 log = logging.getLogger(__name__)
 
 _ACTIVE_LOCAL_MODEL_TIMEOUT_SECONDS = 60
 _ACTIVE_CLOUD_GRACE_SECONDS = 60
 _DOM_CLOUD_START_AFTER_SECONDS = 30
+
+
+def _keep_searching_hit_cap(enabled: bool, extreme: bool) -> int:
+    if not enabled:
+        return 1
+    return 5 if extreme else 3
+
+
+def _finding_variant_key(finding: "ConfirmedFinding") -> str:
+    family = finding.bypass_family or infer_bypass_family(finding.payload, [])
+    return "|".join([
+        finding.context_type,
+        finding.sink_context,
+        finding.execution_method,
+        family,
+        finding.payload,
+    ])
 
 
 def active_worker_timeout_budget(
@@ -103,6 +122,7 @@ class ConfirmedFinding:
     """JS call stack or script location where the sink was reached (DOM XSS only)."""
     ai_engine: str = ""
     ai_note: str = ""
+    bypass_family: str = ""
 
 
 @dataclass
@@ -567,6 +587,8 @@ def run_worker(
     cli_model: str | None = None,
     cloud_attempts: int = 1,
     waf_source: str | None = None,
+    keep_searching: bool = False,
+    extreme: bool = False,
 ) -> None:
     """Target function for multiprocessing.Process.
 
@@ -602,6 +624,8 @@ def run_worker(
             cli_model=cli_model,
             cloud_attempts=cloud_attempts,
             waf_source=waf_source,
+            keep_searching=keep_searching,
+            extreme=extreme,
         )
     except Exception as exc:
         log.exception("Worker crashed for %s", url)
@@ -630,6 +654,8 @@ def _run(
     cli_model: str | None = None,
     cloud_attempts: int = 1,
     waf_source: str | None = None,
+    keep_searching: bool = False,
+    extreme: bool = False,
 ) -> None:
     deadline = start_time + active_worker_timeout_budget(
         timeout_seconds,
@@ -638,6 +664,7 @@ def _run(
         cloud_attempts=cloud_attempts,
     )
     local_model_timeout_seconds = _ACTIVE_LOCAL_MODEL_TIMEOUT_SECONDS
+    context_hit_cap = _keep_searching_hit_cap(keep_searching, extreme)
 
     def _timed_out() -> bool:
         return time.monotonic() > deadline
@@ -844,15 +871,22 @@ def _run(
                 )
                 _append_reason(escalation_reasons, escalation_policy.note)
                 cloud_plan = CloudPayloadPlan()
-                # Track confirmation per context — a confirmed finding on one
-                # param must not suppress escalation on a different param.
-                context_confirmed = False
+                context_done = False
+                context_variant_keys: set[str] = set()
+
+                def _record_context_finding(finding: ConfirmedFinding) -> bool:
+                    key = _finding_variant_key(finding)
+                    if key in context_variant_keys:
+                        return False
+                    context_variant_keys.add(key)
+                    confirmed_findings.append(finding)
+                    return True
 
                 # Ask the local model first using the enriched target context.
                 # Only AI-origin payloads are returned here; heuristic payloads
                 # still exist in generate_payloads() but stay out of active
                 # execution so deterministic fallback remains explicit.
-                if escalation_policy.use_local and not context_confirmed and not _timed_out():
+                if escalation_policy.use_local and not context_done and not _timed_out():
                     local_model_rounds += 1
                     local_payloads = _get_local_payloads(
                         url=url,
@@ -893,13 +927,13 @@ def _run(
                                 cloud_escalated=False,
                                 ai_note=escalation_policy.note,
                             )
-                            confirmed_findings.append(finding)
-                            context_confirmed = True
-                            break
+                            if _record_context_finding(finding) and len(context_variant_keys) >= context_hit_cap:
+                                context_done = True
+                                break
 
                 # If the local model misses, try the cloud model before giving
                 # up on dynamic reasoning for this reflection context.
-                if not context_confirmed and use_cloud and not _timed_out():
+                if not context_done and use_cloud and not _timed_out():
                     # Each unique (endpoint + param + waf + char profile + context)
                     # combination gets exactly one cloud call.
                     surviving_chars = frozenset().union(
@@ -976,12 +1010,12 @@ def _run(
                                         ),
                                     ),
                                 )
-                                confirmed_findings.append(finding)
-                                context_confirmed = True
-                                break
+                                if _record_context_finding(finding) and len(context_variant_keys) >= context_hit_cap:
+                                    context_done = True
+                                    break
                             failed_results.append(result)
 
-                        if context_confirmed or attempt_number >= max(1, cloud_attempts):
+                        if context_done or attempt_number >= max(1, cloud_attempts):
                             break
 
                         cloud_feedback_lessons = _build_cloud_feedback_lessons(
@@ -997,7 +1031,7 @@ def _run(
                             observation=_summarize_failed_execution_results(failed_results),
                         )
 
-                if not context_confirmed and waf_hint and not _timed_out():
+                if not context_done and waf_hint and not _timed_out():
                     waf_payloads = _waf_reference_payloads(waf_hint, context_probe_result, limit=4)
                     if waf_payloads:
                         fallback_rounds += 1
@@ -1029,13 +1063,13 @@ def _run(
                                 cloud_escalated=cloud_escalated,
                                 ai_note=f"Bounded {waf_hint} WAF-specific fallback candidate confirmed execution.",
                             )
-                            confirmed_findings.append(finding)
-                            context_confirmed = True
-                            break
+                            if _record_context_finding(finding) and len(context_variant_keys) >= context_hit_cap:
+                                context_done = True
+                                break
 
                 # Deterministic transforms are now a fallback stage instead of
                 # the primary search strategy.
-                if not context_confirmed and not _timed_out():
+                if not context_done and not _timed_out():
                     fallback_rounds += 1
                     for variant in variants:
                         if _timed_out():
@@ -1065,9 +1099,9 @@ def _run(
                                     cloud_plan.note if use_cloud else "",
                                 ),
                             )
-                            confirmed_findings.append(finding)
-                            context_confirmed = True
-                            break
+                            if _record_context_finding(finding) and len(context_variant_keys) >= context_hit_cap:
+                                context_done = True
+                                break
 
         if not confirmed_findings and not _timed_out():
             for attempt in coordinated_attempts:
@@ -1152,6 +1186,7 @@ def _make_finding(
         cloud_escalated=cloud_escalated,
         ai_engine=ai_engine,
         ai_note=ai_note,
+        bypass_family=infer_bypass_family(result.payload, []),
     )
 
 
@@ -1185,6 +1220,7 @@ def _make_coordinated_finding(
         fired_url=result.fired_url,
         source="phase1_transform",
         cloud_escalated=False,
+        bypass_family=infer_bypass_family(payload_summary, []),
     )
 
 
@@ -1685,6 +1721,8 @@ def run_dom_worker(
     cli_model: str | None = None,
     cloud_attempts: int = 1,
     waf_source: str | None = None,
+    keep_searching: bool = False,
+    extreme: bool = False,
 ) -> None:
     """Worker entry point for DOM XSS runtime scanning.
 
@@ -1715,6 +1753,8 @@ def run_dom_worker(
             cli_model=cli_model,
             cloud_attempts=cloud_attempts,
             waf_source=waf_source,
+            keep_searching=keep_searching,
+            extreme=extreme,
         )
     except Exception as exc:
         log.exception("DOM worker crashed for %s", url)
@@ -1738,6 +1778,8 @@ def _run_dom(
     cli_model: str | None = None,
     cloud_attempts: int = 1,
     waf_source: str | None = None,
+    keep_searching: bool = False,
+    extreme: bool = False,
 ) -> None:
     from playwright.sync_api import sync_playwright
     from ai_xss_generator.active.dom_xss import (
@@ -1761,6 +1803,7 @@ def _run_dom(
     # Cap per-navigation timeout to 15 s regardless of the overall worker timeout
     nav_timeout_ms = min(timeout_seconds * 1_000, 15_000)
     local_model_timeout_seconds = _ACTIVE_LOCAL_MODEL_TIMEOUT_SECONDS
+    context_hit_cap = _keep_searching_hit_cap(keep_searching, extreme)
     _cached_context: Any = None
     try:
         _cached_context = _parse_target(
@@ -2403,6 +2446,8 @@ def run_post_worker(
     cli_model: str | None = None,
     cloud_attempts: int = 1,
     waf_source: str | None = None,
+    keep_searching: bool = False,
+    extreme: bool = False,
 ) -> None:
     """Worker entry point for POST form targets. Mirrors run_worker() for GET URLs."""
     start_time = time.monotonic()
@@ -2433,6 +2478,8 @@ def run_post_worker(
             cli_model=cli_model,
             cloud_attempts=cloud_attempts,
             waf_source=waf_source,
+            keep_searching=keep_searching,
+            extreme=extreme,
         )
     except Exception as exc:
         log.exception("POST worker crashed for %s", post_form.action_url)
@@ -2463,6 +2510,8 @@ def _run_post(
     cli_model: str | None = None,
     cloud_attempts: int = 1,
     waf_source: str | None = None,
+    keep_searching: bool = False,
+    extreme: bool = False,
 ) -> None:
     from ai_xss_generator.probe import probe_post_form
     from ai_xss_generator.active.executor import ActiveExecutor
@@ -2476,6 +2525,7 @@ def _run_post(
         cloud_attempts=cloud_attempts,
     )
     local_model_timeout_seconds = _ACTIVE_LOCAL_MODEL_TIMEOUT_SECONDS
+    context_hit_cap = _keep_searching_hit_cap(keep_searching, extreme)
 
     def _timed_out() -> bool:
         return time.monotonic() > deadline
@@ -2642,9 +2692,18 @@ def _run_post(
                 )
                 _append_reason(escalation_reasons, escalation_policy.note)
                 cloud_plan = CloudPayloadPlan()
-                context_confirmed = False
+                context_done = False
+                context_variant_keys: set[str] = set()
 
-                if escalation_policy.use_local and not context_confirmed and not _timed_out():
+                def _record_context_finding(finding: ConfirmedFinding) -> bool:
+                    key = _finding_variant_key(finding)
+                    if key in context_variant_keys:
+                        return False
+                    context_variant_keys.add(key)
+                    confirmed_findings.append(finding)
+                    return True
+
+                if escalation_policy.use_local and not context_done and not _timed_out():
                     local_model_rounds += 1
                     local_payloads = _get_local_payloads(
                         url=post_form.source_page_url,
@@ -2687,11 +2746,11 @@ def _run_post(
                                 cloud_escalated=False,
                                 ai_note=escalation_policy.note,
                             )
-                            confirmed_findings.append(finding)
-                            context_confirmed = True
-                            break
+                            if _record_context_finding(finding) and len(context_variant_keys) >= context_hit_cap:
+                                context_done = True
+                                break
 
-                if not context_confirmed and use_cloud and not _timed_out():
+                if not context_done and use_cloud and not _timed_out():
                     surviving_chars = frozenset().union(
                         *(ctx.surviving_chars for ctx in context_probe_result.reflections)
                     )
@@ -2768,12 +2827,12 @@ def _run_post(
                                         ),
                                     ),
                                 )
-                                confirmed_findings.append(finding)
-                                context_confirmed = True
-                                break
+                                if _record_context_finding(finding) and len(context_variant_keys) >= context_hit_cap:
+                                    context_done = True
+                                    break
                             failed_results.append(result)
 
-                        if context_confirmed or attempt_number >= max(1, cloud_attempts):
+                        if context_done or attempt_number >= max(1, cloud_attempts):
                             break
 
                         cloud_feedback_lessons = _build_cloud_feedback_lessons(
@@ -2789,7 +2848,7 @@ def _run_post(
                             observation=_summarize_failed_execution_results(failed_results),
                         )
 
-                if not context_confirmed and waf_hint and not _timed_out():
+                if not context_done and waf_hint and not _timed_out():
                     waf_payloads = _waf_reference_payloads(waf_hint, context_probe_result, limit=4)
                     if waf_payloads:
                         fallback_rounds += 1
@@ -2823,11 +2882,11 @@ def _run_post(
                                 cloud_escalated=cloud_escalated,
                                 ai_note=f"Bounded {waf_hint} WAF-specific fallback candidate confirmed execution.",
                             )
-                            confirmed_findings.append(finding)
-                            context_confirmed = True
-                            break
+                            if _record_context_finding(finding) and len(context_variant_keys) >= context_hit_cap:
+                                context_done = True
+                                break
 
-                if not context_confirmed and not _timed_out():
+                if not context_done and not _timed_out():
                     fallback_rounds += 1
                     for variant in variants:
                         if _timed_out():
@@ -2859,9 +2918,9 @@ def _run_post(
                                     cloud_plan.note if use_cloud else "",
                                 ),
                             )
-                            confirmed_findings.append(finding)
-                            context_confirmed = True
-                            break
+                            if _record_context_finding(finding) and len(context_variant_keys) >= context_hit_cap:
+                                context_done = True
+                                break
 
     finally:
         executor.stop()

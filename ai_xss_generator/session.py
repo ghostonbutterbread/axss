@@ -117,6 +117,7 @@ def _finding_to_dict(f: "ConfirmedFinding") -> dict:
         "fired_url": f.fired_url,
         "source": f.source,
         "cloud_escalated": f.cloud_escalated,
+        "bypass_family": getattr(f, "bypass_family", ""),
     }
 
 
@@ -136,6 +137,7 @@ def _dict_to_finding(d: dict) -> "ConfirmedFinding":
         fired_url=d["fired_url"],
         source=d["source"],
         cloud_escalated=d.get("cloud_escalated", False),
+        bypass_family=d.get("bypass_family", ""),
     )
 
 

@@ -237,6 +237,87 @@ def test_get_worker_retries_cloud_with_feedback_before_fallback():
     assert "Cloud attempt 2/2." in results[0].confirmed_findings[0].ai_note
 
 
+def test_get_worker_keep_searching_collects_multiple_distinct_local_variants():
+    url = "https://example.test/search?q=x"
+    probe_result = ProbeResult(
+        param_name="q",
+        original_value="x",
+        reflections=[
+            ReflectionContext(context_type="html_body", surviving_chars=frozenset({"<", ">"})),
+        ],
+    )
+
+    results: list[WorkerResult] = []
+    fire_calls: list[str] = []
+
+    class FakeExecutor:
+        def __init__(self, auth_headers=None) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            pass
+
+        def fire(self, **kwargs):
+            fire_calls.append(kwargs["payload"])
+            return SimpleNamespace(
+                confirmed=kwargs["payload"] in {"<img src=x onerror=alert(1)>", "<svg onload=alert(1)>"},
+                method="dialog",
+                detail="alert fired",
+                transform_name=kwargs["transform_name"],
+                payload=kwargs["payload"],
+                fired_url=kwargs["url"],
+                error=None,
+            )
+
+    with (
+        patch("ai_xss_generator.probe.probe_url", return_value=[probe_result]),
+        patch("ai_xss_generator.parser.parse_target", return_value=_fake_context(url)),
+        patch("scrapling.fetchers.FetcherSession", _FakeFetcherSession),
+        patch("ai_xss_generator.active.executor.ActiveExecutor", FakeExecutor),
+        patch(
+            "ai_xss_generator.active.transforms.all_variants_for_probe",
+            return_value=[("q", "html_body", [TransformVariant("raw", "fallback-html")])],
+        ),
+        patch(
+            "ai_xss_generator.active.worker._get_local_payloads",
+            return_value=["<img src=x onerror=alert(1)>", "<svg onload=alert(1)>"],
+        ),
+        patch("ai_xss_generator.active.worker._get_cloud_payloads", return_value=[]),
+    ):
+        _run(
+            url=url,
+            rate=25.0,
+            waf_hint=None,
+            model="qwen3.5",
+            cloud_model="anthropic/claude-3-5-sonnet",
+            use_cloud=False,
+            timeout_seconds=30,
+            result_queue=None,
+            dedup_registry={},
+            dedup_lock=threading.Lock(),
+            findings_lock=threading.Lock(),
+            start_time=time.monotonic(),
+            put_result=results.append,
+            auth_headers=None,
+            sink_url=None,
+            ai_backend="api",
+            cli_tool="claude",
+            cli_model=None,
+            keep_searching=True,
+        )
+
+    assert fire_calls == ["<img src=x onerror=alert(1)>", "<svg onload=alert(1)>", "fallback-html"]
+    assert results and results[0].status == "confirmed"
+    assert len(results[0].confirmed_findings) == 2
+    assert {f.payload for f in results[0].confirmed_findings} == {
+        "<img src=x onerror=alert(1)>",
+        "<svg onload=alert(1)>",
+    }
+
+
 def test_get_worker_uses_deterministic_fallback_only_after_local_and_cloud_fail():
     url = "https://example.test/search?q=x"
     probe_result = ProbeResult(
