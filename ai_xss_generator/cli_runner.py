@@ -166,6 +166,7 @@ def _codex_output_schema() -> dict[str, object]:
                         "test_vector",
                         "tags",
                         "target_sink",
+                        "strategy",
                         "bypass_family",
                         "risk_score",
                     ],
