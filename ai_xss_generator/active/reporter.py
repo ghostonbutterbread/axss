@@ -56,10 +56,16 @@ def _build_report(results: Sequence[WorkerResult], config_summary: str) -> str:
     error_results     = [r for r in results if r.status == "error"]
 
     all_findings: list[ConfirmedFinding] = [
-        f for r in confirmed_results for f in r.confirmed_findings
+        f
+        for r in confirmed_results
+        for f in r.confirmed_findings
+        if f.execution_method != "dom_taint"
     ]
     taint_findings: list[ConfirmedFinding] = [
-        f for r in taint_results for f in r.confirmed_findings
+        f
+        for r in (*confirmed_results, *taint_results)
+        for f in r.confirmed_findings
+        if f.execution_method == "dom_taint"
     ]
 
     domains = sorted({urllib.parse.urlparse(r.url).netloc for r in results if r.url})

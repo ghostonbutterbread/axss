@@ -248,6 +248,14 @@ def _make_canary() -> str:
     return "axss" + secrets.token_hex(4)
 
 
+def _canary_variants(canary: str) -> list[str]:
+    variants = [canary]
+    for variant in (canary.upper(), canary.lower()):
+        if variant not in variants:
+            variants.append(variant)
+    return variants
+
+
 def _inside_inert_tag(before: str) -> bool:
     """Return True if *before* ends inside a non-executable tag's content.
 
@@ -361,25 +369,50 @@ def _classify_context_at(html: str, idx: int, canary: str) -> ReflectionContext 
 
 def _find_reflections(html: str, canary: str) -> list[ReflectionContext]:
     """Find all positions of *canary* in *html* and classify each injection context."""
-    contexts: list[ReflectionContext] = []
-    seen: set[str] = set()
-    pos = 0
-    while True:
-        idx = html.find(canary, pos)
-        if idx == -1:
-            break
-        pos = idx + 1
-        ctx = _classify_context_at(html, idx, canary)
-        if ctx and ctx.context_type not in seen:
-            contexts.append(ctx)
-            seen.add(ctx.context_type)
-    return contexts
+    indexed_contexts: list[tuple[int, ReflectionContext]] = []
+    seen_contexts: set[str] = set()
+    seen_positions: set[int] = set()
+    for variant in _canary_variants(canary):
+        pos = 0
+        while True:
+            idx = html.find(variant, pos)
+            if idx == -1:
+                break
+            pos = idx + 1
+            if idx in seen_positions:
+                continue
+            seen_positions.add(idx)
+            ctx = _classify_context_at(html, idx, variant)
+            if ctx and ctx.context_type not in seen_contexts:
+                indexed_contexts.append((idx, ctx))
+                seen_contexts.add(ctx.context_type)
+    indexed_contexts.sort(key=lambda item: item[0])
+    return [ctx for _, ctx in indexed_contexts]
+
+
+def _reflection_transform(html: str, canary: str) -> str:
+    variants = _canary_variants(canary)
+    if html.find(variants[0]) != -1:
+        return "exact"
+    for variant in variants[1:]:
+        if html.find(variant) != -1:
+            if variant == canary.upper():
+                return "upper"
+            if variant == canary.lower():
+                return "lower"
+            return "variant"
+    return ""
 
 
 def _analyze_char_survival(html: str, canary: str) -> frozenset[str]:
     """Return the set of probe chars that appeared unmodified in the response."""
-    open_marker = canary + _PROBE_OPEN
-    pos = html.find(open_marker)
+    open_marker = ""
+    pos = -1
+    for variant in _canary_variants(canary):
+        open_marker = variant + _PROBE_OPEN
+        pos = html.find(open_marker)
+        if pos != -1:
+            break
     if pos == -1:
         return frozenset()
     start = pos + len(open_marker)
@@ -546,7 +579,9 @@ def _probe_param(
     except Exception as exc:
         return ProbeResult(param_name=param_name, original_value=original_value, error=str(exc))
 
-    reflections = _find_reflections(_resp_html(resp1), canary)
+    html1 = _resp_html(resp1)
+    reflections = _find_reflections(html1, canary)
+    reflection_transform = _reflection_transform(html1, canary)
     if not reflections:
         # --sink-url: check user-specified sink page for GET-based stored XSS.
         # Session cookies carry the injected canary across requests.
@@ -554,7 +589,8 @@ def _probe_param(
             try:
                 _wait()
                 _sink_resp = _session_get(session, sink_url, {"headers": {"User-Agent": next(ua_cycle)}})
-                _sink_refs = _find_reflections(_resp_html(_sink_resp), canary)
+                _sink_html = _resp_html(_sink_resp)
+                _sink_refs = _find_reflections(_sink_html, canary)
                 if _sink_refs:
                     _char_probe = canary + _PROBE_OPEN + PROBE_CHARS + _PROBE_CLOSE
                     _char_url = _rebuild_url(url, {**all_params, param_name: _char_probe})
@@ -563,6 +599,8 @@ def _probe_param(
                     _wait()
                     _sink_resp2 = _session_get(session, sink_url, {"headers": {"User-Agent": next(ua_cycle)}})
                     _surviving = _analyze_char_survival(_resp_html(_sink_resp2), canary)
+                    if _reflection_transform(_sink_html, canary) == "upper":
+                        _surviving = _surviving.union(frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZ"))
                     log.debug(
                         "probe_url: canary found in sink_url %s for param %s",
                         sink_url, param_name,
@@ -591,6 +629,8 @@ def _probe_param(
     try:
         resp2 = _session_get(session, _rebuild_url(url, {**all_params, param_name: char_probe}), req_kwargs)
         surviving = _analyze_char_survival(_resp_html(resp2), canary)
+        if reflection_transform == "upper":
+            surviving = surviving.union(frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZ"))
     except Exception:
         surviving = frozenset()
 
@@ -645,7 +685,9 @@ def _probe_param_playwright(
     except Exception as exc:
         return ProbeResult(param_name=param_name, original_value=original_value, error=str(exc))
 
-    reflections = _find_reflections(_resp_html(resp1), canary)
+    html1 = _resp_html(resp1)
+    reflections = _find_reflections(html1, canary)
+    reflection_transform = _reflection_transform(html1, canary)
     if not reflections:
         return ProbeResult(param_name=param_name, original_value=original_value)
 
@@ -658,6 +700,8 @@ def _probe_param_playwright(
             _rebuild_url(url, {**all_params, param_name: char_probe}), **fetch_kwargs
         )
         surviving = _analyze_char_survival(_resp_html(resp2), canary)
+        if reflection_transform == "upper":
+            surviving = surviving.union(frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZ"))
     except Exception:
         surviving = frozenset()
 

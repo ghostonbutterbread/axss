@@ -113,6 +113,7 @@ class ActiveExecutor:
         all_params: dict[str, str],
         transform_name: str,
         sink_url: str | None = None,
+        payload_overrides: dict[str, str] | None = None,
     ) -> ExecutionResult:
         """Navigate to *url* with *payload* injected into *param_name*.
 
@@ -133,7 +134,13 @@ class ActiveExecutor:
                 error="Executor not started",
             )
 
-        fired_url = _build_url(url, param_name, payload, all_params)
+        fired_url = _build_url(
+            url,
+            param_name,
+            payload,
+            all_params,
+            payload_overrides=payload_overrides,
+        )
 
         confirmed = False
         method = ""
@@ -419,9 +426,17 @@ class ActiveExecutor:
         )
 
 
-def _build_url(url: str, param_name: str, payload: str, all_params: dict[str, str]) -> str:
+def _build_url(
+    url: str,
+    param_name: str,
+    payload: str,
+    all_params: dict[str, str],
+    payload_overrides: dict[str, str] | None = None,
+) -> str:
     """Return *url* with *param_name* replaced by *payload*, others preserved."""
     parsed = urllib.parse.urlparse(url)
     params = {**all_params, param_name: payload}
+    if payload_overrides:
+        params.update(payload_overrides)
     new_query = urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
     return urllib.parse.urlunparse(parsed._replace(query=new_query))
