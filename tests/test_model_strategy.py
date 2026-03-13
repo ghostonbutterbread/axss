@@ -94,6 +94,7 @@ def test_cloud_feedback_lessons_include_strategy_shift_constraints() -> None:
     assert "plain_javascript_uri" in metadata["failed_families"]
     assert any("Do not repeat plain javascript: URIs" in item for item in metadata["strategy_constraints"])
     assert any("fragment-only delivery" in item for item in metadata["delivery_constraints"])
+    assert "query" in metadata["attempted_delivery_modes"]
 
 
 def test_cloud_prompt_includes_structured_execution_feedback_profile() -> None:
@@ -124,6 +125,7 @@ def test_cloud_prompt_includes_structured_execution_feedback_profile() -> None:
     assert "EXECUTION FEEDBACK PROFILE" in prompt
     assert '"failed_families": [' in prompt
     assert '"plain_javascript_uri"' in prompt
+    assert '"attempted_delivery_modes": [' in prompt
     assert '"required_strategy_shifts": [' in prompt
     assert '"required_delivery_shifts": [' in prompt
     assert '"creative_techniques": [' in prompt

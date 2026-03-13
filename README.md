@@ -343,6 +343,9 @@ axss -u "https://target.com/account" --active \
 
 # Multiple workers for faster scanning
 axss -u "https://target.com" --active --workers 4 --timeout 120
+
+# More aggressive active profile for deeper model retries
+axss -u "https://target.com" --active --extreme
 ```
 
 ### Active scan — SPA / Angular / React / Vue target
@@ -464,6 +467,7 @@ axss --help
 | `--workers N` | 1 | Parallel active-scan worker processes |
 | `--timeout N` | 300 | Per-URL worker timeout in seconds |
 | `--attempts N` | 1 | Cloud reasoning rounds per execution context before deterministic fallback |
+| `--extreme` | off | More aggressive active-scan profile. Raises cloud reasoning rounds and timeout defaults when you did not override them explicitly |
 | `--waf NAME` | auto | Set WAF context (auto-detected if omitted) |
 | `--waf-source PATH` | — | Analyze an open-source WAF/filter codebase and inject a compact knowledge profile into model reasoning. Accepts a local path or Git repo URL; remote sources are cloned locally first |
 | `--header 'Name: Value'` | — | Add a request header (repeatable) |

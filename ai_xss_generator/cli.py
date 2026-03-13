@@ -455,6 +455,16 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--extreme",
+        action="store_true",
+        default=False,
+        help=(
+            "--extreme  Use a more aggressive active-scan profile. "
+            "Raises cloud reasoning rounds and timeout defaults for deeper, slower scans. "
+            "Only changes values you did not override explicitly."
+        ),
+    )
+    parser.add_argument(
         "--no-crawl",
         action="store_true",
         default=False,
@@ -1121,6 +1131,8 @@ def _run_active_scan(
         info(f"Sink URL: {sink_url} (checking this page after each injection)")
     if auth_profile_ref:
         info(f"Active scan auth profile: {auth_profile_ref}")
+    if getattr(args, "extreme", False):
+        info("Active scan profile: extreme")
     if getattr(args, "waf_source", None):
         info(f"WAF source knowledge: {args.waf_source}")
         if waf_knowledge:
@@ -1174,6 +1186,7 @@ def _run_active_scan(
         f"rate={args.rate:g} req/s | workers={scan_config.workers} | "
         f"model={scan_config.model} | waf={waf or 'none'} | "
         f"cloud_attempts={scan_config.cloud_attempts}"
+        + (" | profile=extreme" if getattr(args, "extreme", False) else "")
         + (f" | waf_source={Path(args.waf_source).name}" if getattr(args, "waf_source", None) else "")
     )
     auth_summary = auth_profile_ref or ("ad hoc headers/cookies" if auth_headers else "none")
@@ -1282,6 +1295,11 @@ def main(argv: list[str] | None = None) -> int:
     config = load_config()
     parser = build_parser(config.default_model)
     args = parser.parse_args(argv)
+    if getattr(args, "extreme", False):
+        if getattr(args, "attempts", 1) == 1:
+            args.attempts = 3
+        if getattr(args, "timeout", 300) == 300:
+            args.timeout = 600
     if getattr(args, "attempts", 1) < 1:
         parser.error("--attempts must be >= 1")
 

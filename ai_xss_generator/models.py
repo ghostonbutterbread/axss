@@ -185,6 +185,7 @@ def _effective_constraints_section(
     failed_families: list[str] = []
     strategy_shifts: list[str] = []
     delivery_shifts: list[str] = []
+    attempted_delivery_modes: list[str] = []
     creative_techniques: list[str] = []
 
     if past_lessons:
@@ -204,6 +205,10 @@ def _effective_constraints_section(
                 shift_text = str(shift or "").strip()
                 if shift_text and shift_text not in delivery_shifts:
                     delivery_shifts.append(shift_text)
+            for mode in metadata.get("attempted_delivery_modes", []) or []:
+                mode_text = str(mode or "").strip()
+                if mode_text and mode_text not in attempted_delivery_modes:
+                    attempted_delivery_modes.append(mode_text)
 
     if context_type == "html_attr_url":
         if "scheme_fragmentation" not in recommended_families:
@@ -241,6 +246,7 @@ def _effective_constraints_section(
         "observed_transforms": observed_transforms,
         "recommended_families": recommended_families[:5],
         "deprioritized_families": deprioritized_families[:5],
+        "attempted_delivery_modes": attempted_delivery_modes[:4],
         "required_strategy_shifts": strategy_shifts[:4],
         "required_delivery_shifts": delivery_shifts[:4],
         "creative_techniques": deduped_creative[:4],
@@ -255,6 +261,7 @@ def _execution_feedback_section(past_lessons: list[Any] | None) -> str:
     failed_families: list[str] = []
     strategy_constraints: list[str] = []
     delivery_constraints: list[str] = []
+    attempted_delivery_modes: list[str] = []
     duplicate_payloads: list[str] = []
     observations: list[str] = []
 
@@ -273,6 +280,7 @@ def _execution_feedback_section(past_lessons: list[Any] | None) -> str:
         _extend_unique(failed_families, metadata.get("failed_families", []) or [], 5)
         _extend_unique(strategy_constraints, metadata.get("strategy_constraints", []) or [], 5)
         _extend_unique(delivery_constraints, metadata.get("delivery_constraints", []) or [], 5)
+        _extend_unique(attempted_delivery_modes, metadata.get("attempted_delivery_modes", []) or [], 5)
         _extend_unique(duplicate_payloads, metadata.get("duplicate_payloads", []) or [], 4)
         observation = str(metadata.get("observation", "") or "").strip()
         if observation and observation not in observations:
@@ -280,13 +288,14 @@ def _execution_feedback_section(past_lessons: list[Any] | None) -> str:
         if len(observations) >= 2:
             break
 
-    if not any((failed_families, strategy_constraints, delivery_constraints, duplicate_payloads, observations)):
+    if not any((failed_families, strategy_constraints, delivery_constraints, attempted_delivery_modes, duplicate_payloads, observations)):
         return ""
 
     compact = {
         "failed_families": failed_families[:5],
         "strategy_shifts": strategy_constraints[:5],
         "delivery_shifts": delivery_constraints[:5],
+        "attempted_delivery_modes": attempted_delivery_modes[:5],
         "duplicate_payloads": duplicate_payloads[:4],
         "observations": observations[:2],
     }

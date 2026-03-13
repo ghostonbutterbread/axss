@@ -229,7 +229,7 @@ def _build_cloud_feedback_lessons(
     delivery_mode: str,
     context_type: str,
     sink_context: str,
-    payloads_tried: list[str],
+    payloads_tried: list[Any],
     duplicate_payloads: list[str] | None = None,
     observation: str = "",
 ) -> list[Any]:
@@ -244,12 +244,17 @@ def _build_cloud_feedback_lessons(
         duplicate_payloads=duplicate_payloads or [],
         observation=observation,
     )
+    attempted_delivery_modes = _infer_attempted_delivery_modes(
+        payloads_tried,
+        default_delivery_mode=delivery_mode,
+    )
     delivery_constraints = _infer_delivery_constraints(
         prompt_context=prompt_context,
         delivery_mode=delivery_mode,
         context_type=context_type,
         sink_context=sink_context,
         observation=observation,
+        attempted_delivery_modes=attempted_delivery_modes,
     )
 
     summary_parts = [
@@ -302,6 +307,7 @@ def _build_cloud_feedback_lessons(
                 "failed_families": failed_families,
                 "strategy_constraints": strategy_constraints[:4],
                 "delivery_constraints": delivery_constraints[:4],
+                "attempted_delivery_modes": attempted_delivery_modes[:4],
                 "observation": observation.strip(),
                 "duplicate_payloads": [payload for payload in (duplicate_payloads or []) if payload][:4],
             },
@@ -417,6 +423,7 @@ def _infer_delivery_constraints(
     context_type: str,
     sink_context: str,
     observation: str,
+    attempted_delivery_modes: list[str],
 ) -> list[str]:
     constraints: list[str] = []
     normalized_context = context_type.strip().lower()
@@ -438,6 +445,14 @@ def _infer_delivery_constraints(
         _add("Document.write contexts often reward fragment or same-page attribute pivots more than repeated query-only full-tag escapes.")
     if "no dialog" in lowered_observation or "no execution signal" in lowered_observation:
         _add("If the syntax family changed but nothing executed, also change the delivery path or state transition on the next attempt.")
+    if "fragment" in attempted_delivery_modes and "query" in attempted_delivery_modes:
+        _add("Both query and fragment delivery have already been exercised; consider coordinated multi-parameter or stateful follow-up delivery next.")
+    elif "query" in attempted_delivery_modes:
+        _add("Query-style delivery was already exercised; bias the next round toward fragment, multi-parameter, or stateful follow-up pivots.")
+    elif "fragment" in attempted_delivery_modes:
+        _add("Fragment delivery was already exercised; bias the next round toward query reshaping, multi-parameter delivery, or stateful follow-up pivots.")
+    if "multi_param" in attempted_delivery_modes:
+        _add("Multi-parameter delivery was already exercised; avoid repeating the same split and prefer a stateful or alternate-surface pivot next.")
 
     try:
         from ai_xss_generator.behavior import extract_behavior_profile
@@ -455,6 +470,39 @@ def _infer_delivery_constraints(
         _add("Keep delivery low-noise and compact; prefer one or two deliberate pivots over broad request churn.")
 
     return constraints[:4]
+
+
+def _infer_attempted_delivery_modes(
+    payloads_tried: list[Any],
+    *,
+    default_delivery_mode: str = "",
+) -> list[str]:
+    modes: list[str] = []
+
+    def _add(mode: str) -> None:
+        cleaned = mode.strip().lower()
+        if cleaned and cleaned not in modes:
+            modes.append(cleaned)
+
+    for payload in payloads_tried:
+        strategy = getattr(payload, "strategy", None)
+        if strategy is not None:
+            _add(str(getattr(strategy, "delivery_mode_hint", "") or ""))
+            _add(str(getattr(strategy, "coordination_hint", "") or ""))
+        test_vector = _payload_vector(payload)
+        if "#" in test_vector:
+            _add("fragment")
+        if "?" in test_vector:
+            _add("query")
+
+    if not modes and default_delivery_mode:
+        fallback_mode = default_delivery_mode.strip().lower()
+        if fallback_mode == "get":
+            _add("query")
+        elif fallback_mode:
+            _add(fallback_mode)
+
+    return modes[:4]
 
 
 # ---------------------------------------------------------------------------
