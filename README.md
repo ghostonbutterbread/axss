@@ -311,6 +311,10 @@ axss -u "https://target.com" --active \
 # Scan with explicit WAF context
 axss -u "https://target.com" --active --waf cloudflare
 
+# Add manual open-source WAF/filter knowledge as a planning prior
+axss -u "https://target.com" --active \
+     --waf-source ~/src/coreruleset
+
 # Deeper crawl (default depth is 2)
 axss -u "https://target.com" --active --depth 3
 
@@ -391,6 +395,10 @@ axss -u "https://target.com/search?q=test" --generate
 # Generate with specific WAF context
 axss -u "https://target.com/page?id=1" --generate --waf modsecurity
 
+# Add local open-source WAF/filter source as compact reasoning context
+axss -u "https://target.com/page?id=1" --generate \
+     --waf-source ~/src/modsecurity-rules
+
 # Generate from public payload database
 axss --public --waf cloudflare -o heat
 
@@ -453,6 +461,7 @@ axss --help
 | `--timeout N` | 300 | Per-URL worker timeout in seconds |
 | `--attempts N` | 1 | Cloud reasoning rounds per execution context before deterministic fallback |
 | `--waf NAME` | auto | Set WAF context (auto-detected if omitted) |
+| `--waf-source PATH` | — | Analyze a local open-source WAF/filter codebase and inject a compact knowledge profile into model reasoning. Manual local paths only; remote repo discovery is future work |
 | `--header 'Name: Value'` | — | Add a request header (repeatable) |
 | `--cookies FILE` | — | Load session cookies from Netscape cookies.txt |
 | `-m, --model MODEL` | config | Override local Ollama model |

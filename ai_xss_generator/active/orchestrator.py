@@ -67,6 +67,7 @@ class ActiveScanConfig:
     cli_tool: str = "claude"      # "claude" | "codex" (when ai_backend="cli")
     cli_model: str | None = None  # model passed to CLI (None = CLI default)
     cloud_attempts: int = 1       # recursive cloud reasoning rounds per context
+    waf_source: str | None = None # local path to open-source WAF/filter code for planning hints
 
 
 def _auto_workers(rate: float, explicit_workers: int) -> int:
@@ -381,6 +382,7 @@ def run_active_scan(
                                 "findings_lock": findings_lock,
                                 "auth_headers": config.auth_headers,
                                 "sink_url": config.sink_url,
+                                "waf_source": config.waf_source,
                                 **_cli_kwargs,
                             },
                             daemon=True,
@@ -401,6 +403,7 @@ def run_active_scan(
                                 "dedup_registry": dedup_registry,
                                 "dedup_lock": dedup_lock,
                                 "auth_headers": config.auth_headers,
+                                "waf_source": config.waf_source,
                                 **_cli_kwargs,
                             },
                             daemon=True,
@@ -440,6 +443,7 @@ def run_active_scan(
                                 "auth_headers": config.auth_headers,
                                 "crawled_pages": crawled_pages_list,
                                 "sink_url": config.sink_url,
+                                "waf_source": config.waf_source,
                                 **_cli_kwargs,
                             },
                             daemon=True,

@@ -52,6 +52,7 @@ class ParsedContext:
     notes: list[str] = field(default_factory=list)
     parser_plugins: list[str] = field(default_factory=list)
     auth_notes: list[str] = field(default_factory=list)
+    waf_knowledge: dict[str, Any] | None = None
     """Redacted notes about active authentication (e.g. 'Authorization header present').
     Never contains credential values — informational for the LLM prompt only."""
 
@@ -67,6 +68,24 @@ class StrategyProfile:
     session_hint: str = ""
     follow_up_hint: str = ""
     coordination_hint: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class WafKnowledgeProfile:
+    source_type: str = "local_repo"
+    source_ref: str = ""
+    engine_name: str = ""
+    confidence: float = 0.0
+    normalization: dict[str, Any] = field(default_factory=dict)
+    matching: dict[str, Any] = field(default_factory=dict)
+    likely_pressure_points: list[str] = field(default_factory=list)
+    likely_blind_spots: list[str] = field(default_factory=list)
+    preferred_strategies: list[str] = field(default_factory=list)
+    avoid_strategies: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

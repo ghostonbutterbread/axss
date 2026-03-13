@@ -222,6 +222,15 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
             "Loads WAF-specific bypass payloads and primes the model."
         ),
     )
+    parser.add_argument(
+        "--waf-source",
+        metavar="PATH",
+        help=(
+            "--waf-source PATH  Analyze a local open-source WAF/filter codebase and add a compact "
+            "knowledge profile to model reasoning. Use a local directory or file path; remote repo "
+            "ingestion is a future feature."
+        ),
+    )
 
     parser.add_argument(
         "-m",
@@ -705,6 +714,7 @@ def _make_live_callback(
 
 
 def _merge_contexts(contexts: list[ParsedContext], source: str) -> ParsedContext:
+    waf_knowledge = next((context.waf_knowledge for context in contexts if context.waf_knowledge), None)
     return ParsedContext(
         source=source,
         source_type="batch",
@@ -723,6 +733,7 @@ def _merge_contexts(contexts: list[ParsedContext], source: str) -> ParsedContext
             f"Merged {len(contexts)} URL contexts.",
             *list(dict.fromkeys(note for context in contexts for note in context.notes)),
         ],
+        waf_knowledge=waf_knowledge,
     )
 
 
@@ -760,6 +771,29 @@ def _build_result(
         context=context,
         payloads=payloads,
     )
+
+
+def _load_waf_knowledge_profile(waf_source: str | None, verbose: bool) -> dict | None:
+    if not waf_source:
+        return None
+    from ai_xss_generator.waf_knowledge import analyze_waf_source
+
+    step(f"Analyzing WAF source: {waf_source}")
+    profile = analyze_waf_source(waf_source)
+    success(
+        "WAF knowledge loaded: "
+        f"{profile.engine_name or 'unknown'}"
+        + (f" (confidence {profile.confidence:.2f})" if profile.confidence else "")
+    )
+    _vlog(f"WAF knowledge notes: {profile.notes}", enabled=verbose)
+    return profile.to_dict()
+
+
+def _attach_waf_knowledge_to_context(context: ParsedContext, waf_knowledge: dict | None) -> ParsedContext:
+    if not waf_knowledge:
+        return context
+    from ai_xss_generator.waf_knowledge import attach_waf_knowledge
+    return attach_waf_knowledge(context, waf_knowledge) or context
 
 
 def _print_single_result(result: GenerationResult, output_mode: str, top: int, waf: str | None = None) -> None:
@@ -906,6 +940,7 @@ def _run_active_scan(
     resolved_waf: str | None,
     auth_headers: dict[str, str] | None = None,
     auth_profile_ref: str = "",
+    waf_knowledge: dict | None = None,
     scan_reflected: bool = True,
     scan_stored: bool = True,
     scan_uploads: bool = True,
@@ -1086,6 +1121,10 @@ def _run_active_scan(
         info(f"Sink URL: {sink_url} (checking this page after each injection)")
     if auth_profile_ref:
         info(f"Active scan auth profile: {auth_profile_ref}")
+    if getattr(args, "waf_source", None):
+        info(f"WAF source knowledge: {args.waf_source}")
+        if waf_knowledge:
+            info(f"WAF source engine: {waf_knowledge.get('engine_name', 'unknown')}")
 
     # Session management: detect an existing in-progress/paused session for this
     # exact target + scan type combination; offer to resume or start fresh.
@@ -1120,6 +1159,7 @@ def _run_active_scan(
         cli_tool=ai_config.cli_tool,
         cli_model=ai_config.cli_model,
         cloud_attempts=getattr(args, "attempts", 1),
+        waf_source=getattr(args, "waf_source", None),
     )
 
     results = run_active_scan(
@@ -1134,6 +1174,7 @@ def _run_active_scan(
         f"rate={args.rate:g} req/s | workers={scan_config.workers} | "
         f"model={scan_config.model} | waf={waf or 'none'} | "
         f"cloud_attempts={scan_config.cloud_attempts}"
+        + (f" | waf_source={Path(args.waf_source).name}" if getattr(args, "waf_source", None) else "")
     )
     auth_summary = auth_profile_ref or ("ad hoc headers/cookies" if auth_headers else "none")
     report_path = write_report(
@@ -1415,6 +1456,7 @@ def main(argv: list[str] | None = None) -> int:
     cli_model = ai_config.cli_model
     registry = PluginRegistry()
     registry.load_from(Path(__file__).resolve().parent.parent)
+    waf_knowledge = _load_waf_knowledge_profile(getattr(args, "waf_source", None), args.verbose)
 
     # --- Interesting URL triage mode ---
     if args.interesting:
@@ -1503,6 +1545,7 @@ def main(argv: list[str] | None = None) -> int:
             args, config, resolved_waf,
             auth_headers=auth_headers,
             auth_profile_ref=auth_profile_ref,
+            waf_knowledge=waf_knowledge,
             scan_reflected=_want_reflected,
             scan_stored=_want_stored,
             scan_uploads=_want_uploads,
@@ -1542,6 +1585,8 @@ def main(argv: list[str] | None = None) -> int:
             contexts, errors = parse_targets(urls=urls, parser_plugins=registry.parsers, rate=args.rate, waf=resolved_waf, auth_headers=auth_headers or None)
         except Exception as exc:
             parser.error(str(exc))
+
+        contexts = [_attach_waf_knowledge_to_context(context, waf_knowledge) for context in contexts]
 
         if not contexts and errors:
             parser.error(errors[0].error)
@@ -1646,6 +1691,8 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         parser.error(str(exc))
 
+    context = _attach_waf_knowledge_to_context(context, waf_knowledge)
+
     # --- Active probing (default for live URLs with query params) ---
     probe_enabled = args.url and not args.no_probe and "?" in args.url
     if probe_enabled:
@@ -1676,7 +1723,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             info("Probing complete: all parameters were tracking/analytics noise — nothing to probe.")
 
-        context = enrich_context(context, probe_results)
+        context = _attach_waf_knowledge_to_context(enrich_context(context, probe_results), waf_knowledge)
 
     step(f"Generating payloads with {selected_model}...")
     if resolved_waf:

@@ -403,6 +403,7 @@ def run_worker(
     cli_tool: str = "claude",
     cli_model: str | None = None,
     cloud_attempts: int = 1,
+    waf_source: str | None = None,
 ) -> None:
     """Target function for multiprocessing.Process.
 
@@ -437,6 +438,7 @@ def run_worker(
             cli_tool=cli_tool,
             cli_model=cli_model,
             cloud_attempts=cloud_attempts,
+            waf_source=waf_source,
         )
     except Exception as exc:
         log.exception("Worker crashed for %s", url)
@@ -464,6 +466,7 @@ def _run(
     cli_tool: str = "claude",
     cli_model: str | None = None,
     cloud_attempts: int = 1,
+    waf_source: str | None = None,
 ) -> None:
     deadline = start_time + active_worker_timeout_budget(
         timeout_seconds,
@@ -538,6 +541,9 @@ def _run(
             url=url, html_value=None, waf=waf_hint, auth_headers=auth_headers,
             cached_html=_prefetched_html,
         )
+        if waf_source:
+            from ai_xss_generator.waf_knowledge import analyze_waf_source, attach_waf_knowledge
+            _cached_context = attach_waf_knowledge(_cached_context, analyze_waf_source(waf_source))
     except Exception as exc:
         log.debug("Pre-parse of %s failed (will retry per-param): %s", url, exc)
 
@@ -1514,6 +1520,7 @@ def run_dom_worker(
     cli_tool: str = "claude",
     cli_model: str | None = None,
     cloud_attempts: int = 1,
+    waf_source: str | None = None,
 ) -> None:
     """Worker entry point for DOM XSS runtime scanning.
 
@@ -1543,6 +1550,7 @@ def run_dom_worker(
             cli_tool=cli_tool,
             cli_model=cli_model,
             cloud_attempts=cloud_attempts,
+            waf_source=waf_source,
         )
     except Exception as exc:
         log.exception("DOM worker crashed for %s", url)
@@ -1565,6 +1573,7 @@ def _run_dom(
     cli_tool: str = "claude",
     cli_model: str | None = None,
     cloud_attempts: int = 1,
+    waf_source: str | None = None,
 ) -> None:
     from playwright.sync_api import sync_playwright
     from ai_xss_generator.active.dom_xss import (
@@ -1596,6 +1605,9 @@ def _run_dom(
             waf=waf_hint,
             auth_headers=auth_headers,
         )
+        if waf_source:
+            from ai_xss_generator.waf_knowledge import analyze_waf_source, attach_waf_knowledge
+            _cached_context = attach_waf_knowledge(_cached_context, analyze_waf_source(waf_source))
     except Exception as exc:
         log.debug("Pre-parse of DOM target %s failed: %s", url, exc)
 
@@ -2225,6 +2237,7 @@ def run_post_worker(
     cli_tool: str = "claude",
     cli_model: str | None = None,
     cloud_attempts: int = 1,
+    waf_source: str | None = None,
 ) -> None:
     """Worker entry point for POST form targets. Mirrors run_worker() for GET URLs."""
     start_time = time.monotonic()
@@ -2254,6 +2267,7 @@ def run_post_worker(
             cli_tool=cli_tool,
             cli_model=cli_model,
             cloud_attempts=cloud_attempts,
+            waf_source=waf_source,
         )
     except Exception as exc:
         log.exception("POST worker crashed for %s", post_form.action_url)
@@ -2283,6 +2297,7 @@ def _run_post(
     cli_tool: str = "claude",
     cli_model: str | None = None,
     cloud_attempts: int = 1,
+    waf_source: str | None = None,
 ) -> None:
     from ai_xss_generator.probe import probe_post_form
     from ai_xss_generator.active.executor import ActiveExecutor
@@ -2329,6 +2344,9 @@ def _run_post(
             waf=waf_hint,
             auth_headers=auth_headers,
         )
+        if waf_source:
+            from ai_xss_generator.waf_knowledge import analyze_waf_source, attach_waf_knowledge
+            _cached_context = attach_waf_knowledge(_cached_context, analyze_waf_source(waf_source))
     except Exception as exc:
         log.debug("Pre-parse of form source %s failed: %s", post_form.source_page_url, exc)
 

@@ -137,6 +137,28 @@ def _behavior_profile_section(context: ParsedContext) -> str:
     return "TARGET BEHAVIOR PROFILE:\n" + json.dumps(compact, indent=2) + "\n"
 
 
+def _waf_knowledge_section(context: ParsedContext) -> str:
+    profile = getattr(context, "waf_knowledge", None) or {}
+    if not profile:
+        return ""
+    compact = {
+        "engine_name": profile.get("engine_name", ""),
+        "confidence": profile.get("confidence", 0.0),
+        "normalization": profile.get("normalization", {}),
+        "matching": profile.get("matching", {}),
+        "likely_pressure_points": list(profile.get("likely_pressure_points", []) or [])[:5],
+        "likely_blind_spots": list(profile.get("likely_blind_spots", []) or [])[:5],
+        "preferred_strategies": list(profile.get("preferred_strategies", []) or [])[:5],
+        "avoid_strategies": list(profile.get("avoid_strategies", []) or [])[:5],
+        "notes": list(profile.get("notes", []) or [])[:4],
+    }
+    return (
+        "WAF SOURCE KNOWLEDGE (secondary to live observations — use as a prior, not ground truth):\n"
+        + json.dumps(compact, indent=2)
+        + "\n"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Prompt construction
 # ---------------------------------------------------------------------------
@@ -205,6 +227,7 @@ def _prompt_for_context(
     if past_lessons:
         lessons_section = lessons_prompt_section(past_lessons) + "\n"
     behavior_section = _behavior_profile_section(context)
+    waf_knowledge_section = _waf_knowledge_section(context)
 
     # ── Section 2b: Auth context ──────────────────────────────────────────────
     auth_section = ""
@@ -276,7 +299,7 @@ Requirements:
 - Prefer compact, self-contained payloads with no external dependencies.
 - Include a compact `strategy` object per payload so the scanner can reason about delivery shape, encoding style, and what to pivot to next if the attempt fails.
 
-{probe_section}{dom_section}{behavior_section}{lessons_section}{findings_section}{auth_section}{waf_section}{reference_section}Full parsed context:
+{probe_section}{dom_section}{behavior_section}{waf_knowledge_section}{lessons_section}{findings_section}{auth_section}{waf_section}{reference_section}Full parsed context:
 {context_blob}""".strip()
 
 
@@ -353,6 +376,7 @@ def _compact_dom_prompt_for_local(
         if lesson_lines:
             lessons_section = "Runtime lessons:\n" + "\n".join(lesson_lines) + "\n"
     behavior_section = _behavior_profile_section(context)
+    waf_knowledge_section = _waf_knowledge_section(context)
 
     context_summary = {
         "source": context.source,
@@ -404,7 +428,7 @@ Requirements:
 
 DOM runtime:
 {json.dumps(dom_runtime, indent=2)}
-{waf_line}{behavior_section}{lessons_section}{findings_section}Context summary:
+{waf_line}{behavior_section}{waf_knowledge_section}{lessons_section}{findings_section}Context summary:
 {json.dumps(context_summary, indent=2)}""".strip()
 
 
@@ -553,6 +577,7 @@ def _compact_dom_prompt_for_cloud(
         if lesson_lines:
             lessons_section = "Runtime lessons:\n" + "\n".join(lesson_lines) + "\n"
     behavior_section = _behavior_profile_section(context)
+    waf_knowledge_section = _waf_knowledge_section(context)
 
     context_summary = {
         "source": context.source,
@@ -606,7 +631,7 @@ Requirements:
 
 DOM runtime:
 {json.dumps(dom_runtime, indent=2)}
-{waf_line}{behavior_section}{lessons_section}{findings_section}{seed_section}Context summary:
+{waf_line}{behavior_section}{waf_knowledge_section}{lessons_section}{findings_section}{seed_section}Context summary:
 {json.dumps(context_summary, indent=2)}""".strip()
 
 
@@ -631,6 +656,7 @@ def _document_write_prompt_for_cloud(
         if lesson_lines:
             lessons_section = "Runtime lessons:\n" + "\n".join(lesson_lines) + "\n"
     behavior_section = _behavior_profile_section(context)
+    waf_knowledge_section = _waf_knowledge_section(context)
 
     targeted_examples = [
         {
@@ -703,7 +729,7 @@ Document.write subcontext:
 {json.dumps(subcontext, indent=2)}
 Recommended payload families:
 {recommended}
-{waf_line}{behavior_section}{lessons_section}Targeted examples:
+{waf_line}{behavior_section}{waf_knowledge_section}{lessons_section}Targeted examples:
 {json.dumps(targeted_examples, indent=2)}
 Context summary:
 {json.dumps(context_summary, indent=2)}""".strip()
