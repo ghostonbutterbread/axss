@@ -59,6 +59,19 @@ class ParsedContext:
 
 
 @dataclass(slots=True)
+class StrategyProfile:
+    attack_family: str = ""
+    delivery_mode_hint: str = ""
+    encoding_hint: str = ""
+    session_hint: str = ""
+    follow_up_hint: str = ""
+    coordination_hint: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
 class PayloadCandidate:
     payload: str
     title: str
@@ -67,8 +80,10 @@ class PayloadCandidate:
     tags: list[str] = field(default_factory=list)
     target_sink: str = ""
     framework_hint: str = ""
+    bypass_family: str = ""
     risk_score: int = 0
     source: str = "heuristic"
+    strategy: StrategyProfile | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

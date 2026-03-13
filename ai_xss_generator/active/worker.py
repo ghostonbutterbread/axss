@@ -221,6 +221,16 @@ def _build_cloud_feedback_lessons(
 ) -> list[Any]:
     from ai_xss_generator.lessons import Lesson
 
+    strategy_constraints = _infer_strategy_constraints(
+        prompt_context=prompt_context,
+        delivery_mode=delivery_mode,
+        context_type=context_type,
+        sink_context=sink_context,
+        payloads_tried=payloads_tried,
+        duplicate_payloads=duplicate_payloads or [],
+        observation=observation,
+    )
+
     summary_parts = [
         f"Cloud attempt {attempt_number}/{total_attempts} for {delivery_mode or 'active'} "
         f"{context_type or sink_context or 'xss'} did not confirm execution."
@@ -233,6 +243,10 @@ def _build_cloud_feedback_lessons(
         summary_parts.append(f"Repeated payloads to avoid: {_preview_payloads(duplicate_payloads)}.")
     if observation:
         summary_parts.append(observation.strip())
+    if strategy_constraints:
+        summary_parts.append(
+            "Strategy shifts for the next batch: " + " ".join(strategy_constraints)
+        )
     summary_parts.append("Return a materially different next batch and avoid near-duplicates.")
 
     return [
@@ -250,6 +264,75 @@ def _build_cloud_feedback_lessons(
             confidence=0.83,
         )
     ]
+
+
+def _infer_strategy_constraints(
+    *,
+    prompt_context: Any,
+    delivery_mode: str,
+    context_type: str,
+    sink_context: str,
+    payloads_tried: list[str],
+    duplicate_payloads: list[str],
+    observation: str,
+) -> list[str]:
+    constraints: list[str] = []
+    lowered_payloads = [payload.lower() for payload in payloads_tried if payload]
+    normalized_context = context_type.strip().lower()
+    normalized_sink = sink_context.strip().lower()
+
+    def _add(note: str) -> None:
+        cleaned = note.strip()
+        if cleaned and cleaned not in constraints:
+            constraints.append(cleaned)
+
+    if duplicate_payloads:
+        _add("Do not repeat prior payloads or trivial rewrites of them.")
+
+    if lowered_payloads and all("<" in payload and ">" in payload for payload in lowered_payloads):
+        _add("Shift away from full-tag injection and try quote closure, same-tag attribute pivots, or tagless execution paths.")
+
+    if normalized_context == "html_attr_url" and lowered_payloads and all("javascript:" in payload for payload in lowered_payloads):
+        _add("Do not repeat plain javascript: URIs; prefer entity-encoded, whitespace-broken, or alternate URL-handler pivots.")
+
+    if normalized_context.startswith("js_string_") and lowered_payloads and all("<script" in payload or "</script>" in payload for payload in lowered_payloads):
+        _add("Prefer in-string breakout payloads over raw HTML tag injection.")
+
+    if delivery_mode == "dom" and normalized_sink in {"document.write", "document.writeln"}:
+        _add("Prioritize same-tag attribute pivots, srcdoc pivots, and quote-closure payloads before full-tag escapes.")
+
+    if lowered_payloads and any("alert(" in payload for payload in lowered_payloads) and all("alert(" in payload for payload in lowered_payloads):
+        _add("Vary the execution primitive or wrapper so the next batch is materially different.")
+
+    try:
+        from ai_xss_generator.behavior import extract_behavior_profile
+
+        profile = extract_behavior_profile(prompt_context)
+    except Exception:
+        profile = {}
+
+    transforms = {
+        str(item).strip().lower()
+        for item in profile.get("reflection_transforms", []) or []
+        if str(item).strip()
+    }
+    probe_modes = {
+        str(item).strip().lower()
+        for item in profile.get("probe_modes", []) or []
+        if str(item).strip()
+    }
+    if "upper" in transforms:
+        _add("Reflection uppercases alphabetic characters; prefer numeric/entity-encoded alpha or case-insensitive payloads.")
+    if "stealth" in probe_modes:
+        _add("Keep the next batch compact and lower-noise; avoid broad noisy payload families.")
+
+    lowered_observation = observation.lower()
+    if "no dialog" in lowered_observation or "no execution signal" in lowered_observation:
+        _add("The previous batch produced no execution signal; switch attack families instead of minor rewrites.")
+    if "error" in lowered_observation:
+        _add("Treat runtime errors as a hint that the syntax shape was wrong; change syntax family rather than repeating the same wrapper.")
+
+    return constraints[:4]
 
 
 # ---------------------------------------------------------------------------

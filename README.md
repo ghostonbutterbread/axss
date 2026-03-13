@@ -42,8 +42,10 @@ Active scan flow (GET + POST + DOM)
   - GET / POST: per reflection context
   - DOM: per tainted source -> sink path
   - config-gated AI backend / tool / model selection
+  - per-payload strategy metadata: delivery, encoding, session, follow-up hint
   - local model first when worth the budget
   - cloud model if local is weak, skipped, or misses
+  - failed cloud rounds feed back tactic-shift constraints, not just "try more payloads"
   - optional recursive cloud rounds (`--attempts N`) with execution feedback
          |
          v
@@ -199,7 +201,8 @@ Two execution modes matter here:
    - Ask the local model per execution context only when the behavior policy says local is worth trying
    - GET / POST isolate one reflection context per model call; DOM isolates one tainted source -> sink path per model call
    - Escalate to cloud only if the local model misses, is skipped, or produces weak output
-   - If `--attempts N` is greater than `1`, each cloud round tests its payload batch and feeds the failure outcome into the next cloud prompt
+   - Model output now carries compact strategy metadata per payload (delivery hint, encoding hint, session hint, follow-up hint, coordination hint)
+   - If `--attempts N` is greater than `1`, each cloud round tests its payload batch and feeds the failure outcome plus tactic-shift constraints into the next cloud prompt
    - If model-driven payloads do not confirm execution, fall back to deterministic context-aware transforms
 
 2. **Payload generation only (`--generate`)**

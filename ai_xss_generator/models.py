@@ -23,7 +23,7 @@ from ai_xss_generator.findings import (
 from ai_xss_generator.learning import build_memory_profile
 from ai_xss_generator.lessons import lessons_prompt_section
 from ai_xss_generator.payloads import base_payloads_for_context, rank_payloads
-from ai_xss_generator.types import ParsedContext, PayloadCandidate
+from ai_xss_generator.types import ParsedContext, PayloadCandidate, StrategyProfile
 
 log = logging.getLogger(__name__)
 
@@ -61,6 +61,15 @@ MODEL_ALIASES = {
 # ---------------------------------------------------------------------------
 # Context extraction helpers
 # ---------------------------------------------------------------------------
+
+_STRATEGY_SCHEMA_BLOCK = """      "strategy": {
+        "attack_family": "short family label",
+        "delivery_mode_hint": "query | fragment | post | multi_param | same_page",
+        "encoding_hint": "raw | html_entity | url_encoded | mixed | whitespace_broken | quote_closure",
+        "session_hint": "same_page | navigate_then_fire | post_then_sink | authenticated_follow_up",
+        "follow_up_hint": "what to try next if this class misses",
+        "coordination_hint": "single_param | multi_param | fragment_only | same_tag_pivot"
+      },"""
 
 def _extract_probe_context(context: ParsedContext) -> tuple[str, str, str]:
     """Return (primary_sink_type, context_type, surviving_chars) from context.
@@ -252,6 +261,7 @@ Output schema:
       "test_vector": "exact delivery (e.g. ?param=...)",
       "tags": ["tag1", "tag2"],
       "target_sink": "sink name or empty",
+{_STRATEGY_SCHEMA_BLOCK}
       "bypass_family": "one of: {family_list}",
       "risk_score": 1-100
     }}
@@ -264,6 +274,7 @@ Requirements:
 - Generic payloads that ignore the probe results score low — be specific.
 - Include payloads from multiple bypass families that are plausible for this context.
 - Prefer compact, self-contained payloads with no external dependencies.
+- Include a compact `strategy` object per payload so the scanner can reason about delivery shape, encoding style, and what to pivot to next if the attempt fails.
 
 {probe_section}{dom_section}{behavior_section}{lessons_section}{findings_section}{auth_section}{waf_section}{reference_section}Full parsed context:
 {context_blob}""".strip()
@@ -369,7 +380,15 @@ Output schema:
     {{
       "payload": "string",
       "target_sink": "{sink or 'unknown'}",
-      "tags": ["short", "labels"]
+      "tags": ["short", "labels"],
+      "strategy": {{
+        "attack_family": "short family label",
+        "delivery_mode_hint": "query | fragment | post | same_page",
+        "encoding_hint": "raw | html_entity | url_encoded | mixed",
+        "session_hint": "same_page | navigate_then_fire | post_then_sink",
+        "follow_up_hint": "next tactic if this class misses",
+        "coordination_hint": "single_param | multi_param | fragment_only | same_tag_pivot"
+      }}
     }}
   ]
 }}
@@ -379,6 +398,7 @@ Requirements:
 - Solve the exact DOM source->sink path shown below.
 - Prefer fast, practical payloads over exhaustive coverage.
 - Avoid explanations, rankings, essays, or long reasoning.
+- Keep each `strategy` object short and actionable.
 - Sink profile: {profile_name}
 {rule_lines}
 
@@ -567,6 +587,7 @@ Output schema:
       "test_vector": "exact delivery string",
       "tags": ["tag1", "tag2"],
       "target_sink": "{sink or 'unknown'}",
+{_STRATEGY_SCHEMA_BLOCK}
       "bypass_family": "best-fit family",
       "risk_score": 1-100
     }}
@@ -579,6 +600,7 @@ Requirements:
 - Do not return an empty payload list.
 - Prefer materially distinct payload families over near-duplicates.
 - Keep payloads compact and execution-focused.
+- Use `strategy` to describe delivery shape and the next tactic to pivot to if the sink stays taint-only.
 - Sink profile: {profile_name}
 {rule_lines}
 
@@ -655,6 +677,7 @@ Output schema:
       "test_vector": "exact delivery string",
       "tags": ["tag1", "tag2"],
       "target_sink": "document.write",
+{_STRATEGY_SCHEMA_BLOCK}
       "bypass_family": "best-fit family",
       "risk_score": 1-100
     }}
@@ -672,6 +695,7 @@ Requirements:
   - 1 full tag breakout only if angle brackets might survive
 - Avoid safe parser probes and other non-executing markup.
 - Prefer materially distinct payload families over near-duplicates.
+- Use `strategy` to explain which attack family the payload belongs to and what family should be tried next if it does not execute.
 
 DOM runtime:
 {json.dumps(dom_runtime, indent=2)}
@@ -868,23 +892,44 @@ def _extract_json_blob(text: str) -> dict[str, Any]:
     return json.loads(text[start: end + 1])
 
 
+def _normalize_strategy(item: dict[str, Any]) -> StrategyProfile | None:
+    raw = item.get("strategy")
+    if not isinstance(raw, dict):
+        return None
+    strategy = StrategyProfile(
+        attack_family=str(raw.get("attack_family", "")).strip(),
+        delivery_mode_hint=str(raw.get("delivery_mode_hint", "")).strip(),
+        encoding_hint=str(raw.get("encoding_hint", "")).strip(),
+        session_hint=str(raw.get("session_hint", "")).strip(),
+        follow_up_hint=str(raw.get("follow_up_hint", "")).strip(),
+        coordination_hint=str(raw.get("coordination_hint", "")).strip(),
+    )
+    if not any(strategy.to_dict().values()):
+        return None
+    return strategy
+
+
 def _normalize_payloads(items: list[dict[str, Any]], source: str) -> list[PayloadCandidate]:
     normalized: list[PayloadCandidate] = []
     for item in items:
         payload = str(item.get("payload", "")).strip()
         if not payload:
             continue
+        tags = [str(tag) for tag in item.get("tags", []) if str(tag).strip()]
+        bypass_family = str(item.get("bypass_family", "")).strip() or infer_bypass_family(payload, tags)
         normalized.append(
             PayloadCandidate(
                 payload=payload,
                 title=str(item.get("title", "AI-generated payload")).strip() or "AI-generated payload",
                 explanation=str(item.get("explanation", "Tailored by model output.")).strip(),
                 test_vector=str(item.get("test_vector", "Inject into the highest-confidence sink.")).strip(),
-                tags=[str(tag) for tag in item.get("tags", []) if str(tag).strip()],
+                tags=tags,
                 target_sink=str(item.get("target_sink", "")).strip(),
                 framework_hint=str(item.get("framework_hint", "")).strip(),
+                bypass_family=bypass_family,
                 risk_score=int(item.get("risk_score", 0) or 0),
                 source=source,
+                strategy=_normalize_strategy(item),
             )
         )
     return normalized
