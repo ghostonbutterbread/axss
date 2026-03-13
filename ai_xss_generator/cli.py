@@ -340,6 +340,14 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
             "authenticated pages. e.g. --cookies cookies.txt"
         ),
     )
+    parser.add_argument(
+        "--profile",
+        metavar="PROGRAM/NAME",
+        help=(
+            "--profile PROGRAM/NAME  Use a saved auth profile for the scan. "
+            "Explicit --header/--cookies values override the profile on conflicts."
+        ),
+    )
 
     # ── Active scanner ────────────────────────────────────────────────────────
     parser.add_argument(
@@ -1217,6 +1225,11 @@ def _resolve_session(
 # ---------------------------------------------------------------------------
 
 def main(argv: list[str] | None = None) -> int:
+    argv = list(argv) if argv is not None else sys.argv[1:]
+    if argv and argv[0] == "auth":
+        from ai_xss_generator.auth_cli import handle_auth_command
+        return handle_auth_command(argv[1:])
+
     config = load_config()
     parser = build_parser(config.default_model)
     args = parser.parse_args(argv)
@@ -1317,15 +1330,38 @@ def main(argv: list[str] | None = None) -> int:
 
     # --- Build auth headers from --header / --cookies ---
     auth_headers: dict[str, str] = {}
-    if args.headers or args.cookies:
-        from ai_xss_generator.auth import build_auth_headers, describe_auth
+    if args.headers or args.cookies or args.profile:
+        from ai_xss_generator.auth import describe_auth
+        from ai_xss_generator.auth_profiles import (
+            merge_scan_auth_headers,
+            resolve_scan_profile,
+            touch_profile_last_used,
+        )
+
+        target_hint = str(args.url or "")
+        if not target_hint and args.urls:
+            try:
+                _targets = read_url_list(args.urls)
+                target_hint = _targets[0] if _targets else ""
+            except Exception:
+                target_hint = ""
+
         try:
-            auth_headers = build_auth_headers(
-                headers=args.headers or [],
+            selected_profile, profile_source = resolve_scan_profile(
+                explicit_profile=args.profile,
+                target_url=target_hint or None,
+            )
+            auth_headers = merge_scan_auth_headers(
+                profile=selected_profile,
+                extra_headers=args.headers or [],
                 cookies_path=args.cookies,
             )
         except ValueError as exc:
             parser.error(str(exc))
+
+        if selected_profile is not None and profile_source:
+            touch_profile_last_used(selected_profile.ref)
+            info(f"Auth profile: {selected_profile.ref} ({profile_source})")
         if auth_headers:
             _auth_desc = describe_auth(auth_headers)
             info("Auth: " + "; ".join(_auth_desc))

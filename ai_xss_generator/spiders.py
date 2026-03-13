@@ -184,11 +184,16 @@ def _build_result(url: str, response: Any, note: str = "Fetched with Scrapling."
     markup = extract_markup_from_response(response)
     if response.url != url:
         markup.notes.append(f"Final URL: {response.url}")
+    status_code = getattr(response, "status", None)
+    if status_code is None:
+        status_code = getattr(response, "status_code", None)
     html_text = response.text or response.body.decode("utf-8", errors="replace")
     return {
         "source": url,
         "source_type": "url",
         "html": html_text,
+        "status_code": status_code,
+        "final_url": str(getattr(response, "url", "") or url),
         "title": markup.title,
         "forms": markup.forms,
         "inputs": markup.inputs,
