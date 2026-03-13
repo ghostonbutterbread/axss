@@ -11,6 +11,7 @@ class CliHelpTest(unittest.TestCase):
         self.assertIn("-h, --help", help_text)
         self.assertIn("-u TARGET, --url TARGET", help_text)
         self.assertIn("--urls FILE", help_text)
+        self.assertIn("--interesting FILE", help_text)
         self.assertIn("-i FILE_OR_SNIPPET, --input FILE_OR_SNIPPET", help_text)
         self.assertIn("-l, --list-models", help_text)
         self.assertIn("-s QUERY, --search-models QUERY", help_text)

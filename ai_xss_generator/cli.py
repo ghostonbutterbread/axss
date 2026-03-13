@@ -111,6 +111,7 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
             "  axss --public --waf modsecurity -o list          (standalone — no target needed)\n"
             "  axss --public -o list                            (all public payloads)\n"
             "  axss --urls urls.txt -t 5 -o list\n"
+            "  axss --interesting urls.txt -o list\n"
             "  axss --urls urls.txt --merge-batch -o json -j result.json\n"
             f"  axss -u https://example.com -m {config_default_model} -o list -t 3\n"
             "  axss -v -i sample_target.html -o heat\n"
@@ -135,6 +136,15 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
         "--urls",
         metavar="FILE",
         help="--urls FILE (fetch one URL per line), e.g. --urls urls.txt",
+    )
+    action_group.add_argument(
+        "--interesting",
+        metavar="FILE",
+        help=(
+            "--interesting FILE  Use the configured AI backend to rank URLs from a file by how "
+            "promising they look for deeper XSS testing. Writes a markdown report and helps "
+            "narrow single-target runs."
+        ),
     )
     action_group.add_argument(
         "-i",
@@ -809,6 +819,33 @@ def _try_detect_waf(url: str, verbose: bool) -> str | None:
         return None
 
 
+def _print_interesting_results(results: list[object], output_mode: str, top: int) -> None:
+    if output_mode == "json":
+        import json as _json
+        print(_json.dumps([getattr(item, "to_dict")() for item in results[:top]], indent=2))
+        return
+
+    rows = []
+    for item in results[:top]:
+        rows.append({
+            "score": str(getattr(item, "score", "")),
+            "verdict": getattr(item, "verdict", ""),
+            "candidate_params": ",".join(getattr(item, "candidate_params", []) or []) or "-",
+            "likely_xss": ",".join(getattr(item, "likely_xss_types", []) or []) or "-",
+            "recommended_mode": getattr(item, "recommended_mode", "") or "-",
+            "url": getattr(item, "url", ""),
+        })
+    print(_render_table(rows))
+    print()
+    for item in results[:top]:
+        print(f"- {item.url}")
+        print(f"  score={item.score} verdict={item.verdict} engine={item.ai_engine or '-'}")
+        print(f"  reason: {item.reason or '-'}")
+        if getattr(item, "next_step", ""):
+            print(f"  next: {item.next_step}")
+        print()
+
+
 def _handle_public_payloads(
     fetch_result: FetchResult,
     output_mode: str,
@@ -1110,7 +1147,7 @@ def main(argv: list[str] | None = None) -> int:
     _set_verbose(verbose_level)
     _configure_logging(verbose_level)
 
-    has_target = bool(args.url or args.urls or args.input)
+    has_target = bool(args.url or args.urls or args.input or args.interesting)
     is_utility = (
         args.list_models or args.search_models or args.check_keys or args.clear_reports
         or args.memory_list or args.memory_stats
@@ -1121,7 +1158,7 @@ def main(argv: list[str] | None = None) -> int:
     if not has_target and not args.public and not is_utility:
         parser.error(
             "one of the arguments -u/--url --urls -i/--input -l/--list-models "
-            "-s/--search-models --check-keys --public --memory-list --memory-stats "
+            "--interesting -s/--search-models --check-keys --public --memory-list --memory-stats "
             "--memory-export --memory-import is required"
         )
 
@@ -1249,6 +1286,53 @@ def main(argv: list[str] | None = None) -> int:
     cli_model = ai_config.cli_model
     registry = PluginRegistry()
     registry.load_from(Path(__file__).resolve().parent.parent)
+
+    # --- Interesting URL triage mode ---
+    if args.interesting:
+        from ai_xss_generator.interesting import analyze_interesting_urls, write_interesting_report
+
+        step(f"Reading URL list: {args.interesting}")
+        try:
+            urls = read_url_list(args.interesting)
+        except Exception as exc:
+            parser.error(str(exc))
+
+        if ai_config.ai_backend == "api":
+            warn(
+                "Interesting-URL triage is using the API backend. This mode may issue multiple "
+                "paid model requests depending on how many URLs are in the file."
+            )
+
+        step(f"Ranking {len(urls)} URL(s) for deep XSS follow-up...")
+        try:
+            interesting_results = analyze_interesting_urls(
+                urls,
+                ai_config,
+                progress=lambda message: _vlog(message, enabled=args.verbose),
+            )
+        except Exception as exc:
+            parser.error(str(exc))
+
+        success(f"Interesting triage complete. {len(interesting_results)} URL(s) scored.")
+        print()
+        _print_interesting_results(interesting_results, args.output, args.top)
+
+        report_path = write_interesting_report(
+            interesting_results,
+            source_file=args.interesting,
+            ai_config=ai_config,
+        )
+        success(f"Report written to: {report_path}")
+
+        if args.json_out:
+            import json as _json
+
+            Path(args.json_out).write_text(
+                _json.dumps([item.to_dict() for item in interesting_results], indent=2),
+                encoding="utf-8",
+            )
+            success(f"JSON written to {args.json_out}")
+        return 0
 
     # --- Determine effective scan mode ---
     _want_generate  = getattr(args, "generate",  False)
