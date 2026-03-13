@@ -27,6 +27,7 @@ log = logging.getLogger(__name__)
 
 from scrapling.fetchers import FetcherSession
 
+from ai_xss_generator.browser_nav import goto_with_edge_recovery
 from ai_xss_generator.types import DomSink, ParsedContext, PayloadCandidate
 
 # curl error code for HTTP/2 stream reset — server/WAF rejected the connection
@@ -669,17 +670,13 @@ def _browser_context_auth(
 
 def _page_fetch_html(page: Any, url: str, timeout_ms: int = _BROWSER_PROBE_TIMEOUT_MS) -> str:
     """Navigate a Playwright page and return rendered HTML."""
-    nav_error: Exception | None = None
-    for wait_until, current_timeout in (
-        ("domcontentloaded", timeout_ms),
-        ("commit", min(timeout_ms, 10_000)),
-    ):
-        try:
-            page.goto(url, wait_until=wait_until, timeout=current_timeout)
-            break
-        except Exception as exc:
-            nav_error = exc
-    time.sleep(_BROWSER_PROBE_SETTLE_SECONDS)
+    ok, _phases, nav_error = goto_with_edge_recovery(
+        page,
+        url,
+        timeout_ms=timeout_ms,
+    )
+    if ok:
+        time.sleep(_BROWSER_PROBE_SETTLE_SECONDS)
     try:
         return page.content()
     except Exception:

@@ -265,6 +265,7 @@ def _format_finding(index: int, f: ConfirmedFinding) -> list[str]:
     is_dom = f.context_type == "dom_xss"
     source_label = {
         "phase1_transform": "Deterministic fallback transform",
+        "phase1_waf_fallback": "WAF-specific deterministic fallback",
         "local_model":      "Local AI model payload",
         "cloud_model":      "Cloud model payload (escalated)",
         "dom_xss_runtime":  "DOM XSS runtime sink hooking",
@@ -375,6 +376,7 @@ def _explain_why(f: ConfirmedFinding) -> str:
         "js_uri":           "`javascript:` URI scheme executed when injected into a URL-type attribute.",
         "autofocus":        "`onfocus` + `autofocus` attributes triggered execution without user interaction.",
         "details_toggle":   "`<details open ontoggle=...>` triggered execution on page load without clicks.",
+        "waf_payload":      "A bounded WAF-specific fallback candidate was executed before the generic transform layer.",
         "local_model":      "The local AI model generated a payload tailored to this exact context.",
         "cloud_model":      "The cloud AI model generated a targeted bypass after the local model could not produce a working payload.",
     }

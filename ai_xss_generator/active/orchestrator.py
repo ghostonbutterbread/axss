@@ -503,6 +503,7 @@ def _log_result(r: WorkerResult) -> None:
             source_label = {
                 "local_model": "local",
                 "cloud_model": "cloud",
+                "phase1_waf_fallback": "waf-fallback",
                 "phase1_transform": "fallback",
                 "dom_xss_runtime": "runtime",
             }.get(next(iter(sources)), "mixed")

@@ -15,6 +15,7 @@ import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any
 
+from ai_xss_generator.browser_nav import goto_with_edge_recovery, same_origin_root
 from ai_xss_generator.active.console_signals import (
     console_init_script,
     is_execution_console_text,
@@ -217,19 +218,24 @@ class ActiveExecutor:
             for preflight_url in plan.preflight_urls:
                 if confirmed:
                     break
-                try:
-                    page.goto(preflight_url, timeout=_NAV_TIMEOUT_MS, wait_until="domcontentloaded")
-                except Exception as nav_exc:
-                    log.debug("Preflight navigation error for %s: %s", preflight_url, nav_exc)
+                ok, phases, nav_exc = goto_with_edge_recovery(
+                    page,
+                    preflight_url,
+                    timeout_ms=_NAV_TIMEOUT_MS,
+                )
+                if not ok and nav_exc is not None:
+                    log.debug("Preflight navigation error for %s after %s: %s", preflight_url, phases, nav_exc)
 
             # Navigate — use domcontentloaded so we don't wait for all assets
-            try:
-                page.goto(fired_url, timeout=_NAV_TIMEOUT_MS, wait_until="domcontentloaded")
-            except Exception as nav_exc:
+            ok, phases, nav_exc = goto_with_edge_recovery(
+                page,
+                fired_url,
+                timeout_ms=_NAV_TIMEOUT_MS,
+            )
+            if not ok and nav_exc is not None and not confirmed:
                 # Navigation errors (timeout, net error) don't mean no execution —
                 # a dialog event may have already fired and been caught.
-                if not confirmed:
-                    log.debug("Navigation error for %s: %s", fired_url, nav_exc)
+                log.debug("Navigation error for %s after %s: %s", fired_url, phases, nav_exc)
 
             # --sink-url: navigate to the user-specified render page to catch
             # GET-based stored XSS where the payload shows up elsewhere.
@@ -239,10 +245,13 @@ class ActiveExecutor:
             for follow_up_url in follow_ups:
                 if confirmed:
                     break
-                try:
-                    page.goto(follow_up_url, timeout=_NAV_TIMEOUT_MS, wait_until="domcontentloaded")
-                except Exception as _nav_exc:
-                    log.debug("fire: follow-up nav error for %s: %s", follow_up_url, _nav_exc)
+                ok, phases, _nav_exc = goto_with_edge_recovery(
+                    page,
+                    follow_up_url,
+                    timeout_ms=_NAV_TIMEOUT_MS,
+                )
+                if not ok and _nav_exc is not None:
+                    log.debug("fire: follow-up nav error for %s after %s: %s", follow_up_url, phases, _nav_exc)
 
         except Exception as exc:
             return ExecutionResult(
@@ -364,10 +373,13 @@ class ActiveExecutor:
             page.on("request", _on_request)
 
             # Step 1: Load the form page (server fills in CSRF token automatically)
-            try:
-                page.goto(source_page_url, timeout=_NAV_TIMEOUT_MS, wait_until="domcontentloaded")
-            except Exception as nav_exc:
-                log.debug("fire_post: source page load error for %s: %s", source_page_url, nav_exc)
+            ok, phases, nav_exc = goto_with_edge_recovery(
+                page,
+                source_page_url,
+                timeout_ms=_NAV_TIMEOUT_MS,
+            )
+            if not ok and nav_exc is not None:
+                log.debug("fire_post: source page load error for %s after %s: %s", source_page_url, phases, nav_exc)
 
             plan = _build_post_delivery_plan(
                 source_page_url=source_page_url,
@@ -423,7 +435,7 @@ class ActiveExecutor:
             if not confirmed:
                 import urllib.parse as _up
                 _pp = _up.urlparse(source_page_url)
-                _origin_root = f"{_pp.scheme}://{_pp.netloc}/"
+                _origin_root = same_origin_root(source_page_url)
                 # sink_url (manually specified) is first — highest priority
                 _follow_ups = list(dict.fromkeys(
                     list(plan.follow_up_urls)
@@ -433,10 +445,13 @@ class ActiveExecutor:
                 for _fu in _follow_ups:
                     if confirmed:
                         break
-                    try:
-                        page.goto(_fu, timeout=_NAV_TIMEOUT_MS, wait_until="domcontentloaded")
-                    except Exception as _nav_exc:
-                        log.debug("fire_post: follow-up nav error for %s: %s", _fu, _nav_exc)
+                    ok, phases, _nav_exc = goto_with_edge_recovery(
+                        page,
+                        _fu,
+                        timeout_ms=_NAV_TIMEOUT_MS,
+                    )
+                    if not ok and _nav_exc is not None:
+                        log.debug("fire_post: follow-up nav error for %s after %s: %s", _fu, phases, _nav_exc)
 
         except Exception as exc:
             return ExecutionResult(
@@ -543,10 +558,13 @@ class ActiveExecutor:
 
             page.on("request", _on_request)
 
-            try:
-                page.goto(source_page_url, timeout=_NAV_TIMEOUT_MS, wait_until="domcontentloaded")
-            except Exception as nav_exc:
-                log.debug("fire_upload: source page load error for %s: %s", source_page_url, nav_exc)
+            ok, phases, nav_exc = goto_with_edge_recovery(
+                page,
+                source_page_url,
+                timeout_ms=_NAV_TIMEOUT_MS,
+            )
+            if not ok and nav_exc is not None:
+                log.debug("fire_upload: source page load error for %s after %s: %s", source_page_url, phases, nav_exc)
 
             for field_name, field_value in companion_overrides.items():
                 try:
@@ -587,7 +605,7 @@ class ActiveExecutor:
                 payload_submitted = False
 
             if not confirmed:
-                origin_root = _same_origin_root(source_page_url)
+                origin_root = same_origin_root(source_page_url)
                 follow_ups = list(dict.fromkeys(
                     ([sink_url] if sink_url else [])
                     + [source_page_url, action_url, origin_root]
@@ -595,10 +613,13 @@ class ActiveExecutor:
                 for follow_up_url in follow_ups:
                     if confirmed:
                         break
-                    try:
-                        page.goto(follow_up_url, timeout=_NAV_TIMEOUT_MS, wait_until="domcontentloaded")
-                    except Exception as nav_exc:
-                        log.debug("fire_upload: follow-up nav error for %s: %s", follow_up_url, nav_exc)
+                    ok, phases, nav_exc = goto_with_edge_recovery(
+                        page,
+                        follow_up_url,
+                        timeout_ms=_NAV_TIMEOUT_MS,
+                    )
+                    if not ok and nav_exc is not None:
+                        log.debug("fire_upload: follow-up nav error for %s after %s: %s", follow_up_url, phases, nav_exc)
 
         except Exception as exc:
             return ExecutionResult(
@@ -649,11 +670,6 @@ def _candidate_follow_up_target(url: str, payload_candidate: Any = None, sink_ur
         base = urllib.parse.urlparse(url)
         return urllib.parse.urlunparse(base._replace(path=follow_up_hint, query="", fragment=""))
     return ""
-
-
-def _same_origin_root(url: str) -> str:
-    parsed = urllib.parse.urlparse(url)
-    return urllib.parse.urlunparse(parsed._replace(path="/", query="", fragment=""))
 
 
 def _parse_test_vector(test_vector: str) -> tuple[dict[str, str], str]:
@@ -715,7 +731,7 @@ def _build_delivery_plan(
     preflight_urls: list[str] = []
     follow_up_urls: list[str] = []
     if session_hint in {"navigate_then_fire", "authenticated_follow_up"}:
-        preflight_urls.append(_same_origin_root(url))
+        preflight_urls.append(same_origin_root(url))
     if session_hint in {"authenticated_follow_up"}:
         follow_up = _candidate_follow_up_target(url, payload_candidate)
         if follow_up:

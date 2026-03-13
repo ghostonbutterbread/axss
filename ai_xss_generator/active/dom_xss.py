@@ -28,6 +28,7 @@ import os
 import urllib.parse
 from dataclasses import dataclass
 
+from ai_xss_generator.browser_nav import goto_with_edge_recovery
 from ai_xss_generator.console import debug as _debug
 from ai_xss_generator.active.console_signals import (
     console_init_script,
@@ -295,14 +296,19 @@ def attempt_dom_payloads(
             page.on("dialog", _on_dialog)
             page.on("console", _on_console)
 
-            try:
-                page.goto(payload_url, timeout=timeout_ms, wait_until="domcontentloaded")
-            except Exception:
-                pass
-            try:
-                page.wait_for_load_state("networkidle", timeout=_STABILIZE_TIMEOUT_MS)
-            except Exception:
-                pass
+            ok, phases, nav_exc = goto_with_edge_recovery(
+                page,
+                payload_url,
+                timeout_ms=timeout_ms,
+                stabilize_timeout_ms=_STABILIZE_TIMEOUT_MS,
+            )
+            if not ok and nav_exc is not None:
+                log.debug(
+                    "DOM payload nav error for %s after recovery %s: %s",
+                    payload_url,
+                    phases,
+                    nav_exc,
+                )
 
             if _confirmed:
                 return True, payload, _detail
@@ -368,16 +374,19 @@ def discover_dom_taint_paths(
             # sinks called during initial page evaluation.
             page.add_init_script(hook_js)
 
-            try:
-                page.goto(canary_url, timeout=timeout_ms, wait_until="domcontentloaded")
-            except Exception as nav_exc:
-                log.debug("Canary nav error for %s: %s", canary_url, nav_exc)
-
-            # Brief wait for SPA frameworks (Angular, React) to finish async init
-            try:
-                page.wait_for_load_state("networkidle", timeout=_STABILIZE_TIMEOUT_MS)
-            except Exception:
-                pass
+            ok, phases, nav_exc = goto_with_edge_recovery(
+                page,
+                canary_url,
+                timeout_ms=timeout_ms,
+                stabilize_timeout_ms=_STABILIZE_TIMEOUT_MS,
+            )
+            if not ok and nav_exc is not None:
+                log.debug(
+                    "Canary nav error for %s after recovery %s: %s",
+                    canary_url,
+                    phases,
+                    nav_exc,
+                )
 
             try:
                 hits: list[dict] = page.evaluate("window.__axss_dom_hits || []")

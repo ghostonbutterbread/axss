@@ -15,10 +15,11 @@ import hashlib
 import json
 import logging
 import queue
+import re
 import threading
 import time
 import urllib.parse
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from multiprocessing.managers import DictProxy
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -826,6 +827,42 @@ def _run(
                             observation=_summarize_failed_execution_results(failed_results),
                         )
 
+                if not context_confirmed and waf_hint and not _timed_out():
+                    waf_payloads = _waf_reference_payloads(waf_hint, context_probe_result, limit=4)
+                    if waf_payloads:
+                        fallback_rounds += 1
+                        _append_reason(
+                            escalation_reasons,
+                            f"Inserted bounded {waf_hint} WAF-specific fallback candidates before generic transforms.",
+                        )
+                    for wp in waf_payloads:
+                        if _timed_out():
+                            break
+                        total_transforms_tried += 1
+                        result = executor.fire(
+                            url=url,
+                            param_name=param_name,
+                            payload=_payload_text(wp),
+                            all_params=flat_params,
+                            transform_name="waf_payload",
+                            sink_url=sink_url,
+                            payload_candidate=wp,
+                        )
+                        if result.confirmed:
+                            finding = _make_finding(
+                                url=url,
+                                probe_result=context_probe_result,
+                                context_type=context_type,
+                                result=result,
+                                waf=waf_hint,
+                                source="phase1_waf_fallback",
+                                cloud_escalated=cloud_escalated,
+                                ai_note=f"Bounded {waf_hint} WAF-specific fallback candidate confirmed execution.",
+                            )
+                            confirmed_findings.append(finding)
+                            context_confirmed = True
+                            break
+
                 # Deterministic transforms are now a fallback stage instead of
                 # the primary search strategy.
                 if not context_confirmed and not _timed_out():
@@ -995,6 +1032,83 @@ def _probe_result_for_context(probe_result: Any, context_type: str) -> Any:
         reflections=reflections,
         error=getattr(probe_result, "error", None),
     )
+
+
+def _payload_matches_context(payload: str, context_type: str, attr_name: str = "") -> bool:
+    lowered = payload.lower()
+    has_markup = any(token in lowered for token in ("<", "&#60;", "\\u003c", "%3c"))
+    has_uri = any(token in lowered for token in ("javascript:", "data:", "srcdoc", "java\t", "java\r", "java&#9;", "jav&#x0a;"))
+    has_js = any(token in lowered for token in ("alert", "confirm", "constructor", "eval", "prompt"))
+    normalized_context = context_type.strip().lower()
+    normalized_attr = attr_name.strip().lower()
+
+    if normalized_context in {"html_body", "html_comment"}:
+        return has_markup
+    if normalized_context == "html_attr_url":
+        if normalized_attr == "srcdoc":
+            return has_markup or "srcdoc" in lowered
+        return has_uri and not has_markup
+    if normalized_context == "html_attr_value":
+        return has_markup or lowered.startswith(("'", "\"")) or any(token in lowered for token in ("onfocus", "onload", "ontoggle", "onerror"))
+    if normalized_context == "html_attr_event":
+        return has_js and not has_markup
+    if normalized_context.startswith("js_") or normalized_context == "json_value":
+        return has_js and not has_markup
+    return True
+
+
+def _coerce_waf_payload_for_context(candidate: Any, context_type: str, attr_name: str = "") -> Any:
+    payload = _payload_text(candidate).strip()
+    normalized_context = context_type.strip().lower()
+    normalized_attr = attr_name.strip().lower()
+
+    if normalized_context == "html_attr_url" and payload and "<" in payload:
+        if normalized_attr == "srcdoc":
+            match = re.search(r"srcdoc\s*=\s*['\"]([^'\"]+)['\"]", payload, flags=re.IGNORECASE)
+            if match:
+                return replace(candidate, payload=match.group(1))
+            return candidate
+
+        match = re.search(
+            r"(?:href|src|action|formaction|data)\s*=\s*['\"]?([^'\"\s>]+(?:[^'\">]*[^'\"\s>])?)",
+            payload,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            return replace(candidate, payload=match.group(1))
+    return candidate
+
+
+def _waf_reference_payloads(
+    waf: str | None,
+    probe_result: Any,
+    *,
+    limit: int = 6,
+) -> list[Any]:
+    if not waf:
+        return []
+    try:
+        from ai_xss_generator.public_payloads import _waf_candidates
+    except Exception:
+        return []
+
+    reflections = list(getattr(probe_result, "reflections", []) or [])
+    context_type = str(getattr(reflections[0], "context_type", "") or "") if reflections else ""
+    attr_name = str(getattr(reflections[0], "attr_name", "") or "") if reflections else ""
+    seen: set[str] = set()
+    selected: list[Any] = []
+    for candidate in _waf_candidates(waf):
+        candidate = _coerce_waf_payload_for_context(candidate, context_type, attr_name)
+        payload = _payload_text(candidate).strip()
+        if not payload or payload in seen:
+            continue
+        if not _payload_matches_context(payload, context_type, attr_name):
+            continue
+        seen.add(payload)
+        selected.append(candidate)
+        if len(selected) >= limit:
+            break
+    return selected
 
 
 def _get_local_payloads(
@@ -2047,6 +2161,7 @@ def _get_cloud_payloads(
             base_context = parse_target(url=url, html_value=None, waf=waf, auth_headers=auth_headers)
 
         context = enrich_context(base_context, [probe_result])
+        reference_payloads = _waf_reference_payloads(waf, probe_result)
         memory_profile = build_memory_profile(
             context=context,
             waf_name=waf,
@@ -2056,6 +2171,7 @@ def _get_cloud_payloads(
             context=context,
             cloud_model=cloud_model,
             waf=waf,
+            reference_payloads=reference_payloads,
             past_lessons=_join_lessons(session_lessons, feedback_lessons),
             ai_backend=ai_backend,
             cli_tool=cli_tool,
@@ -2488,6 +2604,44 @@ def _run_post(
                             duplicate_payloads=duplicate_payloads,
                             observation=_summarize_failed_execution_results(failed_results),
                         )
+
+                if not context_confirmed and waf_hint and not _timed_out():
+                    waf_payloads = _waf_reference_payloads(waf_hint, context_probe_result, limit=4)
+                    if waf_payloads:
+                        fallback_rounds += 1
+                        _append_reason(
+                            escalation_reasons,
+                            f"Inserted bounded {waf_hint} WAF-specific fallback candidates before generic transforms.",
+                        )
+                    for wp in waf_payloads:
+                        if _timed_out():
+                            break
+                        total_transforms_tried += 1
+                        result = executor.fire_post(
+                            source_page_url=post_form.source_page_url,
+                            action_url=post_form.action_url,
+                            param_name=param_name,
+                            payload=_payload_text(wp),
+                            all_param_names=post_form.param_names,
+                            csrf_field=post_form.csrf_field,
+                            transform_name="waf_payload",
+                            sink_url=sink_url,
+                            payload_candidate=wp,
+                        )
+                        if result.confirmed:
+                            finding = _make_finding(
+                                url=post_form.action_url,
+                                probe_result=context_probe_result,
+                                context_type=context_type,
+                                result=result,
+                                waf=waf_hint,
+                                source="phase1_waf_fallback",
+                                cloud_escalated=cloud_escalated,
+                                ai_note=f"Bounded {waf_hint} WAF-specific fallback candidate confirmed execution.",
+                            )
+                            confirmed_findings.append(finding)
+                            context_confirmed = True
+                            break
 
                 if not context_confirmed and not _timed_out():
                     fallback_rounds += 1

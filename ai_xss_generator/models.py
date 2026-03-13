@@ -1315,6 +1315,7 @@ def generate_cloud_payloads(
     context: "ParsedContext",
     cloud_model: str,
     waf: str | None = None,
+    reference_payloads: list[Any] | None = None,
     past_findings: "list[Finding] | None" = None,
     past_lessons: "list[Any] | None" = None,
     ai_backend: str = "api",
@@ -1352,7 +1353,7 @@ def generate_cloud_payloads(
     payloads, engine = _try_cloud(
         context=context,
         cloud_model=cloud_model,
-        reference_payloads=None,
+        reference_payloads=reference_payloads,
         waf=waf,
         past_findings=past_findings,
         past_lessons=past_lessons,
