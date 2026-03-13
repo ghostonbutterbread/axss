@@ -1289,16 +1289,51 @@ def _make_coordinated_finding(
 
 def _probe_result_for_context(probe_result: Any, context_type: str) -> Any:
     """Return a lightweight probe result containing only one reflection context."""
+    from ai_xss_generator.types import DomSink
+
     reflections = [
         ctx for ctx in getattr(probe_result, "reflections", [])
         if getattr(ctx, "context_type", "") == context_type
     ]
     if not reflections:
         reflections = list(getattr(probe_result, "reflections", []))
+
+    param_name = getattr(probe_result, "param_name", "")
+
+    def _to_sinks() -> list[DomSink]:
+        sinks: list[DomSink] = []
+        for ctx in reflections:
+            sink_name = f"probe:{getattr(ctx, 'context_type', '')}"
+            attr_name = str(getattr(ctx, "attr_name", "") or "")
+            if attr_name:
+                sink_name += f":{attr_name}"
+            surviving_chars = getattr(ctx, "surviving_chars", frozenset()) or frozenset()
+            chars_note = f" surviving={sorted(surviving_chars)!r}" if surviving_chars else ""
+            short_label = str(getattr(ctx, "short_label", getattr(ctx, "context_type", "")))
+            sinks.append(
+                DomSink(
+                    sink=sink_name,
+                    source=f"param={param_name!r} confirmed via active probe → {short_label}{chars_note}",
+                    location=f"active_probe:param:{param_name}",
+                    confidence=0.99 if surviving_chars else 0.88,
+                )
+            )
+        return sinks
+
     return SimpleNamespace(
-        param_name=getattr(probe_result, "param_name", ""),
+        param_name=param_name,
         original_value=getattr(probe_result, "original_value", ""),
         reflections=reflections,
+        is_reflected=bool(reflections) and not getattr(probe_result, "error", None),
+        is_injectable=bool(reflections) and any(
+            bool(getattr(ctx, "surviving_chars", frozenset()) or frozenset())
+            for ctx in reflections
+        ),
+        discovery_style=getattr(probe_result, "discovery_style", ""),
+        reflection_transform=getattr(probe_result, "reflection_transform", ""),
+        probe_mode=getattr(probe_result, "probe_mode", ""),
+        tested_chars=getattr(probe_result, "tested_chars", ""),
+        to_sinks=_to_sinks,
         error=getattr(probe_result, "error", None),
     )
 

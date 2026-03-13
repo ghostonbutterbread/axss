@@ -73,6 +73,53 @@ def test_build_delivery_plan_adds_preflight_for_navigate_then_fire() -> None:
     assert plan.preflight_urls == ["https://example.test/"]
 
 
+def test_build_delivery_plan_honors_test_vector_path_override() -> None:
+    candidate = PayloadCandidate(
+        payload="payload",
+        title="path override",
+        explanation="",
+        test_vector="/account/profile?view=full#frag",
+        strategy=StrategyProfile(delivery_mode_hint="query"),
+    )
+
+    plan = _build_delivery_plan(
+        url="https://example.test/search?q=x",
+        param_name="q",
+        payload=candidate.payload,
+        all_params={"q": "x"},
+        payload_candidate=candidate,
+    )
+
+    assert plan.fired_url == "https://example.test/account/profile?q=payload&view=full#frag"
+
+
+def test_build_post_delivery_plan_supports_multiple_follow_up_hints() -> None:
+    candidate = PayloadCandidate(
+        payload="ignored",
+        title="stored multi follow-up",
+        explanation="",
+        test_vector="name=test",
+        strategy=StrategyProfile(
+            session_hint="post_then_sink",
+            follow_up_hint="/profile/avatar,/profile/view|/feed",
+        ),
+    )
+
+    plan = _build_post_delivery_plan(
+        source_page_url="https://example.test/settings/avatar",
+        param_name="name",
+        payload=candidate.payload,
+        payload_candidate=candidate,
+        sink_url=None,
+    )
+
+    assert plan.follow_up_urls == [
+        "https://example.test/profile/avatar",
+        "https://example.test/profile/view",
+        "https://example.test/feed",
+    ]
+
+
 def test_build_post_delivery_plan_applies_multi_param_test_vector() -> None:
     candidate = PayloadCandidate(
         payload="ignored",

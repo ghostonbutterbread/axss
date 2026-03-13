@@ -11,6 +11,7 @@ from ai_xss_generator.behavior import attach_behavior_profile, build_target_beha
 from ai_xss_generator.active.worker import (
     WorkerResult,
     _dom_hit_priority,
+    _probe_result_for_context,
     _run,
     _run_dom,
     _run_post,
@@ -64,6 +65,34 @@ class _FakeFetcherSession:
 
     def get(self, url, headers=None):
         return SimpleNamespace(text="<html></html>", body=None)
+
+
+def test_probe_result_for_context_preserves_reflection_flags():
+    probe_result = SimpleNamespace(
+        param_name="q",
+        original_value="test",
+        reflections=[
+            SimpleNamespace(context_type="html_body", surviving_chars=frozenset({"<", ">"})),
+            SimpleNamespace(context_type="html_attr_url", surviving_chars=frozenset({"j", "a"})),
+        ],
+        discovery_style="semantic_search",
+        reflection_transform="upper",
+        probe_mode="stealth",
+        tested_chars="<>ja",
+        error=None,
+    )
+
+    reduced = _probe_result_for_context(probe_result, "html_body")
+
+    assert reduced.is_reflected is True
+    assert reduced.is_injectable is True
+    assert reduced.discovery_style == "semantic_search"
+    assert reduced.reflection_transform == "upper"
+    assert reduced.probe_mode == "stealth"
+    assert reduced.tested_chars == "<>ja"
+    assert len(reduced.reflections) == 1
+    assert reduced.reflections[0].context_type == "html_body"
+    assert reduced.to_sinks()[0].sink == "probe:html_body"
 
 
 def test_get_worker_runs_local_model_per_context_before_any_fallback():

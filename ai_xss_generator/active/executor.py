@@ -11,6 +11,7 @@ all payload attempts for that URL, so the browser is only launched once.
 from __future__ import annotations
 
 import logging
+import re
 import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any
@@ -861,42 +862,58 @@ def _strategy_value(strategy: Any, key: str) -> str:
     return str(getattr(strategy, key, "") or "").strip()
 
 
-def _candidate_follow_up_target(url: str, payload_candidate: Any = None, sink_url: str | None = None) -> str:
+def _candidate_follow_up_targets(url: str, payload_candidate: Any = None, sink_url: str | None = None) -> list[str]:
+    targets: list[str] = []
     if sink_url:
-        return sink_url
+        targets.append(sink_url)
     follow_up_hint = str(getattr(getattr(payload_candidate, "strategy", None), "follow_up_hint", "") or "").strip()
     if not follow_up_hint:
-        return ""
-    parsed = urllib.parse.urlparse(follow_up_hint)
-    if parsed.scheme and parsed.netloc:
-        return follow_up_hint
-    if follow_up_hint.startswith("/"):
-        base = urllib.parse.urlparse(url)
-        return urllib.parse.urlunparse(base._replace(path=follow_up_hint, query="", fragment=""))
-    return ""
+        return list(dict.fromkeys(targets))
+    base = urllib.parse.urlparse(url)
+    for raw_hint in re.split(r"[,\n|]+", follow_up_hint):
+        hint = raw_hint.strip()
+        if not hint:
+            continue
+        parsed = urllib.parse.urlparse(hint)
+        if parsed.scheme and parsed.netloc:
+            targets.append(hint)
+            continue
+        if hint.startswith("/"):
+            targets.append(urllib.parse.urlunparse(base._replace(path=hint, query="", fragment="")))
+            continue
+        if hint.startswith("?") or hint.startswith("#"):
+            targets.append(urllib.parse.urlunparse(base._replace(query="", fragment="")) + hint)
+            continue
+        if "/" in hint:
+            targets.append(urllib.parse.urljoin(url, hint))
+    return list(dict.fromkeys(targets))
 
 
-def _parse_test_vector(test_vector: str) -> tuple[dict[str, str], str]:
+def _parse_test_vector(test_vector: str) -> tuple[dict[str, str], str, str]:
     test_vector = (test_vector or "").strip()
     if not test_vector:
-        return {}, ""
+        return {}, "", ""
     if test_vector.startswith("#"):
-        return {}, test_vector[1:]
+        return {}, test_vector[1:], ""
     query = test_vector
     fragment = ""
+    path = ""
     if query.startswith("?"):
         query = query[1:]
     elif "?" in query:
         parsed = urllib.parse.urlparse(query)
         query = parsed.query
         fragment = parsed.fragment
+        if parsed.path:
+            path = parsed.path
     elif query.startswith("/"):
         parsed = urllib.parse.urlparse(query)
         query = parsed.query
         fragment = parsed.fragment
+        path = parsed.path
     elif "#" in query:
         query, fragment = query.split("#", 1)
-    return dict(urllib.parse.parse_qsl(query, keep_blank_values=True)), fragment
+    return dict(urllib.parse.parse_qsl(query, keep_blank_values=True)), fragment, path
 
 
 def _build_delivery_plan(
@@ -915,7 +932,7 @@ def _build_delivery_plan(
     coordination_hint = _strategy_value(strategy, "coordination_hint").lower()
 
     overrides = dict(payload_overrides or {})
-    vector_params, vector_fragment = _parse_test_vector(test_vector)
+    vector_params, vector_fragment, vector_path = _parse_test_vector(test_vector)
     if vector_params and (coordination_hint == "multi_param" or len(vector_params) > 1):
         overrides.update(vector_params)
     elif vector_params:
@@ -925,21 +942,22 @@ def _build_delivery_plan(
     params = {**all_params, param_name: payload}
     params.update(overrides)
     fragment = parsed.fragment
+    path = parsed.path
     if vector_fragment:
         fragment = vector_fragment
     elif delivery_hint in {"fragment", "fragment_only"}:
         fragment = payload
+    if vector_path:
+        path = vector_path
 
     new_query = urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
-    fired_url = urllib.parse.urlunparse(parsed._replace(query=new_query, fragment=fragment))
+    fired_url = urllib.parse.urlunparse(parsed._replace(path=path, query=new_query, fragment=fragment))
     preflight_urls: list[str] = []
     follow_up_urls: list[str] = []
     if session_hint in {"navigate_then_fire", "authenticated_follow_up"}:
         preflight_urls.append(same_origin_root(url))
     if session_hint in {"authenticated_follow_up"}:
-        follow_up = _candidate_follow_up_target(url, payload_candidate)
-        if follow_up:
-            follow_up_urls.append(follow_up)
+        follow_up_urls.extend(_candidate_follow_up_targets(url, payload_candidate))
     return DeliveryPlan(
         fired_url=fired_url,
         payload_value=str(params.get(param_name, payload)),
@@ -966,14 +984,12 @@ def _build_post_delivery_plan(
     overrides = {param_name: payload}
     if payload_overrides:
         overrides.update(payload_overrides)
-    vector_params, _ = _parse_test_vector(test_vector)
+    vector_params, _, _ = _parse_test_vector(test_vector)
     if vector_params and (coordination_hint == "multi_param" or len(vector_params) >= 1):
         overrides.update(vector_params)
     follow_up_urls: list[str] = []
     if session_hint in {"post_then_sink", "authenticated_follow_up"}:
-        follow_up = _candidate_follow_up_target(source_page_url, payload_candidate, sink_url)
-        if follow_up:
-            follow_up_urls.append(follow_up)
+        follow_up_urls.extend(_candidate_follow_up_targets(source_page_url, payload_candidate, sink_url))
     return DeliveryPlan(
         fired_url="",
         payload_value=str(overrides.get(param_name, payload)),
