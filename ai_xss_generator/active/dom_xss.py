@@ -243,7 +243,7 @@ def attempt_dom_payloads(
     source_type: str,
     source_name: str,
     sink: str,
-    payloads: list[str],
+    payloads: list[object],
     auth_headers: dict[str, str],
     timeout_ms: int,
 ) -> tuple[bool, str, str]:
@@ -251,7 +251,10 @@ def attempt_dom_payloads(
 
     Returns (confirmed, payload_that_fired, detail_string).
     """
-    for payload in payloads:
+    for payload_item in payloads:
+        payload = str(getattr(payload_item, "payload", payload_item) or "")
+        if not payload:
+            continue
         payload_url = _inject_source(url, source_type, source_name, payload)
         ctx = browser.new_context(
             ignore_https_errors=True,

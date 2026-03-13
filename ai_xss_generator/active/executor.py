@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import urllib.parse
 from dataclasses import dataclass, field
+from typing import Any
 
 from ai_xss_generator.active.console_signals import (
     console_init_script,
@@ -57,6 +58,13 @@ class ExecutionResult:
 
     error: str | None = None
     """Any error that prevented the attempt."""
+
+
+@dataclass(slots=True)
+class DeliveryPlan:
+    fired_url: str
+    payload_value: str
+    param_overrides: dict[str, str] = field(default_factory=dict)
 
 
 class ActiveExecutor:
@@ -114,6 +122,7 @@ class ActiveExecutor:
         transform_name: str,
         sink_url: str | None = None,
         payload_overrides: dict[str, str] | None = None,
+        payload_candidate: Any = None,
     ) -> ExecutionResult:
         """Navigate to *url* with *payload* injected into *param_name*.
 
@@ -134,13 +143,15 @@ class ActiveExecutor:
                 error="Executor not started",
             )
 
-        fired_url = _build_url(
-            url,
-            param_name,
-            payload,
-            all_params,
+        plan = _build_delivery_plan(
+            url=url,
+            param_name=param_name,
+            payload=payload,
+            all_params=all_params,
             payload_overrides=payload_overrides,
+            payload_candidate=payload_candidate,
         )
+        fired_url = plan.fired_url
 
         confirmed = False
         method = ""
@@ -256,6 +267,8 @@ class ActiveExecutor:
         csrf_field: str | None,
         transform_name: str,
         sink_url: str | None = None,
+        payload_overrides: dict[str, str] | None = None,
+        payload_candidate: Any = None,
     ) -> "ExecutionResult":
         """Navigate to *source_page_url*, fill *param_name* with *payload*, submit the form.
 
@@ -341,20 +354,28 @@ class ActiveExecutor:
             except Exception as nav_exc:
                 log.debug("fire_post: source page load error for %s: %s", source_page_url, nav_exc)
 
+            plan = _build_post_delivery_plan(
+                param_name=param_name,
+                payload=payload,
+                payload_overrides=payload_overrides,
+                payload_candidate=payload_candidate,
+            )
+
             # Step 2: Fill the target param with the payload
             try:
-                page.fill(f'[name="{param_name}"]', payload, timeout=3000)
+                for field_name, field_value in plan.param_overrides.items():
+                    page.fill(f'[name="{field_name}"]', field_value, timeout=3000)
             except Exception as fill_exc:
                 log.debug("fire_post: fill failed for %s: %s", param_name, fill_exc)
                 return ExecutionResult(
                     confirmed=False,
                     method="",
                     detail="",
-                    transform_name=transform_name,
-                    payload=payload,
-                    param_name=param_name,
-                    fired_url=source_page_url,
-                    error=f"fill failed: {fill_exc}",
+                transform_name=transform_name,
+                payload=plan.payload_value,
+                param_name=param_name,
+                fired_url=source_page_url,
+                error=f"fill failed: {fill_exc}",
                 )
 
             # Step 3: Submit the form — try submit button first, fall back to JS submit
@@ -404,7 +425,7 @@ class ActiveExecutor:
                 method="",
                 detail="",
                 transform_name=transform_name,
-                payload=payload,
+                payload=plan.payload_value,
                 param_name=param_name,
                 fired_url=source_page_url,
                 error=str(exc),
@@ -420,10 +441,104 @@ class ActiveExecutor:
             method=method,
             detail=detail,
             transform_name=transform_name,
-            payload=payload,
+            payload=plan.payload_value,
             param_name=param_name,
             fired_url=source_page_url,
         )
+
+
+def _strategy_value(strategy: Any, key: str) -> str:
+    if strategy is None:
+        return ""
+    if isinstance(strategy, dict):
+        return str(strategy.get(key, "") or "").strip()
+    return str(getattr(strategy, key, "") or "").strip()
+
+
+def _parse_test_vector(test_vector: str) -> tuple[dict[str, str], str]:
+    test_vector = (test_vector or "").strip()
+    if not test_vector:
+        return {}, ""
+    if test_vector.startswith("#"):
+        return {}, test_vector[1:]
+    query = test_vector
+    fragment = ""
+    if query.startswith("?"):
+        query = query[1:]
+    elif "?" in query:
+        parsed = urllib.parse.urlparse(query)
+        query = parsed.query
+        fragment = parsed.fragment
+    elif query.startswith("/"):
+        parsed = urllib.parse.urlparse(query)
+        query = parsed.query
+        fragment = parsed.fragment
+    elif "#" in query:
+        query, fragment = query.split("#", 1)
+    return dict(urllib.parse.parse_qsl(query, keep_blank_values=True)), fragment
+
+
+def _build_delivery_plan(
+    *,
+    url: str,
+    param_name: str,
+    payload: str,
+    all_params: dict[str, str],
+    payload_overrides: dict[str, str] | None = None,
+    payload_candidate: Any = None,
+) -> DeliveryPlan:
+    strategy = getattr(payload_candidate, "strategy", None)
+    test_vector = str(getattr(payload_candidate, "test_vector", "") or "")
+    delivery_hint = _strategy_value(strategy, "delivery_mode_hint").lower()
+    coordination_hint = _strategy_value(strategy, "coordination_hint").lower()
+
+    overrides = dict(payload_overrides or {})
+    vector_params, vector_fragment = _parse_test_vector(test_vector)
+    if vector_params and (coordination_hint == "multi_param" or len(vector_params) > 1):
+        overrides.update(vector_params)
+    elif vector_params:
+        overrides.update(vector_params)
+
+    parsed = urllib.parse.urlparse(url)
+    params = {**all_params, param_name: payload}
+    params.update(overrides)
+    fragment = parsed.fragment
+    if vector_fragment:
+        fragment = vector_fragment
+    elif delivery_hint in {"fragment", "fragment_only"}:
+        fragment = payload
+
+    new_query = urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
+    fired_url = urllib.parse.urlunparse(parsed._replace(query=new_query, fragment=fragment))
+    return DeliveryPlan(
+        fired_url=fired_url,
+        payload_value=str(params.get(param_name, payload)),
+        param_overrides=params,
+    )
+
+
+def _build_post_delivery_plan(
+    *,
+    param_name: str,
+    payload: str,
+    payload_overrides: dict[str, str] | None = None,
+    payload_candidate: Any = None,
+) -> DeliveryPlan:
+    strategy = getattr(payload_candidate, "strategy", None)
+    coordination_hint = _strategy_value(strategy, "coordination_hint").lower()
+    test_vector = str(getattr(payload_candidate, "test_vector", "") or "")
+
+    overrides = {param_name: payload}
+    if payload_overrides:
+        overrides.update(payload_overrides)
+    vector_params, _ = _parse_test_vector(test_vector)
+    if vector_params and (coordination_hint == "multi_param" or len(vector_params) >= 1):
+        overrides.update(vector_params)
+    return DeliveryPlan(
+        fired_url="",
+        payload_value=str(overrides.get(param_name, payload)),
+        param_overrides=overrides,
+    )
 
 
 def _build_url(

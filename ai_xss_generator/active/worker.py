@@ -107,7 +107,7 @@ class ConfirmedFinding:
 @dataclass
 class CloudPayloadPlan:
     """Cloud-model payload batch plus engine metadata for reporting."""
-    payloads: list[str] = field(default_factory=list)
+    payloads: list[Any] = field(default_factory=list)
     engine: str = ""
     note: str = ""
 
@@ -159,10 +159,22 @@ def _join_lessons(*lesson_groups: list[Any] | None) -> list[Any] | None:
     return merged or None
 
 
-def _preview_payloads(payloads: list[str], limit: int = 4) -> str:
+def _payload_text(item: Any) -> str:
+    if hasattr(item, "payload"):
+        return str(getattr(item, "payload", "") or "")
+    return str(item or "")
+
+
+def _payload_vector(item: Any) -> str:
+    if hasattr(item, "test_vector"):
+        return str(getattr(item, "test_vector", "") or "")
+    return ""
+
+
+def _preview_payloads(payloads: list[Any], limit: int = 4) -> str:
     if not payloads:
         return "none"
-    preview = ", ".join(repr(payload) for payload in payloads[:limit])
+    preview = ", ".join(repr(_payload_text(payload)) for payload in payloads[:limit] if _payload_text(payload))
     remaining = len(payloads) - min(len(payloads), limit)
     if remaining > 0:
         preview += f", +{remaining} more"
@@ -186,16 +198,17 @@ def _summarize_failed_execution_results(results: list[Any]) -> str:
     return "No dialog, console, or network execution signal fired."
 
 
-def _unique_new_payloads(payloads: list[str], seen: set[str]) -> tuple[list[str], list[str]]:
-    fresh: list[str] = []
+def _unique_new_payloads(payloads: list[Any], seen: set[str]) -> tuple[list[Any], list[str]]:
+    fresh: list[Any] = []
     duplicates: list[str] = []
     for payload in payloads:
-        if not payload:
+        payload_text = _payload_text(payload).strip()
+        if not payload_text:
             continue
-        if payload in seen:
-            duplicates.append(payload)
+        if payload_text in seen:
+            duplicates.append(payload_text)
             continue
-        seen.add(payload)
+        seen.add(payload_text)
         fresh.append(payload)
     return fresh, duplicates
 
@@ -693,10 +706,11 @@ def _run(
                         result = executor.fire(
                             url=url,
                             param_name=param_name,
-                            payload=lp,
+                            payload=_payload_text(lp),
                             all_params=flat_params,
                             transform_name="local_model",
                             sink_url=sink_url,
+                            payload_candidate=lp,
                         )
                         if result.confirmed:
                             finding = _make_finding(
@@ -767,10 +781,11 @@ def _run(
                             result = executor.fire(
                                 url=url,
                                 param_name=param_name,
-                                payload=cp,
+                                payload=_payload_text(cp),
                                 all_params=flat_params,
                                 transform_name="cloud_model",
                                 sink_url=sink_url,
+                                payload_candidate=cp,
                             )
                             if result.confirmed:
                                 finding = _make_finding(
@@ -992,8 +1007,8 @@ def _get_local_payloads(
     delivery_mode: str = "get",
     session_lessons: list[Any] | None = None,
     local_timeout_seconds: int = _ACTIVE_LOCAL_MODEL_TIMEOUT_SECONDS,
-) -> list[str]:
-    """Ask the local model for payloads. Returns raw payload strings.
+) -> list[Any]:
+    """Ask the local model for payloads. Returns AI payload candidates.
 
     *base_context* is a pre-parsed ParsedContext for *url*. When provided it
     avoids a redundant HTTP fetch — enrich_context adds the probe-specific
@@ -1026,9 +1041,9 @@ def _get_local_payloads(
         if engine == "heuristic":
             return []
         return [
-            p.payload
+            p
             for p in payloads
-            if p.payload and getattr(p, "source", "heuristic") != "heuristic"
+            if getattr(p, "payload", "") and getattr(p, "source", "heuristic") != "heuristic"
         ]
     except Exception as exc:
         log.debug("Local model failed for %s param=%s: %s", url, probe_result.param_name, exc)
@@ -1058,11 +1073,40 @@ def _cloud_note_for_engine(
 
 def _coerce_cloud_plan(value: Any) -> CloudPayloadPlan:
     """Normalize legacy/raw mocked cloud responses into CloudPayloadPlan."""
+    from ai_xss_generator.types import PayloadCandidate
+
     if isinstance(value, CloudPayloadPlan):
         return value
     if isinstance(value, dict):
+        payload_items = []
+        for item in value.get("payloads", []):
+            if isinstance(item, PayloadCandidate):
+                payload_items.append(item)
+            elif isinstance(item, dict):
+                strategy = item.get("strategy")
+                payload_items.append(PayloadCandidate(
+                    payload=str(item.get("payload", "")).strip(),
+                    title=str(item.get("title", "AI-generated payload")).strip() or "AI-generated payload",
+                    explanation=str(item.get("explanation", "Tailored by model output.")).strip(),
+                    test_vector=str(item.get("test_vector", "Inject into the highest-confidence sink.")).strip(),
+                    tags=[str(tag) for tag in item.get("tags", []) if str(tag).strip()],
+                    target_sink=str(item.get("target_sink", "")).strip(),
+                    framework_hint=str(item.get("framework_hint", "")).strip(),
+                    bypass_family=str(item.get("bypass_family", "")).strip(),
+                    risk_score=int(item.get("risk_score", 0) or 0),
+                    source=str(item.get("source", "heuristic") or "heuristic"),
+                    strategy=strategy,
+                ))
+            elif item:
+                payload_items.append(PayloadCandidate(
+                    payload=str(item),
+                    title="AI-generated payload",
+                    explanation="Tailored by model output.",
+                    test_vector="Inject into the highest-confidence sink.",
+                    source="heuristic",
+                ))
         return CloudPayloadPlan(
-            payloads=list(value.get("payloads", [])),
+            payloads=payload_items,
             engine=str(value.get("engine", "")),
             note=str(value.get("note", "")),
         )
@@ -1236,7 +1280,7 @@ def _get_dom_local_payloads(
     waf: str | None,
     session_lessons: list[Any] | None = None,
     local_timeout_seconds: int = _ACTIVE_LOCAL_MODEL_TIMEOUT_SECONDS,
-) -> list[str]:
+) -> list[Any]:
     """Ask the local model for DOM XSS payloads for one tainted source → sink path."""
     try:
         from ai_xss_generator.models import generate_dom_local_payloads
@@ -1256,9 +1300,9 @@ def _get_dom_local_payloads(
             local_timeout_seconds=local_timeout_seconds,
         )
         return [
-            p.payload
+            p
             for p in payloads
-            if p.payload and getattr(p, "source", "heuristic") != "heuristic"
+            if getattr(p, "payload", "") and getattr(p, "source", "heuristic") != "heuristic"
         ]
     except Exception as exc:
         log.debug("DOM local model failed for %s: %s", getattr(context, "source", "?"), exc)
@@ -1312,7 +1356,7 @@ def _get_dom_cloud_payloads(
             memory_profile=memory_profile,
         )
         result_plan = CloudPayloadPlan(
-            payloads=[p.payload for p in payloads if p.payload],
+            payloads=[p for p in payloads if getattr(p, "payload", "")],
             engine=engine,
             note=_cloud_note_for_engine(
                 ai_backend=ai_backend,
@@ -1327,7 +1371,10 @@ def _get_dom_cloud_payloads(
     if use_dedup:
         with dedup_lock:
             dedup_registry[ekey] = {
-                "payloads": list(result_plan.payloads),
+                "payloads": [
+                    payload.to_dict() if hasattr(payload, "to_dict") else payload
+                    for payload in result_plan.payloads
+                ],
                 "engine": result_plan.engine,
                 "note": result_plan.note,
             }
@@ -1807,11 +1854,7 @@ def _get_cloud_payloads(
             if ekey in dedup_registry:
                 log.debug("Dedup hit — reusing cloud result for key %s", ekey[:12])
                 cached = dict(dedup_registry[ekey])
-                return CloudPayloadPlan(
-                    payloads=list(cached.get("payloads", [])),
-                    engine=str(cached.get("engine", "")),
-                    note=str(cached.get("note", "")),
-                )
+                return _coerce_cloud_plan(cached)
 
     try:
         from ai_xss_generator.probe import enrich_context
@@ -2146,11 +2189,12 @@ def _run_post(
                             source_page_url=post_form.source_page_url,
                             action_url=post_form.action_url,
                             param_name=param_name,
-                            payload=lp,
+                            payload=_payload_text(lp),
                             all_param_names=post_form.param_names,
                             csrf_field=post_form.csrf_field,
                             transform_name="local_model",
                             sink_url=sink_url,
+                            payload_candidate=lp,
                         )
                         if result.confirmed:
                             finding = _make_finding(
@@ -2218,11 +2262,12 @@ def _run_post(
                                 source_page_url=post_form.source_page_url,
                                 action_url=post_form.action_url,
                                 param_name=param_name,
-                                payload=cp,
+                                payload=_payload_text(cp),
                                 all_param_names=post_form.param_names,
                                 csrf_field=post_form.csrf_field,
                                 transform_name="cloud_model",
                                 sink_url=sink_url,
+                                payload_candidate=cp,
                             )
                             if result.confirmed:
                                 finding = _make_finding(

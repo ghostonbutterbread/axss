@@ -17,7 +17,7 @@ from ai_xss_generator.active.worker import (
     active_worker_timeout_budget,
 )
 from ai_xss_generator.probe import ProbeResult, ReflectionContext
-from ai_xss_generator.types import ParsedContext, PostFormTarget
+from ai_xss_generator.types import ParsedContext, PayloadCandidate, PostFormTarget, StrategyProfile
 
 
 def _fake_context(source: str) -> SimpleNamespace:
@@ -438,6 +438,89 @@ def test_get_worker_marks_dead_target_when_no_reflection() -> None:
     assert results[0].dead_target is True
     assert results[0].target_tier == "hard_dead"
     assert "No reflection was confirmed" in results[0].dead_reason
+
+
+def test_get_worker_forwards_payload_candidate_strategy_to_executor() -> None:
+    url = "https://example.test/search?q=x"
+    probe_result = ProbeResult(
+        param_name="q",
+        original_value="x",
+        reflections=[
+            ReflectionContext(context_type="html_body", surviving_chars=frozenset({"<", ">"})),
+        ],
+    )
+    strategies: list[str] = []
+    results: list[WorkerResult] = []
+
+    class FakeExecutor:
+        def __init__(self, auth_headers=None) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            pass
+
+        def fire(self, **kwargs):
+            candidate = kwargs.get("payload_candidate")
+            strategies.append(getattr(getattr(candidate, "strategy", None), "delivery_mode_hint", ""))
+            return SimpleNamespace(
+                confirmed=True,
+                method="dialog",
+                detail="alert fired",
+                transform_name=kwargs["transform_name"],
+                payload=kwargs["payload"],
+                fired_url=kwargs["url"] + "#frag",
+            )
+
+    with (
+        patch("ai_xss_generator.probe.probe_url", return_value=[probe_result]),
+        patch("ai_xss_generator.parser.parse_target", return_value=_fake_context(url)),
+        patch("scrapling.fetchers.FetcherSession", _FakeFetcherSession),
+        patch("ai_xss_generator.active.executor.ActiveExecutor", FakeExecutor),
+        patch(
+            "ai_xss_generator.active.transforms.all_variants_for_probe",
+            return_value=[("q", "html_body", [TransformVariant("raw", "fallback-html")])],
+        ),
+        patch(
+            "ai_xss_generator.active.worker._get_local_payloads",
+            return_value=[
+                PayloadCandidate(
+                    payload="<svg/onload=alert(1)>",
+                    title="fragment",
+                    explanation="",
+                    test_vector="",
+                    source="ollama",
+                    strategy=StrategyProfile(delivery_mode_hint="fragment"),
+                )
+            ],
+        ),
+        patch("ai_xss_generator.active.worker._get_cloud_payloads", return_value=[]),
+    ):
+        _run(
+            url=url,
+            rate=25.0,
+            waf_hint=None,
+            model="qwen3.5",
+            cloud_model="anthropic/claude-3-5-sonnet",
+            use_cloud=True,
+            timeout_seconds=30,
+            result_queue=None,
+            dedup_registry={},
+            dedup_lock=threading.Lock(),
+            findings_lock=threading.Lock(),
+            start_time=time.monotonic(),
+            put_result=results.append,
+            auth_headers=None,
+            sink_url=None,
+            ai_backend="api",
+            cli_tool="claude",
+            cli_model=None,
+        )
+
+    assert strategies == ["fragment"]
+    assert results and results[0].status == "confirmed"
 
 
 class _FakeBrowser:
