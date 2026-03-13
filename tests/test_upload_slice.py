@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from ai_xss_generator.browser_crawler import _process_raw_forms
 from ai_xss_generator.crawler import _extract_links
 from ai_xss_generator.session import compute_seed_hash
@@ -136,3 +138,94 @@ def test_run_upload_worker_confirms_when_executor_fires(monkeypatch) -> None:
     assert result.fallback_rounds == 1
     assert result.confirmed_findings[0].context_type == "stored_upload"
     assert result.confirmed_findings[0].sink_context == "upload_render"
+
+
+def test_upload_only_batch_mode_crawls_each_seed(monkeypatch, tmp_path) -> None:
+    from ai_xss_generator import cli
+    from ai_xss_generator.crawler import CrawlResult
+
+    seeds = [
+        "https://example.test/account",
+        "https://example.test/profile",
+    ]
+    url_file = tmp_path / "urls.txt"
+    url_file.write_text("\n".join(seeds), encoding="utf-8")
+
+    crawled: list[str] = []
+    captured: dict[str, object] = {}
+
+    def _fake_crawl(url, **kwargs):
+        crawled.append(url)
+        slug = url.rsplit("/", 1)[-1]
+        return CrawlResult(
+            get_urls=[],
+            post_forms=[],
+            upload_targets=[UploadTarget(
+                action_url=f"{url}/upload",
+                source_page_url=url,
+                file_field_names=[f"{slug}File"],
+                companion_field_names=["displayName"],
+                csrf_field=None,
+                hidden_defaults={},
+            )],
+            visited_urls=[url],
+            detected_waf=None,
+        )
+
+    def _fake_run_active_scan(urls, scan_config, **kwargs):
+        captured["urls"] = list(urls)
+        captured["scan_uploads"] = scan_config.scan_uploads
+        captured["scan_stored"] = scan_config.scan_stored
+        captured["upload_targets"] = list(kwargs.get("upload_targets", []))
+        return []
+
+    monkeypatch.setattr("ai_xss_generator.cli.resolve_ai_config", lambda config, args=None: SimpleNamespace(
+        model="qwen3.5:9b",
+        cloud_model="anthropic/claude-3-5-sonnet",
+        use_cloud=False,
+        ai_backend="api",
+        cli_tool="claude",
+        cli_model=None,
+    ))
+    monkeypatch.setattr("ai_xss_generator.parser.read_url_list", lambda path: seeds)
+    monkeypatch.setattr("ai_xss_generator.crawler.crawl", _fake_crawl)
+    monkeypatch.setattr("ai_xss_generator.cli._resolve_session", lambda **kwargs: None)
+    monkeypatch.setattr("ai_xss_generator.active.orchestrator.run_active_scan", _fake_run_active_scan)
+    monkeypatch.setattr("ai_xss_generator.active.reporter.write_report", lambda *args, **kwargs: "/tmp/report.md")
+
+    args = SimpleNamespace(
+        urls=str(url_file),
+        url=None,
+        rate=5.0,
+        depth=1,
+        browser_crawl=False,
+        no_crawl=False,
+        verbose=0,
+        workers=1,
+        timeout=300,
+        json_out=None,
+        sink_url=None,
+        attempts=1,
+        header=[],
+        headers=[],
+        cookies=None,
+        resume=False,
+    )
+
+    rc = cli._run_active_scan(
+        args=args,
+        config=SimpleNamespace(),
+        resolved_waf=None,
+        auth_headers=None,
+        scan_reflected=False,
+        scan_stored=False,
+        scan_uploads=True,
+        scan_dom=False,
+    )
+
+    assert rc == 0
+    assert crawled == seeds
+    assert captured["urls"] == seeds
+    assert captured["scan_uploads"] is True
+    assert captured["scan_stored"] is False
+    assert len(captured["upload_targets"]) == 2

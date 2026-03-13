@@ -418,7 +418,7 @@ axss --help
 | `--active` | off | Fire payloads in Playwright and confirm execution |
 | `--reflected` | off | Test reflected XSS only (GET params); implies `--active` |
 | `--stored` | off | Test stored/POST XSS only; implies `--active` |
-| `--uploads` | off | Test multipart upload / artifact workflows only; implies `--active` |
+| `--uploads` | off | Test multipart upload / artifact workflows only; implies `--active`. With `--urls`, upload-only mode treats each URL as a crawl seed for multipart discovery unless `--no-crawl` is set |
 | `--dom` | off | Test DOM-based XSS via runtime source→sink analysis and browser confirmation; implies `--active` |
 | `--generate` | off | Generate AI-ranked payloads without browser execution |
 | `--no-crawl` | off | Skip crawling — test only the provided URL |

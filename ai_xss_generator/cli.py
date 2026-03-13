@@ -918,11 +918,20 @@ def _run_active_scan(
     else:
         urls = [args.url]
 
+    upload_only_batch_discovery = bool(
+        args.urls
+        and scan_uploads
+        and not scan_reflected
+        and not scan_stored
+        and not scan_dom
+        and not getattr(args, "no_crawl", False)
+    )
+
     # WAF auto-detect from first URL — only when not crawling (the crawl will
     # detect WAF from its seed fetch, saving a redundant round-trip).
     waf = resolved_waf
     no_crawl = getattr(args, "no_crawl", False)
-    if not waf and urls and (no_crawl or not args.url):
+    if not waf and urls and (no_crawl or (not args.url and not upload_only_batch_discovery)):
         step(f"Probing for WAF on {urls[0]}...")
         detected = _try_detect_waf(urls[0], getattr(args, "verbose", False))
         if detected:
@@ -938,7 +947,7 @@ def _run_active_scan(
     post_forms: list = []
     upload_targets: list = []
     crawled_pages: list = []
-    if scan_uploads and args.urls:
+    if scan_uploads and args.urls and not upload_only_batch_discovery:
         info(
             "Upload scanning in --urls batch mode only tests upload forms already discovered "
             "from crawlable entry pages; raw URL lists do not discover upload endpoints on their own."
@@ -948,7 +957,7 @@ def _run_active_scan(
             "Upload scanning with --no-crawl needs a known upload target; the scanner will not "
             "discover multipart forms when crawling is disabled."
         )
-    if args.url and not no_crawl:
+    def _crawl_seed(seed_url: str, *, status_label: str | None = None) -> Any:
         from ai_xss_generator.console import (
             clear_status_bar, fmt_duration, set_status_bar,
             spin_char, update_status_bar,
@@ -970,38 +979,69 @@ def _run_active_scan(
 
         if use_browser_crawl:
             from ai_xss_generator.browser_crawler import browser_crawl
-            step(f"Browser-crawling {urls[0]} (depth={crawl_depth}, Playwright)...")
+            step(status_label or f"Browser-crawling {seed_url} (depth={crawl_depth}, Playwright)...")
             set_status_bar(
                 f"\033[2m[~] ⠋ Browser crawl | depth 0/{crawl_depth} | "
                 f"0 pages visited | 0 target(s) found\033[0m"
             )
             try:
-                crawl_result = browser_crawl(
-                    urls[0],
+                return browser_crawl(
+                    seed_url,
                     depth=crawl_depth,
                     auth_headers=auth_headers,
                     on_progress=_crawl_progress,
                 )
             finally:
                 clear_status_bar()
-        else:
-            from ai_xss_generator.crawler import crawl as crawl_site, CrawlResult
-            step(f"Crawling {urls[0]} (depth={crawl_depth})...")
-            set_status_bar(
-                f"\033[2m[~] ⠋ Crawling | depth 0/{crawl_depth} | "
-                f"0 pages visited | 0 target(s) found\033[0m"
+
+        from ai_xss_generator.crawler import crawl as crawl_site
+        step(status_label or f"Crawling {seed_url} (depth={crawl_depth})...")
+        set_status_bar(
+            f"\033[2m[~] ⠋ Crawling | depth 0/{crawl_depth} | "
+            f"0 pages visited | 0 target(s) found\033[0m"
+        )
+        try:
+            return crawl_site(
+                seed_url,
+                depth=crawl_depth,
+                rate=args.rate,
+                waf=waf,
+                auth_headers=auth_headers,
+                on_progress=_crawl_progress,
             )
-            try:
-                crawl_result = crawl_site(
-                    urls[0],
-                    depth=crawl_depth,
-                    rate=args.rate,
-                    waf=waf,
-                    auth_headers=auth_headers,
-                    on_progress=_crawl_progress,
+        finally:
+            clear_status_bar()
+
+    if upload_only_batch_discovery:
+        info("Uploads-only batch mode: crawling each seed URL to discover multipart workflows.")
+        seen_upload_keys: set[str] = set()
+        for idx, seed_url in enumerate(urls, 1):
+            crawl_result = _crawl_seed(
+                seed_url,
+                status_label=f"Crawling upload seed {idx}/{len(urls)}: {seed_url}",
+            )
+            crawled_pages.extend(crawl_result.visited_urls)
+            for target in getattr(crawl_result, "upload_targets", []):
+                key = (
+                    target.action_url,
+                    tuple(sorted(target.file_field_names)),
+                    tuple(sorted(target.companion_field_names)),
                 )
-            finally:
-                clear_status_bar()
+                if key in seen_upload_keys:
+                    continue
+                seen_upload_keys.add(key)
+                upload_targets.append(target)
+            if not waf and crawl_result.detected_waf:
+                waf = crawl_result.detected_waf
+        if upload_targets:
+            success(
+                f"Upload discovery complete: {len(upload_targets)} upload form(s) "
+                f"across {len(urls)} seed URL(s)"
+            )
+        else:
+            info("Upload discovery found no multipart forms on the provided seed URLs.")
+    elif args.url and not no_crawl:
+        crawl_result = _crawl_seed(urls[0])
 
         post_forms = crawl_result.post_forms
         upload_targets = getattr(crawl_result, "upload_targets", [])
