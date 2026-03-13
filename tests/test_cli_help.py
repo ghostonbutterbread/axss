@@ -66,7 +66,10 @@ class CliHelpTest(unittest.TestCase):
             captured.update(kwargs)
             return 0
 
-        with patch.object(cli, "_run_active_scan", side_effect=_fake_run_active_scan):
+        with (
+            patch.object(cli, "_run_active_scan", side_effect=_fake_run_active_scan),
+            patch("ai_xss_generator.ai_capabilities.choose_generation_tool", return_value=("claude", "")),
+        ):
             rc = cli.main(["-u", "https://example.test/profile", "--uploads"])
 
         self.assertEqual(rc, 0)
@@ -82,7 +85,10 @@ class CliHelpTest(unittest.TestCase):
             captured.update(kwargs)
             return 0
 
-        with patch.object(cli, "_run_active_scan", side_effect=_fake_run_active_scan):
+        with (
+            patch.object(cli, "_run_active_scan", side_effect=_fake_run_active_scan),
+            patch("ai_xss_generator.ai_capabilities.choose_generation_tool", return_value=("claude", "")),
+        ):
             rc = cli.main(["-u", "https://example.test/profile"])
 
         self.assertEqual(rc, 0)
@@ -100,7 +106,10 @@ class CliHelpTest(unittest.TestCase):
             captured["attempts"] = args[0].attempts
             return 0
 
-        with patch.object(cli, "_run_active_scan", side_effect=_fake_run_active_scan):
+        with (
+            patch.object(cli, "_run_active_scan", side_effect=_fake_run_active_scan),
+            patch("ai_xss_generator.ai_capabilities.choose_generation_tool", return_value=("claude", "")),
+        ):
             rc = cli.main(["-u", "https://example.test/profile", "--extreme"])
 
         self.assertEqual(rc, 0)

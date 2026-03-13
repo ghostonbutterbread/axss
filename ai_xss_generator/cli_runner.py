@@ -85,19 +85,20 @@ def _is_fallback_worthy_error(message: str) -> bool:
     return any(marker in lowered for marker in _FALLBACK_ERROR_MARKERS)
 
 
-def _run(cmd: list[str], tool: str) -> str:
+def _run(cmd: list[str], tool: str, timeout_seconds: int | None = None) -> str:
     """Run *cmd*, return stdout.  Raises RuntimeError on non-zero exit or timeout."""
+    effective_timeout = max(1, int(timeout_seconds or CLI_TIMEOUT))
     try:
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
-            timeout=CLI_TIMEOUT,
+            timeout=effective_timeout,
         )
     except subprocess.TimeoutExpired:
         raise CliInvocationError(
             tool,
-            f"{tool} CLI timed out after {CLI_TIMEOUT}s — "
+            f"{tool} CLI timed out after {effective_timeout}s — "
             "try increasing CLI_TIMEOUT or simplify the prompt",
             fallback_recommended=True,
         )
@@ -179,7 +180,12 @@ def _codex_output_schema() -> dict[str, object]:
     }
 
 
-def call_claude(prompt: str, model: str | None = None) -> str:
+def call_claude(
+    prompt: str,
+    model: str | None = None,
+    *,
+    timeout_seconds: int | None = None,
+) -> str:
     """Run 'claude -p PROMPT [--model MODEL]' and return stdout."""
     if not is_available("claude"):
         raise CliInvocationError(
@@ -192,10 +198,16 @@ def call_claude(prompt: str, model: str | None = None) -> str:
         cmd += ["--model", model]
     log.debug("CLI invoke: claude -p <prompt> %s", f"--model {model}" if model else "")
     log.debug("claude CLI prompt preview:\n%s", _trace_preview(prompt))
-    return _run(cmd, "claude")
+    return _run(cmd, "claude", timeout_seconds)
 
 
-def call_codex(prompt: str, model: str | None = None) -> str:
+def call_codex(
+    prompt: str,
+    model: str | None = None,
+    *,
+    timeout_seconds: int | None = None,
+    schema: dict[str, object] | None = None,
+) -> str:
     """Run 'codex exec PROMPT --skip-git-repo-check' and return stdout.
 
     The --model flag is not currently supported by the codex CLI; the
@@ -212,9 +224,7 @@ def call_codex(prompt: str, model: str | None = None) -> str:
             "codex CLI does not support model selection; --cli-model %r will be ignored", model
         )
     with tempfile.TemporaryDirectory(prefix="axss-codex-") as tmpdir:
-        schema_path = Path(tmpdir) / "payload-schema.json"
         output_path = Path(tmpdir) / "codex-last-message.json"
-        schema_path.write_text(json.dumps(_codex_output_schema(), indent=2), encoding="utf-8")
         cmd = [
             "codex",
             "exec",
@@ -222,17 +232,24 @@ def call_codex(prompt: str, model: str | None = None) -> str:
             "--skip-git-repo-check",
             "--color",
             "never",
-            "--output-schema",
-            str(schema_path),
             "--output-last-message",
             str(output_path),
         ]
+        schema_payload = _codex_output_schema() if schema is None else schema
+        if schema_payload:
+            schema_path = Path(tmpdir) / "payload-schema.json"
+            schema_path.write_text(json.dumps(schema_payload, indent=2), encoding="utf-8")
+            cmd.extend([
+                "--output-schema",
+                str(schema_path),
+            ])
         log.debug(
             "CLI invoke: codex exec <prompt> --skip-git-repo-check --color never "
-            "--output-schema <schema> --output-last-message <file>"
+            "%s--output-last-message <file>",
+            "--output-schema <schema> " if schema_payload else "",
         )
         log.debug("codex CLI prompt preview:\n%s", _trace_preview(prompt))
-        stdout = _run(cmd, "codex")
+        stdout = _run(cmd, "codex", timeout_seconds)
         final_message = ""
         try:
             final_message = output_path.read_text(encoding="utf-8").strip()
@@ -251,10 +268,16 @@ def call_codex(prompt: str, model: str | None = None) -> str:
         )
 
 
-def generate_via_cli_with_tool(tool: str, prompt: str, model: str | None = None) -> tuple[str, str]:
+def generate_via_cli_with_tool(
+    tool: str,
+    prompt: str,
+    model: str | None = None,
+    *,
+    timeout_seconds: int | None = None,
+) -> tuple[str, str]:
     """Dispatch to the correct CLI tool with automatic failover to the alternate CLI."""
     try:
-        return generate_via_cli_no_fallback(tool, prompt, model), tool
+        return generate_via_cli_no_fallback(tool, prompt, model, timeout_seconds=timeout_seconds), tool
     except CliInvocationError as exc:
         alt = _alternate_tool(tool)
         if not exc.fallback_recommended:
@@ -266,23 +289,35 @@ def generate_via_cli_with_tool(tool: str, prompt: str, model: str | None = None)
             exc,
         )
         try:
-            return generate_via_cli_no_fallback(alt, prompt, model), alt
+            return generate_via_cli_no_fallback(alt, prompt, model, timeout_seconds=timeout_seconds), alt
         except CliInvocationError as alt_exc:
             raise RuntimeError(
                 f"{tool} CLI failed ({exc}); fallback {alt} CLI also failed ({alt_exc})"
             ) from alt_exc
 
 
-def generate_via_cli_no_fallback(tool: str, prompt: str, model: str | None = None) -> str:
+def generate_via_cli_no_fallback(
+    tool: str,
+    prompt: str,
+    model: str | None = None,
+    *,
+    timeout_seconds: int | None = None,
+) -> str:
     """Dispatch to the requested CLI tool only, without cross-tool failover."""
     if tool == "claude":
-        return call_claude(prompt, model)
+        return call_claude(prompt, model, timeout_seconds=timeout_seconds)
     if tool == "codex":
-        return call_codex(prompt, model)
+        return call_codex(prompt, model, timeout_seconds=timeout_seconds)
     raise ValueError(f"Unknown CLI tool: {tool!r} — expected 'claude' or 'codex'")
 
 
-def generate_via_cli(tool: str, prompt: str, model: str | None = None) -> str:
+def generate_via_cli(
+    tool: str,
+    prompt: str,
+    model: str | None = None,
+    *,
+    timeout_seconds: int | None = None,
+) -> str:
     """Dispatch to the correct CLI tool and return raw stdout.
 
     Args:
@@ -298,7 +333,7 @@ def generate_via_cli(tool: str, prompt: str, model: str | None = None) -> str:
         RuntimeError: if the CLI tool is not found, times out, or exits non-zero.
         ValueError:   if *tool* is not a recognised CLI tool name.
     """
-    raw, _ = generate_via_cli_with_tool(tool, prompt, model)
+    raw, _ = generate_via_cli_with_tool(tool, prompt, model, timeout_seconds=timeout_seconds)
     return raw
 
 

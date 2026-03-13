@@ -10,9 +10,12 @@ def test_resolve_ai_config_uses_config_defaults() -> None:
         default_model="qwen3.5:27b",
         use_cloud=True,
         cloud_model="anthropic/claude-3-7-sonnet",
+        api_fallback_models=("openai/gpt-4.1-mini",),
         ai_backend="cli",
         cli_tool="codex",
         cli_model="gpt-5-codex",
+        xss_generation_model="codex",
+        xss_reasoning_model="claude",
     )
 
     resolved = resolve_ai_config(config)
@@ -20,9 +23,12 @@ def test_resolve_ai_config_uses_config_defaults() -> None:
     assert resolved.model == "qwen3.5:27b"
     assert resolved.use_cloud is True
     assert resolved.cloud_model == "anthropic/claude-3-7-sonnet"
+    assert resolved.api_fallback_models == ("openai/gpt-4.1-mini",)
     assert resolved.ai_backend == "cli"
     assert resolved.cli_tool == "codex"
     assert resolved.cli_model == "gpt-5-codex"
+    assert resolved.xss_generation_model == "codex"
+    assert resolved.xss_reasoning_model == "claude"
 
 
 def test_resolve_ai_config_applies_args_overrides() -> None:
@@ -30,6 +36,7 @@ def test_resolve_ai_config_applies_args_overrides() -> None:
         default_model="qwen3.5:9b",
         use_cloud=True,
         cloud_model="anthropic/claude-3-5-sonnet",
+        api_fallback_models=(),
         ai_backend="api",
         cli_tool="claude",
         cli_model=None,
@@ -49,6 +56,8 @@ def test_resolve_ai_config_applies_args_overrides() -> None:
     assert resolved.ai_backend == "cli"
     assert resolved.cli_tool == "codex"
     assert resolved.cli_model == "gpt-5-codex-mini"
+    assert resolved.xss_generation_model == "codex"
+    assert resolved.xss_reasoning_model == "codex"
 
 
 def test_resolve_ai_config_sanitizes_invalid_values() -> None:
@@ -56,6 +65,7 @@ def test_resolve_ai_config_sanitizes_invalid_values() -> None:
         default_model="",
         use_cloud=True,
         cloud_model="",
+        api_fallback_models=(),
         ai_backend="api",
         cli_tool="claude",
         cli_model=None,

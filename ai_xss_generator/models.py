@@ -1226,6 +1226,7 @@ def _generate_with_openai_compat(
     waf: str | None = None,
     past_findings: list[Finding] | None = None,
     past_lessons: list[Any] | None = None,
+    request_timeout_seconds: int = 120,
 ) -> list[PayloadCandidate]:
     prompt = _cloud_prompt_for_context(
         context,
@@ -1261,7 +1262,7 @@ def _generate_with_openai_compat(
             ],
             "temperature": 0.35,
         },
-        timeout=120,
+        timeout=max(1, request_timeout_seconds),
     )
     response.raise_for_status()
     body = response.json()
@@ -1277,6 +1278,7 @@ def _generate_with_openrouter(
     waf: str | None = None,
     past_findings: list[Finding] | None = None,
     past_lessons: list[Any] | None = None,
+    request_timeout_seconds: int = 120,
 ) -> list[PayloadCandidate]:
     from ai_xss_generator.config import load_api_key
     api_key = os.environ.get("OPENROUTER_API_KEY", "") or load_api_key("openrouter_api_key")
@@ -1292,6 +1294,7 @@ def _generate_with_openrouter(
         waf=waf,
         past_findings=past_findings,
         past_lessons=past_lessons,
+        request_timeout_seconds=request_timeout_seconds,
     )
 
 
@@ -1301,6 +1304,7 @@ def _generate_with_openai(
     waf: str | None = None,
     past_findings: list[Finding] | None = None,
     past_lessons: list[Any] | None = None,
+    request_timeout_seconds: int = 120,
 ) -> list[PayloadCandidate]:
     from ai_xss_generator.config import load_api_key
     api_key = os.environ.get("OPENAI_API_KEY", "") or load_api_key("openai_api_key")
@@ -1316,6 +1320,7 @@ def _generate_with_openai(
         waf=waf,
         past_findings=past_findings,
         past_lessons=past_lessons,
+        request_timeout_seconds=request_timeout_seconds,
     )
 
 
@@ -1334,6 +1339,7 @@ def _generate_with_cli(
 ) -> tuple[list[PayloadCandidate], str]:
     """Generate payloads by calling the CLI backend, with cross-tool failover."""
     from ai_xss_generator.cli_runner import _trace_preview, generate_via_cli_with_tool
+    from ai_xss_generator.ai_capabilities import GENERATION_ROLE, recommended_timeout_seconds
     prompt = _cloud_prompt_for_context(
         context,
         reference_payloads=reference_payloads,
@@ -1341,7 +1347,13 @@ def _generate_with_cli(
         past_findings=past_findings,
         past_lessons=past_lessons,
     )
-    raw, actual_tool = generate_via_cli_with_tool(tool, prompt, cli_model)
+    timeout_seconds = recommended_timeout_seconds(tool, GENERATION_ROLE, 60)
+    raw, actual_tool = generate_via_cli_with_tool(
+        tool,
+        prompt,
+        cli_model,
+        timeout_seconds=timeout_seconds,
+    )
     log.debug("CLI backend resolved to %s for %s", actual_tool, context.source)
     try:
         data = _extract_json_blob(raw)
@@ -1392,16 +1404,27 @@ def _try_cloud(
 
     # ── API backend (original behaviour) ────────────────────────────────────
     from ai_xss_generator.config import load_api_key
+    from ai_xss_generator.ai_capabilities import GENERATION_ROLE, recommended_api_timeout_seconds
+    api_timeout_seconds = recommended_api_timeout_seconds(cloud_model, GENERATION_ROLE, 120)
     if os.environ.get("OPENROUTER_API_KEY") or load_api_key("openrouter_api_key"):
         try:
-            payloads = _generate_with_openrouter(context, cloud_model, **kwargs)
+            payloads = _generate_with_openrouter(
+                context,
+                cloud_model,
+                request_timeout_seconds=api_timeout_seconds,
+                **kwargs,
+            )
             return payloads, "openrouter"
         except Exception:
             pass
 
     if os.environ.get("OPENAI_API_KEY") or load_api_key("openai_api_key"):
         try:
-            payloads = _generate_with_openai(context, **kwargs)
+            payloads = _generate_with_openai(
+                context,
+                request_timeout_seconds=api_timeout_seconds,
+                **kwargs,
+            )
             return payloads, "openai"
         except Exception:
             pass

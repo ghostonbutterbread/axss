@@ -31,7 +31,7 @@ def test_generate_via_cli_falls_back_from_claude_to_codex() -> None:
 
     assert tool == "codex"
     assert raw == '{"payloads": []}'
-    codex.assert_called_once_with("prompt", None)
+    codex.assert_called_once_with("prompt", None, timeout_seconds=None)
 
 
 def test_trace_preview_sanitizes_terminal_controls_and_truncates() -> None:
@@ -46,7 +46,7 @@ def test_trace_preview_sanitizes_terminal_controls_and_truncates() -> None:
 def test_call_codex_reads_final_message_file(tmp_path) -> None:
     captured = {}
 
-    def _fake_run(cmd, tool):
+    def _fake_run(cmd, tool, timeout_seconds=None):
         captured["cmd"] = cmd
         out_index = cmd.index("--output-last-message") + 1
         schema_index = cmd.index("--output-schema") + 1
@@ -70,7 +70,7 @@ def test_call_codex_reads_final_message_file(tmp_path) -> None:
 
 
 def test_call_codex_falls_back_to_stdout_when_output_file_empty(tmp_path) -> None:
-    def _fake_run(cmd, tool):
+    def _fake_run(cmd, tool, timeout_seconds=None):
         out_index = cmd.index("--output-last-message") + 1
         Path(cmd[out_index]).write_text("", encoding="utf-8")
         return '{"payloads":[{"payload":"stdout-payload"}]}'
@@ -103,7 +103,7 @@ def test_generate_via_cli_falls_back_from_codex_to_claude() -> None:
 
     assert tool == "claude"
     assert raw == '{"payloads": []}'
-    claude.assert_called_once_with("prompt", "claude-opus-4-6")
+    claude.assert_called_once_with("prompt", "claude-opus-4-6", timeout_seconds=None)
 
 
 def test_generate_via_cli_does_not_fallback_for_non_retryable_failure() -> None:
@@ -141,8 +141,8 @@ def test_generate_via_cli_tries_each_tool_once_when_both_fail() -> None:
         with pytest.raises(RuntimeError):
             generate_via_cli_with_tool("claude", "prompt")
 
-    claude.assert_called_once_with("prompt", None)
-    codex.assert_called_once_with("prompt", None)
+    claude.assert_called_once_with("prompt", None, timeout_seconds=None)
+    codex.assert_called_once_with("prompt", None, timeout_seconds=None)
 
 
 def test_generate_with_cli_labels_payloads_with_actual_fallback_tool() -> None:

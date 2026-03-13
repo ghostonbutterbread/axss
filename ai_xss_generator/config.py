@@ -49,12 +49,17 @@ class AppConfig:
     # Preferred OpenRouter model (only used when ai_backend="api").
     # Example: "anthropic/claude-3-5-sonnet", "google/gemini-2.0-flash-001"
     cloud_model: str = "anthropic/claude-3-5-sonnet"
+    # Optional fallback API models to try when the preferred model is not suitable.
+    api_fallback_models: tuple[str, ...] = ()
     # Cloud escalation backend: "api" = OpenRouter/OpenAI, "cli" = subprocess CLI.
     ai_backend: str = "api"
     # Which CLI tool to use when ai_backend="cli": "claude" or "codex".
     cli_tool: str = "claude"
     # Model passed to the CLI tool (e.g. "claude-opus-4-6").  None = CLI default.
     cli_model: str | None = None
+    # Explicit role split for CLI backends. Values are tool names today.
+    xss_generation_model: str | None = None
+    xss_reasoning_model: str | None = None
 
 
 @dataclass(frozen=True)
@@ -64,7 +69,10 @@ class ResolvedAIConfig:
     cloud_model: str
     ai_backend: str
     cli_tool: str
+    api_fallback_models: tuple[str, ...] = ()
     cli_model: str | None = None
+    xss_generation_model: str = "claude"
+    xss_reasoning_model: str = "claude"
 
 
 def load_config() -> AppConfig:
@@ -88,6 +96,13 @@ def load_config() -> AppConfig:
     if not isinstance(cloud_model, str) or not cloud_model.strip():
         cloud_model = "anthropic/claude-3-5-sonnet"
 
+    api_fallback_models_raw = raw.get("api_fallback_models", [])
+    api_fallback_models: list[str] = []
+    if isinstance(api_fallback_models_raw, list):
+        for item in api_fallback_models_raw:
+            if isinstance(item, str) and item.strip():
+                api_fallback_models.append(item.strip())
+
     ai_backend = raw.get("ai_backend", "api")
     if ai_backend not in ("api", "cli"):
         ai_backend = "api"
@@ -100,13 +115,24 @@ def load_config() -> AppConfig:
     if cli_model is not None and (not isinstance(cli_model, str) or not cli_model.strip()):
         cli_model = None
 
+    xss_generation_model = raw.get("xss_generation_model", None)
+    if xss_generation_model is not None and xss_generation_model not in ("claude", "codex"):
+        xss_generation_model = None
+
+    xss_reasoning_model = raw.get("xss_reasoning_model", None)
+    if xss_reasoning_model is not None and xss_reasoning_model not in ("claude", "codex"):
+        xss_reasoning_model = None
+
     return AppConfig(
         default_model=default_model.strip(),
         use_cloud=use_cloud,
         cloud_model=cloud_model.strip(),
+        api_fallback_models=tuple(api_fallback_models),
         ai_backend=ai_backend,
         cli_tool=cli_tool,
         cli_model=cli_model.strip() if cli_model else None,
+        xss_generation_model=xss_generation_model,
+        xss_reasoning_model=xss_reasoning_model,
     )
 
 
@@ -138,14 +164,27 @@ def resolve_ai_config(
     resolved_cloud_model = cloud_model or config.cloud_model or "anthropic/claude-3-5-sonnet"
     if not isinstance(resolved_cloud_model, str) or not resolved_cloud_model.strip():
         resolved_cloud_model = "anthropic/claude-3-5-sonnet"
+    resolved_api_fallback_models = tuple(
+        item for item in getattr(config, "api_fallback_models", ()) if isinstance(item, str) and item.strip()
+    )
 
     resolved_backend = ai_backend or getattr(args, "backend", None) or config.ai_backend or "api"
     if resolved_backend not in {"api", "cli"}:
         resolved_backend = "api"
 
-    resolved_cli_tool = cli_tool or getattr(args, "cli_tool", None) or config.cli_tool or "claude"
+    resolved_cli_tool = (
+        cli_tool
+        or getattr(args, "cli_tool", None)
+        or config.xss_generation_model
+        or config.cli_tool
+        or "claude"
+    )
     if resolved_cli_tool not in {"claude", "codex"}:
         resolved_cli_tool = "claude"
+
+    resolved_reasoning_model = config.xss_reasoning_model or resolved_cli_tool
+    if resolved_reasoning_model not in {"claude", "codex"}:
+        resolved_reasoning_model = resolved_cli_tool
 
     resolved_cli_model = cli_model
     if resolved_cli_model is None and args is not None:
@@ -162,7 +201,10 @@ def resolve_ai_config(
         model=resolved_model.strip(),
         use_cloud=resolved_use_cloud,
         cloud_model=resolved_cloud_model.strip(),
+        api_fallback_models=resolved_api_fallback_models,
         ai_backend=resolved_backend,
         cli_tool=resolved_cli_tool,
         cli_model=resolved_cli_model,
+        xss_generation_model=resolved_cli_tool,
+        xss_reasoning_model=resolved_reasoning_model,
     )
