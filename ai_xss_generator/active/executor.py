@@ -66,6 +66,10 @@ class ExecutionResult:
     preflight_succeeded: bool = False
     follow_up_attempted: bool = False
     follow_up_succeeded: bool = False
+    edge_signals: list[str] = field(default_factory=list)
+    actual_url: str = ""
+    query_preserved: bool | None = None
+    fragment_preserved: bool | None = None
 
 
 @dataclass(slots=True)
@@ -98,6 +102,73 @@ def _planned_delivery_modes(plan: DeliveryPlan, *, base_mode: str) -> list[str]:
     if plan.follow_up_urls:
         _append_unique(modes, "follow_up")
     return modes
+
+
+def _append_unique_signal(items: list[str], value: str) -> None:
+    cleaned = str(value or "").strip().lower()
+    if cleaned and cleaned not in items:
+        items.append(cleaned)
+
+
+def _record_navigation_phases(target: list[str], phases: list[str]) -> None:
+    for phase in phases:
+        text = str(phase or "").strip().lower()
+        if not text:
+            continue
+        if "err_http2_protocol_error" in text:
+            _append_unique_signal(target, "edge_http2_protocol_error")
+        elif "err_http2_stream_error" in text:
+            _append_unique_signal(target, "edge_http2_stream_error")
+        elif "err_connection_reset" in text:
+            _append_unique_signal(target, "edge_connection_reset")
+        elif "err_connection_closed" in text:
+            _append_unique_signal(target, "edge_connection_closed")
+        elif "err_network_changed" in text:
+            _append_unique_signal(target, "edge_network_changed")
+        elif "err_timed_out" in text:
+            _append_unique_signal(target, "edge_timeout")
+        elif "err_aborted" in text:
+            _append_unique_signal(target, "edge_aborted")
+        elif text.startswith("preflight:"):
+            _append_unique_signal(target, "preflight_required")
+        elif text.startswith("preflight_failed:"):
+            _append_unique_signal(target, "preflight_failed")
+        elif text == "stabilize_timeout":
+            _append_unique_signal(target, "stabilize_timeout")
+
+
+def _delivery_preservation(
+    planned_url: str,
+    actual_url: str,
+) -> tuple[bool | None, bool | None]:
+    if not planned_url:
+        return None, None
+    planned = urllib.parse.urlparse(planned_url)
+    actual = urllib.parse.urlparse(actual_url or planned_url)
+
+    query_preserved: bool | None = None
+    fragment_preserved: bool | None = None
+
+    if planned.query:
+        query_preserved = actual.query == planned.query
+    if planned.fragment:
+        fragment_preserved = actual.fragment == planned.fragment
+
+    return query_preserved, fragment_preserved
+
+
+def _post_delivery_preservation(
+    actual_url: str,
+    overrides: dict[str, str],
+) -> tuple[bool | None, bool | None]:
+    if not actual_url:
+        return None, None
+    actual = urllib.parse.urlparse(actual_url)
+    if not actual.query:
+        return None, None
+    query_text = urllib.parse.unquote(actual.query)
+    payload_present = any(str(value or "") and str(value) in query_text for value in overrides.values())
+    return payload_present, None
 
 
 class ActiveExecutor:
@@ -166,10 +237,14 @@ class ActiveExecutor:
         """
         planned_modes: list[str] = []
         executed_modes: list[str] = []
+        edge_signals: list[str] = []
         preflight_attempted = False
         preflight_succeeded = False
         follow_up_attempted = False
         follow_up_succeeded = False
+        actual_url = ""
+        query_preserved: bool | None = None
+        fragment_preserved: bool | None = None
         if not self._started or self._browser is None:
             return ExecutionResult(
                 confirmed=False,
@@ -180,6 +255,7 @@ class ActiveExecutor:
                 param_name=param_name,
                 fired_url="",
                 error="Executor not started",
+                actual_url="",
             )
 
         plan = _build_delivery_plan(
@@ -263,9 +339,11 @@ class ActiveExecutor:
                 )
                 if not ok and nav_exc is not None:
                     log.debug("Preflight navigation error for %s after %s: %s", preflight_url, phases, nav_exc)
+                _record_navigation_phases(edge_signals, phases)
                 if ok:
                     preflight_succeeded = True
                     _append_unique(executed_modes, "preflight")
+                    _append_unique_signal(edge_signals, "session_warmup_succeeded")
 
             # Navigate — use domcontentloaded so we don't wait for all assets
             ok, phases, nav_exc = goto_with_edge_recovery(
@@ -277,6 +355,13 @@ class ActiveExecutor:
                 # Navigation errors (timeout, net error) don't mean no execution —
                 # a dialog event may have already fired and been caught.
                 log.debug("Navigation error for %s after %s: %s", fired_url, phases, nav_exc)
+            _record_navigation_phases(edge_signals, phases)
+            actual_url = page.url or fired_url
+            query_preserved, fragment_preserved = _delivery_preservation(fired_url, actual_url)
+            if query_preserved is False:
+                _append_unique_signal(edge_signals, "query_rewritten")
+            if fragment_preserved is False:
+                _append_unique_signal(edge_signals, "fragment_dropped")
             if ok:
                 for mode in planned_modes:
                     if mode not in {"preflight", "follow_up"}:
@@ -298,9 +383,12 @@ class ActiveExecutor:
                 )
                 if not ok and _nav_exc is not None:
                     log.debug("fire: follow-up nav error for %s after %s: %s", follow_up_url, phases, _nav_exc)
+                _record_navigation_phases(edge_signals, phases)
                 if ok:
                     follow_up_succeeded = True
                     _append_unique(executed_modes, "follow_up")
+                    _append_unique_signal(edge_signals, "follow_up_navigation_succeeded")
+                    actual_url = page.url or actual_url or fired_url
 
         except Exception as exc:
             return ExecutionResult(
@@ -318,6 +406,10 @@ class ActiveExecutor:
                 preflight_succeeded=preflight_succeeded,
                 follow_up_attempted=follow_up_attempted,
                 follow_up_succeeded=follow_up_succeeded,
+                edge_signals=edge_signals,
+                actual_url=actual_url,
+                query_preserved=query_preserved,
+                fragment_preserved=fragment_preserved,
             )
         finally:
             try:
@@ -339,6 +431,10 @@ class ActiveExecutor:
             preflight_succeeded=preflight_succeeded,
             follow_up_attempted=follow_up_attempted,
             follow_up_succeeded=follow_up_succeeded,
+            edge_signals=edge_signals,
+            actual_url=actual_url,
+            query_preserved=query_preserved,
+            fragment_preserved=fragment_preserved,
         )
 
 
@@ -379,8 +475,12 @@ class ActiveExecutor:
         detail = ""
         planned_modes: list[str] = []
         executed_modes: list[str] = []
+        edge_signals: list[str] = []
         follow_up_attempted = False
         follow_up_succeeded = False
+        actual_url = ""
+        query_preserved: bool | None = None
+        fragment_preserved: bool | None = None
         # Guard: only count execution events that happen AFTER the payload is
         # submitted.  Without this, console.log() calls on the form page itself
         # (e.g. analytics scripts) would fire _on_console and give a false positive
@@ -445,6 +545,7 @@ class ActiveExecutor:
             )
             if not ok and nav_exc is not None:
                 log.debug("fire_post: source page load error for %s after %s: %s", source_page_url, phases, nav_exc)
+            _record_navigation_phases(edge_signals, phases)
 
             plan = _build_post_delivery_plan(
                 source_page_url=source_page_url,
@@ -473,6 +574,10 @@ class ActiveExecutor:
                     error=f"fill failed: {fill_exc}",
                     planned_delivery_modes=planned_modes,
                     executed_delivery_modes=executed_modes,
+                    edge_signals=edge_signals,
+                    actual_url=actual_url,
+                    query_preserved=query_preserved,
+                    fragment_preserved=fragment_preserved,
                 )
 
             # Step 3: Submit the form — try submit button first, fall back to JS submit
@@ -492,11 +597,16 @@ class ActiveExecutor:
                     page.wait_for_load_state("domcontentloaded", timeout=_NAV_TIMEOUT_MS)
                 except Exception:
                     pass
+                actual_url = page.url or source_page_url
+                query_preserved, fragment_preserved = _post_delivery_preservation(actual_url, plan.param_overrides)
+                if query_preserved is False:
+                    _append_unique_signal(edge_signals, "post_payload_not_visible_in_url")
             except Exception as submit_exc:
                 log.debug("fire_post: submit error: %s", submit_exc)
                 # Submit failed — roll back the flag so follow-up page events
                 # (e.g. analytics console.log) are not mistaken for execution.
                 payload_submitted = False
+                _append_unique_signal(edge_signals, "submit_failed")
 
             # Step 4: Navigate to follow-up pages to catch session-stored XSS.
             # After the form POST, the payload may be stored server-side and
@@ -524,9 +634,12 @@ class ActiveExecutor:
                     )
                     if not ok and _nav_exc is not None:
                         log.debug("fire_post: follow-up nav error for %s after %s: %s", _fu, phases, _nav_exc)
+                    _record_navigation_phases(edge_signals, phases)
                     if ok:
                         follow_up_succeeded = True
                         _append_unique(executed_modes, "follow_up")
+                        _append_unique_signal(edge_signals, "follow_up_navigation_succeeded")
+                        actual_url = page.url or actual_url or source_page_url
 
         except Exception as exc:
             return ExecutionResult(
@@ -542,6 +655,10 @@ class ActiveExecutor:
                 executed_delivery_modes=executed_modes,
                 follow_up_attempted=follow_up_attempted,
                 follow_up_succeeded=follow_up_succeeded,
+                edge_signals=edge_signals,
+                actual_url=actual_url,
+                query_preserved=query_preserved,
+                fragment_preserved=fragment_preserved,
             )
         finally:
             try:
@@ -561,6 +678,10 @@ class ActiveExecutor:
             executed_delivery_modes=executed_modes,
             follow_up_attempted=follow_up_attempted,
             follow_up_succeeded=follow_up_succeeded,
+            edge_signals=edge_signals,
+            actual_url=actual_url,
+            query_preserved=query_preserved,
+            fragment_preserved=fragment_preserved,
         )
 
     def fire_upload(

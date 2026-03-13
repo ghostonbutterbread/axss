@@ -270,6 +270,7 @@ def _build_cloud_feedback_lessons(
         execution_results=execution_results or [],
         default_delivery_mode=delivery_mode,
     )
+    edge_blockers, delivery_outcomes = _infer_edge_feedback(execution_results or [])
     delivery_constraints = _infer_delivery_constraints(
         prompt_context=prompt_context,
         delivery_mode=delivery_mode,
@@ -277,6 +278,8 @@ def _build_cloud_feedback_lessons(
         sink_context=sink_context,
         observation=observation,
         attempted_delivery_modes=attempted_delivery_modes,
+        edge_blockers=edge_blockers,
+        delivery_outcomes=delivery_outcomes,
     )
 
     summary_parts = [
@@ -298,6 +301,14 @@ def _build_cloud_feedback_lessons(
     if delivery_constraints:
         summary_parts.append(
             "Delivery shifts for the next batch: " + " ".join(delivery_constraints)
+        )
+    if edge_blockers:
+        summary_parts.append(
+            "Observed edge/WAF blockers: " + ", ".join(edge_blockers[:4]) + "."
+        )
+    if delivery_outcomes:
+        summary_parts.append(
+            "Observed delivery outcomes: " + ", ".join(delivery_outcomes[:4]) + "."
         )
     summary_parts.append("Return a materially different next batch and avoid near-duplicates.")
     failed_families = _infer_failed_families(
@@ -330,6 +341,8 @@ def _build_cloud_feedback_lessons(
                 "strategy_constraints": strategy_constraints[:4],
                 "delivery_constraints": delivery_constraints[:4],
                 "attempted_delivery_modes": attempted_delivery_modes[:4],
+                "edge_blockers": edge_blockers[:5],
+                "delivery_outcomes": delivery_outcomes[:5],
                 "observation": observation.strip(),
                 "duplicate_payloads": [payload for payload in (duplicate_payloads or []) if payload][:4],
             },
@@ -446,6 +459,8 @@ def _infer_delivery_constraints(
     sink_context: str,
     observation: str,
     attempted_delivery_modes: list[str],
+    edge_blockers: list[str],
+    delivery_outcomes: list[str],
 ) -> list[str]:
     constraints: list[str] = []
     normalized_context = context_type.strip().lower()
@@ -475,6 +490,18 @@ def _infer_delivery_constraints(
         _add("Fragment delivery was already exercised; bias the next round toward query reshaping, multi-parameter delivery, or stateful follow-up pivots.")
     if "multi_param" in attempted_delivery_modes:
         _add("Multi-parameter delivery was already exercised; avoid repeating the same split and prefer a stateful or alternate-surface pivot next.")
+    if "fragment_dropped" in edge_blockers:
+        _add("Fragment delivery was not preserved by navigation/runtime handling; deprioritize fragment-only ideas and prefer query, coordinated, or same-session pivots.")
+    if "query_rewritten" in edge_blockers:
+        _add("Query delivery was rewritten or stripped at the edge/app layer; prefer fragment, POST, coordinated multi-parameter, or same-session pivots.")
+    if any(item.startswith("edge_http2_") or item.startswith("edge_connection_") for item in edge_blockers):
+        _add("Edge transport is unstable for attack requests; keep the next batch low-noise and prefer fewer deliberate attempts with session continuity.")
+    if "preflight_required" in edge_blockers and "preflight_failed" not in edge_blockers:
+        _add("A warm browser session appears necessary before delivery; prefer same-session or navigate-then-fire pivots over cold direct hits.")
+    if "follow_up_blocked" in delivery_outcomes:
+        _add("Stateful follow-up navigation did not complete; avoid over-investing in follow-up-only strategies until a simpler render path works.")
+    if "query_preserved" in delivery_outcomes and "fragment_preserved" not in delivery_outcomes and "fragment_dropped" not in edge_blockers:
+        _add("Query delivery is preserved cleanly; only pivot away from it if the syntax family changes materially.")
 
     try:
         from ai_xss_generator.behavior import extract_behavior_profile
@@ -492,6 +519,42 @@ def _infer_delivery_constraints(
         _add("Keep delivery low-noise and compact; prefer one or two deliberate pivots over broad request churn.")
 
     return constraints[:4]
+
+
+def _infer_edge_feedback(execution_results: list[Any]) -> tuple[list[str], list[str]]:
+    edge_blockers: list[str] = []
+    delivery_outcomes: list[str] = []
+
+    def _add(target: list[str], value: str) -> None:
+        cleaned = str(value or "").strip().lower()
+        if cleaned and cleaned not in target:
+            target.append(cleaned)
+
+    for result in execution_results:
+        for signal in getattr(result, "edge_signals", []) or []:
+            _add(edge_blockers, signal)
+        query_preserved = getattr(result, "query_preserved", None)
+        fragment_preserved = getattr(result, "fragment_preserved", None)
+        if query_preserved is True:
+            _add(delivery_outcomes, "query_preserved")
+        elif query_preserved is False:
+            _add(edge_blockers, "query_rewritten")
+        if fragment_preserved is True:
+            _add(delivery_outcomes, "fragment_preserved")
+        elif fragment_preserved is False:
+            _add(edge_blockers, "fragment_dropped")
+        if getattr(result, "preflight_attempted", False):
+            _add(delivery_outcomes, "preflight_attempted")
+        if getattr(result, "preflight_succeeded", False):
+            _add(delivery_outcomes, "preflight_succeeded")
+        if getattr(result, "follow_up_attempted", False):
+            _add(delivery_outcomes, "follow_up_attempted")
+            if not getattr(result, "follow_up_succeeded", False):
+                _add(delivery_outcomes, "follow_up_blocked")
+        if getattr(result, "follow_up_succeeded", False):
+            _add(delivery_outcomes, "follow_up_succeeded")
+
+    return edge_blockers[:5], delivery_outcomes[:5]
 
 
 def _infer_attempted_delivery_modes(

@@ -170,3 +170,102 @@ def test_cloud_feedback_prefers_executed_delivery_history_over_planned_only_mode
     )
 
     assert lessons[0].metadata["attempted_delivery_modes"] == ["fragment"]
+
+
+def test_cloud_feedback_lessons_capture_edge_blockers_and_delivery_outcomes() -> None:
+    context = ParsedContext(source="https://example.test/login?redirect=x", source_type="url")
+    profile = build_target_behavior_profile(
+        url=context.source,
+        delivery_mode="get",
+        waf_name="akamai",
+        auth_required=True,
+        context=context,
+    )
+    enriched = attach_behavior_profile(context, profile)
+    assert enriched is not None
+
+    failed_result = ExecutionResult(
+        confirmed=False,
+        method="",
+        detail="",
+        transform_name="cloud_model",
+        payload="javascript:alert(1)",
+        param_name="redirect",
+        fired_url="https://example.test/login?redirect=javascript:alert(1)#frag",
+        planned_delivery_modes=["get", "query", "fragment"],
+        executed_delivery_modes=["query", "preflight"],
+        preflight_attempted=True,
+        preflight_succeeded=True,
+        follow_up_attempted=True,
+        follow_up_succeeded=False,
+        edge_signals=["preflight_required", "fragment_dropped", "edge_http2_protocol_error"],
+        actual_url="https://example.test/login?redirect=javascript:alert(1)",
+        query_preserved=True,
+        fragment_preserved=False,
+    )
+
+    lessons = _build_cloud_feedback_lessons(
+        attempt_number=1,
+        total_attempts=2,
+        prompt_context=enriched,
+        delivery_mode="get",
+        context_type="html_attr_url",
+        sink_context="html_attr_url",
+        payloads_tried=["javascript:alert(1)"],
+        execution_results=[failed_result],
+        duplicate_payloads=[],
+        observation="No dialog, console, or network execution signal fired.",
+    )
+
+    metadata = lessons[0].metadata
+    assert "fragment_dropped" in metadata["edge_blockers"]
+    assert "edge_http2_protocol_error" in metadata["edge_blockers"]
+    assert "query_preserved" in metadata["delivery_outcomes"]
+    assert "follow_up_blocked" in metadata["delivery_outcomes"]
+    assert any("Fragment delivery was not preserved" in item for item in metadata["delivery_constraints"])
+
+
+def test_cloud_prompt_includes_edge_execution_feedback_details() -> None:
+    context = ParsedContext(source="https://example.test/login?redirect=x", source_type="url")
+    profile = build_target_behavior_profile(
+        url=context.source,
+        delivery_mode="get",
+        waf_name="akamai",
+        auth_required=True,
+        context=context,
+    )
+    enriched = attach_behavior_profile(context, profile)
+    assert enriched is not None
+    failed_result = ExecutionResult(
+        confirmed=False,
+        method="",
+        detail="",
+        transform_name="cloud_model",
+        payload="javascript:alert(1)",
+        param_name="redirect",
+        fired_url="https://example.test/login?redirect=javascript:alert(1)#frag",
+        planned_delivery_modes=["get", "query", "fragment"],
+        executed_delivery_modes=["query"],
+        edge_signals=["fragment_dropped", "edge_http2_protocol_error"],
+        actual_url="https://example.test/login?redirect=javascript:alert(1)",
+        query_preserved=True,
+        fragment_preserved=False,
+    )
+    lessons = _build_cloud_feedback_lessons(
+        attempt_number=1,
+        total_attempts=2,
+        prompt_context=enriched,
+        delivery_mode="get",
+        context_type="html_attr_url",
+        sink_context="html_attr_url",
+        payloads_tried=["javascript:alert(1)"],
+        execution_results=[failed_result],
+        duplicate_payloads=[],
+        observation="No dialog, console, or network execution signal fired.",
+    )
+
+    prompt = _cloud_prompt_for_context(enriched, past_lessons=lessons, waf="akamai")
+    assert '"edge_blockers": [' in prompt
+    assert '"fragment_dropped"' in prompt
+    assert '"delivery_outcomes": [' in prompt
+    assert '"query_preserved"' in prompt

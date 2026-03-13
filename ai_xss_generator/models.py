@@ -186,6 +186,8 @@ def _effective_constraints_section(
     strategy_shifts: list[str] = []
     delivery_shifts: list[str] = []
     attempted_delivery_modes: list[str] = []
+    edge_blockers: list[str] = []
+    delivery_outcomes: list[str] = []
     creative_techniques: list[str] = []
 
     if past_lessons:
@@ -209,6 +211,14 @@ def _effective_constraints_section(
                 mode_text = str(mode or "").strip()
                 if mode_text and mode_text not in attempted_delivery_modes:
                     attempted_delivery_modes.append(mode_text)
+            for blocker in metadata.get("edge_blockers", []) or []:
+                blocker_text = str(blocker or "").strip()
+                if blocker_text and blocker_text not in edge_blockers:
+                    edge_blockers.append(blocker_text)
+            for outcome in metadata.get("delivery_outcomes", []) or []:
+                outcome_text = str(outcome or "").strip()
+                if outcome_text and outcome_text not in delivery_outcomes:
+                    delivery_outcomes.append(outcome_text)
 
     if context_type == "html_attr_url":
         if "scheme_fragmentation" not in recommended_families:
@@ -246,6 +256,8 @@ def _effective_constraints_section(
         "observed_transforms": observed_transforms,
         "recommended_families": recommended_families[:5],
         "deprioritized_families": deprioritized_families[:5],
+        "edge_blockers": edge_blockers[:5],
+        "delivery_outcomes": delivery_outcomes[:5],
         "attempted_delivery_modes": attempted_delivery_modes[:4],
         "required_strategy_shifts": strategy_shifts[:4],
         "required_delivery_shifts": delivery_shifts[:4],
@@ -262,6 +274,8 @@ def _execution_feedback_section(past_lessons: list[Any] | None) -> str:
     strategy_constraints: list[str] = []
     delivery_constraints: list[str] = []
     attempted_delivery_modes: list[str] = []
+    edge_blockers: list[str] = []
+    delivery_outcomes: list[str] = []
     duplicate_payloads: list[str] = []
     observations: list[str] = []
 
@@ -281,6 +295,8 @@ def _execution_feedback_section(past_lessons: list[Any] | None) -> str:
         _extend_unique(strategy_constraints, metadata.get("strategy_constraints", []) or [], 5)
         _extend_unique(delivery_constraints, metadata.get("delivery_constraints", []) or [], 5)
         _extend_unique(attempted_delivery_modes, metadata.get("attempted_delivery_modes", []) or [], 5)
+        _extend_unique(edge_blockers, metadata.get("edge_blockers", []) or [], 5)
+        _extend_unique(delivery_outcomes, metadata.get("delivery_outcomes", []) or [], 5)
         _extend_unique(duplicate_payloads, metadata.get("duplicate_payloads", []) or [], 4)
         observation = str(metadata.get("observation", "") or "").strip()
         if observation and observation not in observations:
@@ -288,7 +304,7 @@ def _execution_feedback_section(past_lessons: list[Any] | None) -> str:
         if len(observations) >= 2:
             break
 
-    if not any((failed_families, strategy_constraints, delivery_constraints, attempted_delivery_modes, duplicate_payloads, observations)):
+    if not any((failed_families, strategy_constraints, delivery_constraints, attempted_delivery_modes, edge_blockers, delivery_outcomes, duplicate_payloads, observations)):
         return ""
 
     compact = {
@@ -296,6 +312,8 @@ def _execution_feedback_section(past_lessons: list[Any] | None) -> str:
         "strategy_shifts": strategy_constraints[:5],
         "delivery_shifts": delivery_constraints[:5],
         "attempted_delivery_modes": attempted_delivery_modes[:5],
+        "edge_blockers": edge_blockers[:5],
+        "delivery_outcomes": delivery_outcomes[:5],
         "duplicate_payloads": duplicate_payloads[:4],
         "observations": observations[:2],
     }
