@@ -815,6 +815,19 @@ def _attach_waf_knowledge_to_context(context: ParsedContext, waf_knowledge: dict
     return attach_waf_knowledge(context, waf_knowledge) or context
 
 
+def _format_ai_role(role: object) -> str:
+    backend = getattr(role, "backend", "") or "?"
+    tool = getattr(role, "tool", "") or "?"
+    model = getattr(role, "model", None)
+    fallback_models = tuple(getattr(role, "fallback_models", ()) or ())
+    parts = [f"{backend}:{tool}"]
+    if model:
+        parts.append(f"model={model}")
+    if fallback_models:
+        parts.append(f"fallbacks={','.join(fallback_models)}")
+    return " | ".join(parts)
+
+
 def _print_single_result(result: GenerationResult, output_mode: str, top: int, waf: str | None = None) -> None:
     _print_context_banner(result, waf=waf)
     if output_mode == "interactive":
@@ -1491,7 +1504,6 @@ def main(argv: list[str] | None = None) -> int:
     ai_backend = ai_config.ai_backend
     cli_tool = ai_config.cli_tool
     cli_model = ai_config.cli_model
-    reasoning_model = ai_config.xss_reasoning_model
     if use_cloud and ai_backend == "cli":
         from ai_xss_generator.ai_capabilities import choose_generation_tool
 
@@ -1520,6 +1532,13 @@ def main(argv: list[str] | None = None) -> int:
         cloud_model=cloud_model,
         cli_tool=cli_tool,
         xss_generation_model=cli_tool if ai_backend == "cli" else ai_config.xss_generation_model,
+        generation_role=_dc_replace(
+            ai_config.generation_role,
+            backend=ai_backend,
+            tool=cli_tool if ai_backend == "cli" else "api",
+            model=cli_model if ai_backend == "cli" else cloud_model,
+            fallback_models=ai_config.api_fallback_models if ai_backend == "api" else (),
+        ),
     )
     registry = PluginRegistry()
     registry.load_from(Path(__file__).resolve().parent.parent)
@@ -1540,11 +1559,8 @@ def main(argv: list[str] | None = None) -> int:
                 "Interesting-URL triage is using the API backend. This mode may issue multiple "
                 "paid model requests depending on how many URLs are in the file."
             )
-        if ai_backend == "cli":
-            info(f"XSS generation model: {cli_tool}")
-            info(f"XSS reasoning model: {reasoning_model}")
-        elif ai_backend == "api":
-            info(f"XSS generation model: {cloud_model}")
+        info(f"XSS generation role: {_format_ai_role(ai_config.generation_role)}")
+        info(f"XSS reasoning role: {_format_ai_role(ai_config.reasoning_role)}")
 
         step(f"Ranking {len(urls)} URL(s) for deep XSS follow-up...")
         try:
@@ -1608,11 +1624,8 @@ def main(argv: list[str] | None = None) -> int:
     # --generate always wins: if explicitly requested, route to payload generation
     # even when XSS type flags are also present.
     if _is_active_mode and not _want_generate:
-        if ai_backend == "cli":
-            info(f"XSS generation model: {cli_tool}")
-            info(f"XSS reasoning model: {reasoning_model}")
-        elif ai_backend == "api":
-            info(f"XSS generation model: {cloud_model}")
+        info(f"XSS generation role: {_format_ai_role(ai_config.generation_role)}")
+        info(f"XSS reasoning role: {_format_ai_role(ai_config.reasoning_role)}")
         if not (args.url or args.urls):
             parser.error(
                 "active scanning requires -u/--url or --urls — "
@@ -1670,11 +1683,8 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(errors[0].error)
 
         step(f"Generating payloads with {selected_model}...")
-        if ai_backend == "cli":
-            info(f"XSS generation model: {cli_tool}")
-            info(f"XSS reasoning model: {reasoning_model}")
-        elif ai_backend == "api":
-            info(f"XSS generation model: {cloud_model}")
+        info(f"XSS generation role: {_format_ai_role(ai_config.generation_role)}")
+        info(f"XSS reasoning role: {_format_ai_role(ai_config.reasoning_role)}")
         results = [
             _build_result(
                 context,
@@ -1809,11 +1819,8 @@ def main(argv: list[str] | None = None) -> int:
         context = _attach_waf_knowledge_to_context(enrich_context(context, probe_results), waf_knowledge)
 
     step(f"Generating payloads with {selected_model}...")
-    if ai_backend == "cli":
-        info(f"XSS generation model: {cli_tool}")
-        info(f"XSS reasoning model: {reasoning_model}")
-    elif ai_backend == "api":
-        info(f"XSS generation model: {cloud_model}")
+    info(f"XSS generation role: {_format_ai_role(ai_config.generation_role)}")
+    info(f"XSS reasoning role: {_format_ai_role(ai_config.reasoning_role)}")
     if resolved_waf:
         info(f"WAF context: {waf_label(resolved_waf)}")
     if reference_payloads:

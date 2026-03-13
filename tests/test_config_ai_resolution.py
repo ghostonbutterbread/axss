@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from ai_xss_generator.config import AppConfig, DEFAULT_MODEL, resolve_ai_config
+from ai_xss_generator.config import AIRoleConfig, AppConfig, DEFAULT_MODEL, resolve_ai_config
 
 
 def test_resolve_ai_config_uses_config_defaults() -> None:
@@ -29,6 +29,8 @@ def test_resolve_ai_config_uses_config_defaults() -> None:
     assert resolved.cli_model == "gpt-5-codex"
     assert resolved.xss_generation_model == "codex"
     assert resolved.xss_reasoning_model == "claude"
+    assert resolved.generation_role.tool == "codex"
+    assert resolved.reasoning_role.tool == "claude"
 
 
 def test_resolve_ai_config_applies_args_overrides() -> None:
@@ -58,6 +60,7 @@ def test_resolve_ai_config_applies_args_overrides() -> None:
     assert resolved.cli_model == "gpt-5-codex-mini"
     assert resolved.xss_generation_model == "codex"
     assert resolved.xss_reasoning_model == "codex"
+    assert resolved.generation_role.tool == "codex"
 
 
 def test_resolve_ai_config_sanitizes_invalid_values() -> None:
@@ -85,3 +88,33 @@ def test_resolve_ai_config_sanitizes_invalid_values() -> None:
     assert resolved.ai_backend == "api"
     assert resolved.cli_tool == "claude"
     assert resolved.cli_model is None
+
+
+def test_resolve_ai_config_prefers_nested_role_config() -> None:
+    config = AppConfig(
+        default_model="qwen3.5:9b",
+        use_cloud=True,
+        cloud_model="anthropic/legacy-should-not-win",
+        ai_backend="cli",
+        cli_tool="codex",
+        cli_model="legacy-model",
+        generation_role=AIRoleConfig(
+            backend="api",
+            tool="api",
+            model="anthropic/claude-3-5-sonnet",
+            fallback_models=("openai/gpt-4.1-mini",),
+        ),
+        reasoning_role=AIRoleConfig(
+            backend="cli",
+            tool="codex",
+            model="gpt-5-codex",
+        ),
+    )
+
+    resolved = resolve_ai_config(config)
+
+    assert resolved.ai_backend == "api"
+    assert resolved.cloud_model == "anthropic/claude-3-5-sonnet"
+    assert resolved.api_fallback_models == ("openai/gpt-4.1-mini",)
+    assert resolved.generation_role.backend == "api"
+    assert resolved.reasoning_role.tool == "codex"

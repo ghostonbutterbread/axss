@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +41,14 @@ def load_api_key(name: str) -> str:
 
 
 @dataclass(frozen=True)
+class AIRoleConfig:
+    backend: str = "cli"
+    tool: str = "claude"
+    model: str | None = None
+    fallback_models: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class AppConfig:
     default_model: str = DEFAULT_MODEL
     # Cloud escalation — set to False to never leave local Ollama.
@@ -60,6 +68,8 @@ class AppConfig:
     # Explicit role split for CLI backends. Values are tool names today.
     xss_generation_model: str | None = None
     xss_reasoning_model: str | None = None
+    generation_role: AIRoleConfig = field(default_factory=AIRoleConfig)
+    reasoning_role: AIRoleConfig = field(default_factory=AIRoleConfig)
 
 
 @dataclass(frozen=True)
@@ -73,6 +83,98 @@ class ResolvedAIConfig:
     cli_model: str | None = None
     xss_generation_model: str = "claude"
     xss_reasoning_model: str = "claude"
+    generation_role: AIRoleConfig = field(default_factory=AIRoleConfig)
+    reasoning_role: AIRoleConfig = field(default_factory=AIRoleConfig)
+
+
+def _sanitize_backend(value: Any, default: str = "api") -> str:
+    return value if value in ("api", "cli") else default
+
+
+def _sanitize_tool(value: Any, default: str = "claude") -> str:
+    return value if value in ("claude", "codex") else default
+
+
+def _sanitize_model(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value.strip()
+
+
+def _sanitize_fallback_models(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        return ()
+    cleaned: list[str] = []
+    for item in value:
+        if isinstance(item, str) and item.strip():
+            cleaned.append(item.strip())
+    return tuple(cleaned)
+
+
+def _role_from_config(raw: dict[str, Any], key: str, *, default_backend: str, default_tool: str) -> AIRoleConfig:
+    block = raw.get("ai", {})
+    role_raw = {}
+    if isinstance(block, dict):
+        roles_block = block.get("roles", {})
+        if isinstance(roles_block, dict):
+            maybe_role = roles_block.get(key, {})
+            if isinstance(maybe_role, dict):
+                role_raw = maybe_role
+
+    if role_raw:
+        backend = _sanitize_backend(role_raw.get("backend"), default_backend)
+        tool = _sanitize_tool(role_raw.get("tool"), default_tool)
+        model = _sanitize_model(role_raw.get("model"))
+        fallback_models = _sanitize_fallback_models(role_raw.get("fallback_models", []))
+        return AIRoleConfig(
+            backend=backend,
+            tool=tool,
+            model=model,
+            fallback_models=fallback_models,
+        )
+
+    if key == "generation":
+        backend = _sanitize_backend(raw.get("ai_backend", default_backend), default_backend)
+        tool = _sanitize_tool(raw.get("xss_generation_model", raw.get("cli_tool", default_tool)), default_tool)
+        model = _sanitize_model(raw.get("cli_model")) if backend == "cli" else _sanitize_model(raw.get("cloud_model"))
+        fallback_models = _sanitize_fallback_models(raw.get("api_fallback_models", [])) if backend == "api" else ()
+        return AIRoleConfig(
+            backend=backend,
+            tool=tool,
+            model=model,
+            fallback_models=fallback_models,
+        )
+
+    backend = _sanitize_backend(raw.get("ai_backend", default_backend), default_backend)
+    tool = _sanitize_tool(raw.get("xss_reasoning_model", raw.get("cli_tool", default_tool)), default_tool)
+    model = _sanitize_model(raw.get("cli_model")) if backend == "cli" else _sanitize_model(raw.get("cloud_model"))
+    return AIRoleConfig(
+        backend=backend,
+        tool=tool,
+        model=model,
+        fallback_models=(),
+    )
+
+
+def _derive_generation_role_from_legacy(config: AppConfig) -> AIRoleConfig:
+    backend = _sanitize_backend(config.ai_backend, "api")
+    return AIRoleConfig(
+        backend=backend,
+        tool=_sanitize_tool(config.xss_generation_model or config.cli_tool, "claude"),
+        model=config.cli_model if backend == "cli" else config.cloud_model,
+        fallback_models=config.api_fallback_models if backend == "api" else (),
+    )
+
+
+def _derive_reasoning_role_from_legacy(config: AppConfig, generation_role: AIRoleConfig) -> AIRoleConfig:
+    return AIRoleConfig(
+        backend=_sanitize_backend(config.ai_backend, generation_role.backend),
+        tool=_sanitize_tool(config.xss_reasoning_model or config.cli_tool, generation_role.tool),
+        model=config.cli_model if generation_role.backend == "cli" else config.cloud_model,
+        fallback_models=(),
+    )
 
 
 def load_config() -> AppConfig:
@@ -96,43 +198,28 @@ def load_config() -> AppConfig:
     if not isinstance(cloud_model, str) or not cloud_model.strip():
         cloud_model = "anthropic/claude-3-5-sonnet"
 
-    api_fallback_models_raw = raw.get("api_fallback_models", [])
-    api_fallback_models: list[str] = []
-    if isinstance(api_fallback_models_raw, list):
-        for item in api_fallback_models_raw:
-            if isinstance(item, str) and item.strip():
-                api_fallback_models.append(item.strip())
+    generation_role = _role_from_config(raw, "generation", default_backend="cli", default_tool="claude")
+    reasoning_role = _role_from_config(raw, "reasoning", default_backend="cli", default_tool="claude")
 
-    ai_backend = raw.get("ai_backend", "api")
-    if ai_backend not in ("api", "cli"):
-        ai_backend = "api"
-
-    cli_tool = raw.get("cli_tool", "claude")
-    if cli_tool not in ("claude", "codex"):
-        cli_tool = "claude"
-
-    cli_model = raw.get("cli_model", None)
-    if cli_model is not None and (not isinstance(cli_model, str) or not cli_model.strip()):
-        cli_model = None
-
-    xss_generation_model = raw.get("xss_generation_model", None)
-    if xss_generation_model is not None and xss_generation_model not in ("claude", "codex"):
-        xss_generation_model = None
-
-    xss_reasoning_model = raw.get("xss_reasoning_model", None)
-    if xss_reasoning_model is not None and xss_reasoning_model not in ("claude", "codex"):
-        xss_reasoning_model = None
+    ai_backend = generation_role.backend
+    cli_tool = generation_role.tool
+    cli_model = generation_role.model if generation_role.backend == "cli" else _sanitize_model(raw.get("cli_model"))
+    api_fallback_models = generation_role.fallback_models or _sanitize_fallback_models(raw.get("api_fallback_models", []))
+    xss_generation_model = generation_role.tool
+    xss_reasoning_model = reasoning_role.tool
 
     return AppConfig(
         default_model=default_model.strip(),
         use_cloud=use_cloud,
         cloud_model=cloud_model.strip(),
-        api_fallback_models=tuple(api_fallback_models),
+        api_fallback_models=api_fallback_models,
         ai_backend=ai_backend,
         cli_tool=cli_tool,
         cli_model=cli_model.strip() if cli_model else None,
         xss_generation_model=xss_generation_model,
         xss_reasoning_model=xss_reasoning_model,
+        generation_role=generation_role,
+        reasoning_role=reasoning_role,
     )
 
 
@@ -161,41 +248,76 @@ def resolve_ai_config(
         no_cloud = bool(getattr(args, "no_cloud", False)) if args is not None else False
     resolved_use_cloud = bool(config.use_cloud) and not bool(no_cloud)
 
-    resolved_cloud_model = cloud_model or config.cloud_model or "anthropic/claude-3-5-sonnet"
-    if not isinstance(resolved_cloud_model, str) or not resolved_cloud_model.strip():
-        resolved_cloud_model = "anthropic/claude-3-5-sonnet"
-    resolved_api_fallback_models = tuple(
-        item for item in getattr(config, "api_fallback_models", ()) if isinstance(item, str) and item.strip()
+    default_role = AIRoleConfig()
+    resolved_generation_role = (
+        _derive_generation_role_from_legacy(config)
+        if config.generation_role == default_role
+        else config.generation_role
+    )
+    resolved_reasoning_role = (
+        _derive_reasoning_role_from_legacy(config, resolved_generation_role)
+        if config.reasoning_role == default_role
+        else config.reasoning_role
     )
 
-    resolved_backend = ai_backend or getattr(args, "backend", None) or config.ai_backend or "api"
-    if resolved_backend not in {"api", "cli"}:
-        resolved_backend = "api"
+    resolved_backend = (
+        ai_backend
+        or getattr(args, "backend", None)
+        or resolved_generation_role.backend
+        or config.ai_backend
+        or "api"
+    )
+    resolved_backend = _sanitize_backend(resolved_backend, resolved_generation_role.backend or "api")
 
-    resolved_cli_tool = (
+    generation_model_candidate = (
         cli_tool
         or getattr(args, "cli_tool", None)
+        or resolved_generation_role.tool
         or config.xss_generation_model
         or config.cli_tool
         or "claude"
     )
-    if resolved_cli_tool not in {"claude", "codex"}:
-        resolved_cli_tool = "claude"
+    resolved_cli_tool = _sanitize_tool(generation_model_candidate, "claude")
 
-    resolved_reasoning_model = config.xss_reasoning_model or resolved_cli_tool
-    if resolved_reasoning_model not in {"claude", "codex"}:
-        resolved_reasoning_model = resolved_cli_tool
+    reasoning_model_candidate = (
+        resolved_reasoning_role.tool
+        if (config.xss_reasoning_model or config.reasoning_role != default_role)
+        else resolved_cli_tool
+    )
+    resolved_reasoning_model = _sanitize_tool(reasoning_model_candidate, resolved_cli_tool)
 
     resolved_cli_model = cli_model
     if resolved_cli_model is None and args is not None:
         resolved_cli_model = getattr(args, "cli_model", None)
     if resolved_cli_model is None:
-        resolved_cli_model = config.cli_model
-    if resolved_cli_model is not None:
-        if not isinstance(resolved_cli_model, str) or not resolved_cli_model.strip():
-            resolved_cli_model = None
-        else:
-            resolved_cli_model = resolved_cli_model.strip()
+        resolved_cli_model = resolved_generation_role.model if resolved_backend == "cli" else config.cli_model
+    resolved_cli_model = _sanitize_model(resolved_cli_model)
+
+    resolved_cloud_model = (
+        cloud_model
+        or (resolved_generation_role.model if resolved_backend == "api" else None)
+        or config.cloud_model
+        or "anthropic/claude-3-5-sonnet"
+    )
+    if not isinstance(resolved_cloud_model, str) or not resolved_cloud_model.strip():
+        resolved_cloud_model = "anthropic/claude-3-5-sonnet"
+    resolved_api_fallback_models = (
+        resolved_generation_role.fallback_models
+        or tuple(item for item in getattr(config, "api_fallback_models", ()) if isinstance(item, str) and item.strip())
+    )
+
+    generation_role = AIRoleConfig(
+        backend=resolved_backend,
+        tool=resolved_cli_tool if resolved_backend == "cli" else "api",
+        model=resolved_cli_model if resolved_backend == "cli" else resolved_cloud_model.strip(),
+        fallback_models=resolved_api_fallback_models if resolved_backend == "api" else (),
+    )
+    reasoning_role = AIRoleConfig(
+        backend=resolved_reasoning_role.backend or resolved_backend,
+        tool=resolved_reasoning_model if resolved_reasoning_role.backend == "cli" else resolved_reasoning_role.tool,
+        model=resolved_reasoning_role.model,
+        fallback_models=resolved_reasoning_role.fallback_models,
+    )
 
     return ResolvedAIConfig(
         model=resolved_model.strip(),
@@ -207,4 +329,6 @@ def resolve_ai_config(
         cli_model=resolved_cli_model,
         xss_generation_model=resolved_cli_tool,
         xss_reasoning_model=resolved_reasoning_model,
+        generation_role=generation_role,
+        reasoning_role=reasoning_role,
     )
