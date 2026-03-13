@@ -54,6 +54,7 @@ def _build_report(results: Sequence[WorkerResult], config_summary: str) -> str:
     confirmed_results = [r for r in results if r.status == "confirmed"]
     taint_results     = [r for r in results if r.status == "taint_only"]
     error_results     = [r for r in results if r.status == "error"]
+    dead_results      = [r for r in results if r.dead_target]
 
     all_findings: list[ConfirmedFinding] = [
         f
@@ -130,6 +131,19 @@ def _build_report(results: Sequence[WorkerResult], config_summary: str) -> str:
         for r in error_results:
             err = (r.error or "unknown error").replace("|", "\\|")
             lines.append(f"| `{r.url}` | {err} |")
+        lines.append("")
+
+    # ── Dead Targets ─────────────────────────────────────────────────────────
+    if dead_results:
+        lines += [
+            f"## ⏹️ Dead Targets ({len(dead_results)})",
+            "",
+            "| URL | Status | Reason |",
+            "|-----|--------|--------|",
+        ]
+        for r in dead_results:
+            reason = (r.dead_reason or "No further technical signal justified more budget.").replace("|", "\\|")
+            lines.append(f"| `{r.url}` | `{r.status}` | {reason} |")
         lines.append("")
 
     # ── Known Limitations ─────────────────────────────────────────────────────

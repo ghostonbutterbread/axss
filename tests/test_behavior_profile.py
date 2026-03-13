@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from ai_xss_generator.behavior import (
+    classify_target_disposition,
     derive_ai_escalation_policy,
     attach_behavior_profile,
     build_target_behavior_profile,
@@ -188,3 +189,45 @@ def test_escalation_policy_skips_local_for_document_write_dom() -> None:
 
     assert policy.use_local is False
     assert policy.cloud_start_after_seconds == 0.0
+
+
+def test_classify_target_disposition_marks_hard_dead_without_reflection() -> None:
+    context = ParsedContext(source="https://example.test/search?q=x", source_type="url")
+    profile = build_target_behavior_profile(
+        url=context.source,
+        delivery_mode="get",
+        waf_name="akamai",
+        context=context,
+    )
+    enriched = attach_behavior_profile(context, profile)
+
+    disposition = classify_target_disposition(
+        enriched,
+        delivery_mode="get",
+        reflected_params=0,
+        injectable_params=0,
+    )
+
+    assert disposition.is_dead is True
+    assert disposition.tier == "hard_dead"
+
+
+def test_classify_target_disposition_marks_soft_dead_for_filtered_reflection() -> None:
+    context = ParsedContext(source="https://example.test/search?q=x", source_type="url")
+    profile = build_target_behavior_profile(
+        url=context.source,
+        delivery_mode="get",
+        waf_name=None,
+        context=context,
+    )
+    enriched = attach_behavior_profile(context, profile)
+
+    disposition = classify_target_disposition(
+        enriched,
+        delivery_mode="get",
+        reflected_params=1,
+        injectable_params=0,
+    )
+
+    assert disposition.is_dead is True
+    assert disposition.tier == "soft_dead"

@@ -396,6 +396,44 @@ def test_get_worker_skips_local_on_high_friction_hard_context_and_uses_cloud() -
     assert "Skipped local model" in results[0].confirmed_findings[0].ai_note
 
 
+def test_get_worker_marks_dead_target_when_no_reflection() -> None:
+    url = "https://example.test/search?q=x"
+    results: list[WorkerResult] = []
+
+    with (
+        patch("ai_xss_generator.probe.probe_url", return_value=[]),
+        patch(
+            "ai_xss_generator.parser.parse_target",
+            return_value=_context_with_behavior(url, delivery_mode="get", waf_name="akamai"),
+        ),
+        patch("ai_xss_generator.probe.fetch_html_with_browser", return_value="<html></html>"),
+    ):
+        _run(
+            url=url,
+            rate=5.0,
+            waf_hint="akamai",
+            model="qwen3.5",
+            cloud_model="anthropic/claude-3-5-sonnet",
+            use_cloud=True,
+            timeout_seconds=30,
+            result_queue=None,
+            dedup_registry={},
+            dedup_lock=threading.Lock(),
+            findings_lock=threading.Lock(),
+            start_time=time.monotonic(),
+            put_result=results.append,
+            auth_headers=None,
+            sink_url=None,
+            ai_backend="api",
+            cli_tool="claude",
+            cli_model=None,
+        )
+
+    assert results and results[0].status == "no_reflection"
+    assert results[0].dead_target is True
+    assert "No reflection was confirmed" in results[0].dead_reason
+
+
 class _FakeBrowser:
     def close(self) -> None:
         pass

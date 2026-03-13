@@ -96,6 +96,13 @@ class AIEscalationPolicy:
     note: str = ""
 
 
+@dataclass(slots=True)
+class TargetDisposition:
+    tier: str = "live"
+    is_dead: bool = False
+    reason: str = ""
+
+
 def build_target_behavior_profile(
     *,
     url: str,
@@ -323,6 +330,72 @@ def derive_ai_escalation_policy(
         )
 
     return AIEscalationPolicy()
+
+
+def classify_target_disposition(
+    context: ParsedContext | None,
+    *,
+    delivery_mode: str,
+    reflected_params: int = 0,
+    injectable_params: int = 0,
+    dom_hits: int = 0,
+    coordinated_attempts: int = 0,
+) -> TargetDisposition:
+    """Classify whether the current target is worth deeper model budget."""
+    profile = extract_behavior_profile(context)
+    reflection_contexts = list(profile.get("reflection_contexts", []) or [])
+    probe_modes = list(profile.get("probe_modes", []) or [])
+    reflection_transforms = list(profile.get("reflection_transforms", []) or [])
+
+    if delivery_mode == "dom":
+        if dom_hits <= 0:
+            return TargetDisposition(
+                tier="hard_dead",
+                is_dead=True,
+                reason="No DOM taint path was confirmed during runtime discovery.",
+            )
+        return TargetDisposition(
+            tier="live",
+            is_dead=False,
+            reason="DOM taint reached at least one executable sink; worth deeper execution attempts.",
+        )
+
+    if reflected_params <= 0:
+        return TargetDisposition(
+            tier="hard_dead",
+            is_dead=True,
+            reason="No reflection was confirmed during bounded discovery.",
+        )
+
+    if injectable_params <= 0 and coordinated_attempts <= 0:
+        transform_note = ""
+        if reflection_transforms:
+            transform_note = " Observed transforms: " + ", ".join(reflection_transforms) + "."
+        context_note = ""
+        if reflection_contexts:
+            context_note = " Reflected contexts: " + ", ".join(reflection_contexts) + "."
+        return TargetDisposition(
+            tier="soft_dead",
+            is_dead=True,
+            reason=(
+                "Reflection exists, but the currently tested charset and contexts did not yield an executable path."
+                + transform_note
+                + context_note
+            ).strip(),
+        )
+
+    if "stealth" in probe_modes:
+        return TargetDisposition(
+            tier="high_value",
+            is_dead=False,
+            reason="Target required stealth-style probing but still produced exploitable signal.",
+        )
+
+    return TargetDisposition(
+        tier="live",
+        is_dead=False,
+        reason="Target produced executable reflection signal during bounded discovery.",
+    )
 
 
 def attach_behavior_profile(

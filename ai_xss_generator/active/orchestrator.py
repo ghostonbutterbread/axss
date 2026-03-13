@@ -484,6 +484,8 @@ def _log_result(r: WorkerResult) -> None:
             + (", cloud escalated" if r.cloud_escalated else "")
             + ")"
         )
+        if r.dead_reason:
+            info(f"    {r.dead_reason}")
     elif r.status == "taint_only":
         info(
             f"[active] DOM taint confirmed, but no execution — {r.url} "
@@ -492,6 +494,13 @@ def _log_result(r: WorkerResult) -> None:
         for f in r.confirmed_findings:
             display_url = _up.unquote(f.fired_url)
             info(f"  ↳ [{f.param_name}] {display_url}")
+        if r.dead_reason:
+            info(f"    {r.dead_reason}")
+    elif r.status == "no_reflection":
+        label = "dead target" if r.dead_target else "no reflection"
+        info(f"[active] {label} — {r.url}")
+        if r.dead_reason:
+            info(f"    {r.dead_reason}")
     elif r.status == "error":
         warn(f"[active] error — {r.url}: {r.error}")
 

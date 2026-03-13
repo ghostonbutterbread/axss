@@ -136,6 +136,8 @@ class WorkerResult:
     params_reflected: int = 0
     # Work item type — used by session checkpointing
     kind: str = "get"       # "get" | "post"
+    dead_target: bool = False
+    dead_reason: str = ""
 
 
 def _join_lessons(*lesson_groups: list[Any] | None) -> list[Any] | None:
@@ -432,8 +434,13 @@ def _run(
         log.debug("Pre-parse of %s failed (will retry per-param): %s", url, exc)
 
     session_lessons: list[Any] = []
+    target_disposition: Any = None
     try:
-        from ai_xss_generator.behavior import attach_behavior_profile, build_target_behavior_profile
+        from ai_xss_generator.behavior import (
+            attach_behavior_profile,
+            build_target_behavior_profile,
+            classify_target_disposition,
+        )
         from ai_xss_generator.learning import build_memory_profile
         from ai_xss_generator.lessons import (
             build_behavior_lessons,
@@ -450,6 +457,13 @@ def _run(
             probe_results=probe_results,
         )
         _cached_context = attach_behavior_profile(_cached_context, behavior_profile)
+        target_disposition = classify_target_disposition(
+            _cached_context,
+            delivery_mode="get",
+            reflected_params=len(reflected),
+            injectable_params=len(injectable),
+            coordinated_attempts=len(coordinated_attempts),
+        )
 
         memory_profile = build_memory_profile(
             context=_cached_context,
@@ -480,6 +494,11 @@ def _run(
             status="no_reflection",
             waf=waf_hint,
             params_tested=len(flat_params),
+            dead_target=True,
+            dead_reason=(
+                getattr(target_disposition, "reason", "")
+                or "No reflection was confirmed during bounded discovery."
+            ),
         ))
         return
 
@@ -490,6 +509,11 @@ def _run(
             waf=waf_hint,
             params_tested=len(flat_params),
             params_reflected=len(reflected),
+            dead_target=True,
+            dead_reason=(
+                getattr(target_disposition, "reason", "")
+                or "Reflection exists, but no executable context was confirmed."
+            ),
         ))
         return
 
@@ -1319,8 +1343,13 @@ def _run_dom(
     findings: list[ConfirmedFinding] = []
     cloud_escalated = False
     dom_session_lessons: list[Any] = []
+    target_disposition: Any = None
     try:
-        from ai_xss_generator.behavior import attach_behavior_profile, build_target_behavior_profile
+        from ai_xss_generator.behavior import (
+            attach_behavior_profile,
+            build_target_behavior_profile,
+            classify_target_disposition,
+        )
         from ai_xss_generator.learning import build_memory_profile
         from ai_xss_generator.lessons import build_behavior_lessons, build_mapping_lessons
 
@@ -1333,6 +1362,11 @@ def _run_dom(
             dom_hits=dom_hits,
         )
         _cached_context = attach_behavior_profile(_cached_context, behavior_profile)
+        target_disposition = classify_target_disposition(
+            _cached_context,
+            delivery_mode="dom",
+            dom_hits=len(dom_hits),
+        )
 
         memory_profile = build_memory_profile(
             context=_cached_context,
@@ -1604,6 +1638,15 @@ def _run_dom(
         waf=waf_hint,
         cloud_escalated=cloud_escalated,
         kind="dom",
+        dead_target=bool(getattr(target_disposition, "is_dead", False)),
+        dead_reason=(
+            getattr(target_disposition, "reason", "")
+            if findings or status == "taint_only"
+            else (
+                getattr(target_disposition, "reason", "")
+                or "No DOM source-to-sink taint path was confirmed."
+            )
+        ),
     ))
 
 
@@ -1821,8 +1864,13 @@ def _run_post(
         log.debug("Pre-parse of form source %s failed: %s", post_form.source_page_url, exc)
 
     post_session_lessons: list[Any] = []
+    target_disposition: Any = None
     try:
-        from ai_xss_generator.behavior import attach_behavior_profile, build_target_behavior_profile
+        from ai_xss_generator.behavior import (
+            attach_behavior_profile,
+            build_target_behavior_profile,
+            classify_target_disposition,
+        )
         from ai_xss_generator.learning import build_memory_profile
         from ai_xss_generator.lessons import (
             build_behavior_lessons,
@@ -1839,6 +1887,12 @@ def _run_post(
             probe_results=probe_results,
         )
         _cached_context = attach_behavior_profile(_cached_context, behavior_profile)
+        target_disposition = classify_target_disposition(
+            _cached_context,
+            delivery_mode="post",
+            reflected_params=len(reflected),
+            injectable_params=len(injectable),
+        )
 
         memory_profile = build_memory_profile(
             context=_cached_context,
@@ -1869,6 +1923,11 @@ def _run_post(
             status="no_reflection",
             waf=waf_hint,
             params_tested=len(post_form.param_names),
+            dead_target=True,
+            dead_reason=(
+                getattr(target_disposition, "reason", "")
+                or "No reflection was confirmed during bounded discovery."
+            ),
         ))
         return
 
@@ -1879,6 +1938,11 @@ def _run_post(
             waf=waf_hint,
             params_tested=len(post_form.param_names),
             params_reflected=len(reflected),
+            dead_target=True,
+            dead_reason=(
+                getattr(target_disposition, "reason", "")
+                or "Reflection exists, but no executable context was confirmed."
+            ),
         ))
         return
 
