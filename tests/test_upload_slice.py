@@ -61,6 +61,7 @@ def test_seed_hash_includes_upload_targets() -> None:
         upload_targets=[],
         scan_reflected=False,
         scan_stored=True,
+        scan_uploads=False,
         scan_dom=False,
     )
     upload_hash = compute_seed_hash(
@@ -76,6 +77,7 @@ def test_seed_hash_includes_upload_targets() -> None:
         )],
         scan_reflected=False,
         scan_stored=True,
+        scan_uploads=True,
         scan_dom=False,
     )
 

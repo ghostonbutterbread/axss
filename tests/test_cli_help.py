@@ -1,5 +1,7 @@
 import unittest
+from unittest.mock import patch
 
+from ai_xss_generator import cli
 from ai_xss_generator.cli import build_parser
 from ai_xss_generator.config import DEFAULT_MODEL
 
@@ -34,6 +36,7 @@ class CliHelpTest(unittest.TestCase):
         self.assertIn("--generate", help_text)
         self.assertIn("--reflected", help_text)
         self.assertIn("--stored", help_text)
+        self.assertIn("--uploads", help_text)
         self.assertIn("--dom", help_text)
         self.assertNotIn("--html", help_text)
         self.assertNotIn("(default: None)", help_text)
@@ -52,6 +55,38 @@ class CliHelpTest(unittest.TestCase):
 
         args = parser.parse_args(["--memory-import", "/tmp/in.yaml"])
         self.assertEqual(args.memory_import, "/tmp/in.yaml")
+
+    def test_main_routes_upload_only_scan_to_active_runner(self) -> None:
+        captured: dict[str, object] = {}
+
+        def _fake_run_active_scan(*args, **kwargs):
+            captured.update(kwargs)
+            return 0
+
+        with patch.object(cli, "_run_active_scan", side_effect=_fake_run_active_scan):
+            rc = cli.main(["-u", "https://example.test/profile", "--uploads"])
+
+        self.assertEqual(rc, 0)
+        self.assertFalse(captured["scan_reflected"])
+        self.assertFalse(captured["scan_stored"])
+        self.assertTrue(captured["scan_uploads"])
+        self.assertFalse(captured["scan_dom"])
+
+    def test_main_default_active_scan_includes_uploads(self) -> None:
+        captured: dict[str, object] = {}
+
+        def _fake_run_active_scan(*args, **kwargs):
+            captured.update(kwargs)
+            return 0
+
+        with patch.object(cli, "_run_active_scan", side_effect=_fake_run_active_scan):
+            rc = cli.main(["-u", "https://example.test/profile"])
+
+        self.assertEqual(rc, 0)
+        self.assertTrue(captured["scan_reflected"])
+        self.assertTrue(captured["scan_stored"])
+        self.assertTrue(captured["scan_uploads"])
+        self.assertTrue(captured["scan_dom"])
 
 
 if __name__ == "__main__":

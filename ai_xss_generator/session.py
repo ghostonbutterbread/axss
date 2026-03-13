@@ -53,6 +53,7 @@ def compute_seed_hash(
     upload_targets: "list[UploadTarget]",
     scan_reflected: bool,
     scan_stored: bool,
+    scan_uploads: bool,
     scan_dom: bool,
 ) -> str:
     """Return a 64-char hex SHA-256 that uniquely identifies this scan profile."""
@@ -78,6 +79,7 @@ def compute_seed_hash(
         ),
         "reflected": scan_reflected,
         "stored": scan_stored,
+        "uploads": scan_uploads,
         "dom": scan_dom,
     }
     raw = json.dumps(canonical, sort_keys=True, separators=(",", ":"))

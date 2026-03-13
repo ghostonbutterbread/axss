@@ -6,18 +6,19 @@
 
 ## What this tool is
 
-`axss` is a context-aware XSS scanner for authorized penetration testing. It crawls a live target, maps every GET parameter and POST form it finds, probes each one for reflection and filter behavior, then generates ranked payloads tailored to what the probe observed. It fires each payload through a real Playwright browser and confirms JavaScript execution via dialog hooks, console output, or network beacon. It covers reflected XSS, session-stored XSS, POST forms protected by dynamic CSRF tokens, and DOM XSS via runtime source→sink discovery.
+`axss` is a context-aware XSS scanner for authorized penetration testing. It crawls a live target, maps every GET parameter, POST form, and multipart upload workflow it finds, probes each one for reflection and filter behavior, then generates ranked payloads tailored to what the probe observed. It fires each payload through a real Playwright browser and confirms JavaScript execution via dialog hooks, console output, or network beacon. It covers reflected XSS, session-stored XSS, POST forms protected by dynamic CSRF tokens, multipart upload workflows, and DOM XSS via runtime source→sink discovery.
 
 ## Visual flow
 
 ```text
-Active scan flow (GET + POST + DOM)
+Active scan flow (GET + POST + uploads + DOM)
 
   crawl / parse target
          |
          v
   discover injectable runtime context
   - GET / POST: probe reflections, context type, surviving chars
+  - Uploads: discover multipart forms, file fields, companion fields, follow-up sinks
   - DOM: runtime taint paths, source type, sink, code location
          |
          v
@@ -147,6 +148,7 @@ Goal: scan a live web target for XSS
 Crawls the target from the seed URL to discover the full attack surface before scanning. Produces two lists:
 - **GET URLs** — endpoints with at least one non-tracking query parameter
 - **POST forms** — forms on any crawled page, with CSRF token fields already identified
+- **Upload forms** — multipart workflows with file inputs, companion fields, and hidden defaults
 
 Two crawlers are available:
 
@@ -194,7 +196,7 @@ Stops at the first page where the canary appears. The char survival probe and al
 
 Two execution modes matter here:
 
-1. **Active scan (`--active`, `--reflected`, `--stored`, `--dom`)**
+1. **Active scan (`--active`, `--reflected`, `--stored`, `--uploads`, `--dom`)**
    - Probe first
    - Build enriched reasoning context from parsed page state, probe observations, target behavior profile, session lessons, and curated findings
    - Classify the target as hard-dead / soft-dead / live before spending more model budget
@@ -215,7 +217,7 @@ The deterministic generator is still present and useful, but in active scanning 
 
 ### Active execution
 
-Each GET URL, POST form, and DOM XSS runtime target gets an isolated worker process. Worker fires payloads through a real Playwright browser and detects execution via:
+Each GET URL, POST form, upload workflow, and DOM XSS runtime target gets an isolated worker process. Worker fires payloads through a real Playwright browser and detects execution via:
 - `dialog` — `alert()` / `confirm()` / `prompt()` triggered
 - `console` — `console.log()` / `console.error()` fired
 - `network` — outbound request to internal beacon hostname
@@ -293,6 +295,9 @@ axss -u "https://target.com" --active --reflected
 
 # Scan only POST forms / stored XSS
 axss -u "https://target.com" --active --stored
+
+# Scan only multipart upload workflows
+axss -u "https://target.com" --active --uploads
 
 # Scan only DOM XSS
 axss -u "https://target.com" --active --dom
@@ -413,6 +418,7 @@ axss --help
 | `--active` | off | Fire payloads in Playwright and confirm execution |
 | `--reflected` | off | Test reflected XSS only (GET params); implies `--active` |
 | `--stored` | off | Test stored/POST XSS only; implies `--active` |
+| `--uploads` | off | Test multipart upload / artifact workflows only; implies `--active` |
 | `--dom` | off | Test DOM-based XSS via runtime source→sink analysis and browser confirmation; implies `--active` |
 | `--generate` | off | Generate AI-ranked payloads without browser execution |
 | `--no-crawl` | off | Skip crawling — test only the provided URL |

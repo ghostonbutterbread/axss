@@ -60,6 +60,7 @@ class ActiveScanConfig:
     # XSS type selectors — control which scan types run
     scan_reflected: bool = True   # GET parameter injection (reflected XSS)
     scan_stored: bool = True      # POST form injection (stored XSS)
+    scan_uploads: bool = True     # multipart upload / artifact workflows
     scan_dom: bool = True         # DOM source/sink analysis (DOM XSS)
     # AI backend for cloud escalation
     ai_backend: str = "api"       # "api" | "cli"
@@ -113,6 +114,7 @@ def run_active_scan(
         work_items += [("get", u) for u in url_list]
     if config.scan_stored:
         work_items += [("post", pf) for pf in post_form_list]
+    if config.scan_uploads:
         work_items += [("upload", ut) for ut in upload_target_list]
 
     if config.scan_dom:
@@ -145,8 +147,10 @@ def run_active_scan(
             return prior_results
         if config.scan_reflected and not url_list:
             _reasons.append("no GET URLs with testable query parameters")
-        if config.scan_stored and not post_form_list and not upload_target_list:
-            _reasons.append("no POST or upload forms discovered (try without --no-crawl)")
+        if config.scan_stored and not post_form_list:
+            _reasons.append("no POST forms discovered (try without --no-crawl)")
+        if config.scan_uploads and not upload_target_list:
+            _reasons.append("no upload forms discovered (uploads require crawl discovery or explicit targets)")
         if _reasons:
             info(f"Active scan: nothing to test — {'; '.join(_reasons)}")
         return []
@@ -154,6 +158,7 @@ def run_active_scan(
     _active_types = " + ".join(filter(None, [
         "reflected" if config.scan_reflected else None,
         "stored" if config.scan_stored else None,
+        "uploads" if config.scan_uploads else None,
         "dom" if config.scan_dom else None,
     ]))
     n_get = sum(1 for kind, _ in work_items if kind == "get")

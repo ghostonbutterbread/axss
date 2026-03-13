@@ -371,6 +371,15 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--uploads",
+        action="store_true",
+        help=(
+            "--uploads  Test file-upload and artifact workflows. Discovers multipart forms, "
+            "submits crafted files, and checks follow-up pages for stored execution. "
+            "Requires a crawlable target or explicit upload targets. Implies active scanning."
+        ),
+    )
+    parser.add_argument(
         "--dom",
         action="store_true",
         help=(
@@ -385,12 +394,12 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
         "--active",
         action="store_true",
         help=(
-            "--active  Enable active scanning of all XSS types (reflected + stored + DOM). "
-            "Equivalent to passing --reflected --stored --dom together. "
+            "--active  Enable active scanning of all XSS types (reflected + stored + uploads + DOM). "
+            "Equivalent to passing --reflected --stored --uploads --dom together. "
             "Fires payloads into a real Playwright browser and detects confirmed execution "
             "(alert() dialogs, console output, network beacons). Requires -u or --urls. "
             "Writes a markdown report to ~/.axss/reports/. "
-            "Legacy flag — prefer using --reflected/--stored/--dom directly, "
+            "Legacy flag — prefer using --reflected/--stored/--uploads/--dom directly, "
             "or omit all flags to default to testing all types."
         ),
     )
@@ -890,6 +899,7 @@ def _run_active_scan(
     auth_headers: dict[str, str] | None = None,
     scan_reflected: bool = True,
     scan_stored: bool = True,
+    scan_uploads: bool = True,
     scan_dom: bool = True,
 ) -> int:
     """Route active scans through the orchestrator."""
@@ -928,6 +938,16 @@ def _run_active_scan(
     post_forms: list = []
     upload_targets: list = []
     crawled_pages: list = []
+    if scan_uploads and args.urls:
+        info(
+            "Upload scanning in --urls batch mode only tests upload forms already discovered "
+            "from crawlable entry pages; raw URL lists do not discover upload endpoints on their own."
+        )
+    if scan_uploads and args.url and no_crawl:
+        info(
+            "Upload scanning with --no-crawl needs a known upload target; the scanner will not "
+            "discover multipart forms when crawling is disabled."
+        )
     if args.url and not no_crawl:
         from ai_xss_generator.console import (
             clear_status_bar, fmt_duration, set_status_bar,
@@ -1025,6 +1045,7 @@ def _run_active_scan(
         upload_targets=list(upload_targets),
         scan_reflected=scan_reflected,
         scan_stored=scan_stored,
+        scan_uploads=scan_uploads,
         scan_dom=scan_dom,
         rate=args.rate,
     )
@@ -1042,6 +1063,7 @@ def _run_active_scan(
         sink_url=sink_url,
         scan_reflected=scan_reflected,
         scan_stored=scan_stored,
+        scan_uploads=scan_uploads,
         scan_dom=scan_dom,
         ai_backend=ai_config.ai_backend,
         cli_tool=ai_config.cli_tool,
@@ -1075,6 +1097,7 @@ def _resolve_session(
     upload_targets: list,
     scan_reflected: bool,
     scan_stored: bool,
+    scan_uploads: bool,
     scan_dom: bool,
     rate: float,
 ) -> Any:
@@ -1100,6 +1123,7 @@ def _resolve_session(
         upload_targets=upload_targets,
         scan_reflected=scan_reflected,
         scan_stored=scan_stored,
+        scan_uploads=scan_uploads,
         scan_dom=scan_dom,
     )
 
@@ -1131,11 +1155,12 @@ def _resolve_session(
     config_summary = (
         f"target={urls[0] if urls else '?'} | "
         f"rate={rate:g} req/s | "
-        f"reflected={scan_reflected} stored={scan_stored}"
+        f"reflected={scan_reflected} stored={scan_stored} uploads={scan_uploads} dom={scan_dom}"
     )
     total_items = (
         (len(urls) if scan_reflected else 0)
-        + ((len(post_forms) + len(upload_targets)) if scan_stored else 0)
+        + (len(post_forms) if scan_stored else 0)
+        + (len(upload_targets) if scan_uploads else 0)
         + (len(urls) if scan_dom else 0)
     )
     session = create_session(
@@ -1356,16 +1381,18 @@ def main(argv: list[str] | None = None) -> int:
     _want_generate  = getattr(args, "generate",  False)
     _want_reflected = getattr(args, "reflected", False)
     _want_stored    = getattr(args, "stored",    False)
+    _want_uploads   = getattr(args, "uploads",   False)
     _want_dom       = getattr(args, "dom",       False)
     _want_active    = getattr(args, "active",    False)  # legacy flag
 
-    _any_xss_type = _want_reflected or _want_stored or _want_dom
+    _any_xss_type = _want_reflected or _want_stored or _want_uploads or _want_dom
     _is_active_mode = _want_active or _any_xss_type
 
     # --active alone (legacy): enable all types
     if _want_active and not _any_xss_type:
         _want_reflected = True
         _want_stored    = True
+        _want_uploads   = True
         _want_dom       = True
 
     # Default: no explicit flag → active scan all types
@@ -1373,6 +1400,7 @@ def main(argv: list[str] | None = None) -> int:
     if not _want_generate and not _is_active_mode:
         _want_reflected = True
         _want_stored    = True
+        _want_uploads   = True
         _want_dom       = True
         _is_active_mode = True
 
@@ -1390,6 +1418,7 @@ def main(argv: list[str] | None = None) -> int:
             auth_headers=auth_headers,
             scan_reflected=_want_reflected,
             scan_stored=_want_stored,
+            scan_uploads=_want_uploads,
             scan_dom=_want_dom,
         )
 
