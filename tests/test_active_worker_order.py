@@ -394,6 +394,11 @@ def test_get_worker_skips_local_on_high_friction_hard_context_and_uses_cloud() -
     assert results and results[0].status == "confirmed"
     assert results[0].confirmed_findings[0].source == "cloud_model"
     assert "Skipped local model" in results[0].confirmed_findings[0].ai_note
+    assert results[0].target_tier == "live"
+    assert results[0].local_model_rounds == 0
+    assert results[0].cloud_model_rounds == 1
+    assert results[0].fallback_rounds == 0
+    assert any("Skipped local model" in note for note in results[0].escalation_reasons)
 
 
 def test_get_worker_marks_dead_target_when_no_reflection() -> None:
@@ -431,6 +436,7 @@ def test_get_worker_marks_dead_target_when_no_reflection() -> None:
 
     assert results and results[0].status == "no_reflection"
     assert results[0].dead_target is True
+    assert results[0].target_tier == "hard_dead"
     assert "No reflection was confirmed" in results[0].dead_reason
 
 

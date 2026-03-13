@@ -456,6 +456,12 @@ def run_active_scan(
 
 def _log_result(r: WorkerResult) -> None:
     import urllib.parse as _up
+    budget_note = (
+        f" [tier={getattr(r, 'target_tier', '') or 'unknown'}"
+        f" local={getattr(r, 'local_model_rounds', 0)}"
+        f" cloud={getattr(r, 'cloud_model_rounds', 0)}"
+        f" fallback={getattr(r, 'fallback_rounds', 0)}]"
+    )
     if r.status == "confirmed":
         sources = {f.source for f in r.confirmed_findings}
         if len(sources) == 1:
@@ -469,7 +475,7 @@ def _log_result(r: WorkerResult) -> None:
             source_label = "mixed"
         success(
             f"[active] CONFIRMED {len(r.confirmed_findings)} finding(s) — {r.url} "
-            f"({source_label})"
+            f"({source_label}){budget_note}"
         )
         for f in r.confirmed_findings:
             # Unquote so full-width / half-width chars display as-is, not percent-encoded
@@ -482,14 +488,14 @@ def _log_result(r: WorkerResult) -> None:
             f"[active] no execution confirmed — {r.url} "
             f"({r.transforms_tried} payloads tried"
             + (", cloud escalated" if r.cloud_escalated else "")
-            + ")"
+            + f"){budget_note}"
         )
         if r.dead_reason:
             info(f"    {r.dead_reason}")
     elif r.status == "taint_only":
         info(
             f"[active] DOM taint confirmed, but no execution — {r.url} "
-            f"({len(r.confirmed_findings)} sink hit(s))"
+            f"({len(r.confirmed_findings)} sink hit(s)){budget_note}"
         )
         for f in r.confirmed_findings:
             display_url = _up.unquote(f.fired_url)
@@ -498,11 +504,11 @@ def _log_result(r: WorkerResult) -> None:
             info(f"    {r.dead_reason}")
     elif r.status == "no_reflection":
         label = "dead target" if r.dead_target else "no reflection"
-        info(f"[active] {label} — {r.url}")
+        info(f"[active] {label} — {r.url}{budget_note}")
         if r.dead_reason:
             info(f"    {r.dead_reason}")
     elif r.status == "error":
-        warn(f"[active] error — {r.url}: {r.error}")
+        warn(f"[active] error — {r.url}: {r.error}{budget_note}")
 
 
 def _print_summary(results: list[WorkerResult]) -> None:
@@ -512,9 +518,40 @@ def _print_summary(results: list[WorkerResult]) -> None:
     all_findings = [f for r in confirmed for f in r.confirmed_findings]
     taint_findings = [f for r in taint_only for f in r.confirmed_findings]
     errors = [r for r in results if r.status == "error"]
+    tier_counts = {
+        "hard_dead": 0,
+        "soft_dead": 0,
+        "live": 0,
+        "high_value": 0,
+        "unknown": 0,
+    }
+    local_rounds = 0
+    cloud_rounds = 0
+    fallback_rounds = 0
+    for result in results:
+        tier = str(getattr(result, "target_tier", "") or "").strip().lower() or "unknown"
+        if tier not in tier_counts:
+            tier = "unknown"
+        tier_counts[tier] += 1
+        local_rounds += int(getattr(result, "local_model_rounds", 0) or 0)
+        cloud_rounds += int(getattr(result, "cloud_model_rounds", 0) or 0)
+        fallback_rounds += int(getattr(result, "fallback_rounds", 0) or 0)
 
     info(f"\n{'─'*60}")
     info(f"Active scan complete: {len(results)} target(s) processed")
+    info(
+        "  • Pilot tiers: "
+        f"hard-dead {tier_counts['hard_dead']}  "
+        f"soft-dead {tier_counts['soft_dead']}  "
+        f"live {tier_counts['live']}  "
+        f"high-value {tier_counts['high_value']}"
+    )
+    info(
+        "  • Budget: "
+        f"local rounds {local_rounds}  "
+        f"cloud rounds {cloud_rounds}  "
+        f"fallback rounds {fallback_rounds}"
+    )
     if all_findings:
         success(f"  ✅ Confirmed XSS: {len(all_findings)} finding(s) across {len(confirmed)} target(s)")
         info("")

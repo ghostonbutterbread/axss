@@ -138,6 +138,17 @@ class WorkerResult:
     kind: str = "get"       # "get" | "post"
     dead_target: bool = False
     dead_reason: str = ""
+    target_tier: str = ""
+    local_model_rounds: int = 0
+    cloud_model_rounds: int = 0
+    fallback_rounds: int = 0
+    escalation_reasons: list[str] = field(default_factory=list)
+
+
+def _append_reason(reasons: list[str], note: str) -> None:
+    cleaned = note.strip()
+    if cleaned and cleaned not in reasons:
+        reasons.append(cleaned)
 
 
 def _join_lessons(*lesson_groups: list[Any] | None) -> list[Any] | None:
@@ -499,6 +510,7 @@ def _run(
                 getattr(target_disposition, "reason", "")
                 or "No reflection was confirmed during bounded discovery."
             ),
+            target_tier=getattr(target_disposition, "tier", "hard_dead"),
         ))
         return
 
@@ -514,6 +526,7 @@ def _run(
                 getattr(target_disposition, "reason", "")
                 or "Reflection exists, but no executable context was confirmed."
             ),
+            target_tier=getattr(target_disposition, "tier", "soft_dead"),
         ))
         return
 
@@ -523,12 +536,22 @@ def _run(
     try:
         executor.start()
     except Exception as exc:
-        put_result(WorkerResult(url=url, status="error", error=f"Playwright start failed: {exc}", waf=waf_hint))
+        put_result(WorkerResult(
+            url=url,
+            status="error",
+            error=f"Playwright start failed: {exc}",
+            waf=waf_hint,
+            target_tier=getattr(target_disposition, "tier", ""),
+        ))
         return
 
     confirmed_findings: list[ConfirmedFinding] = []
     total_transforms_tried = 0
     cloud_escalated = False
+    local_model_rounds = 0
+    cloud_model_rounds = 0
+    fallback_rounds = 0
+    escalation_reasons: list[str] = []
 
     try:
         from ai_xss_generator.active.transforms import all_variants_for_probe
@@ -553,6 +576,7 @@ def _run(
                     delivery_mode="get",
                     context_type=context_type,
                 )
+                _append_reason(escalation_reasons, escalation_policy.note)
                 cloud_plan = CloudPayloadPlan()
                 # Track confirmation per context — a confirmed finding on one
                 # param must not suppress escalation on a different param.
@@ -563,6 +587,7 @@ def _run(
                 # still exist in generate_payloads() but stay out of active
                 # execution so deterministic fallback remains explicit.
                 if escalation_policy.use_local and not context_confirmed and not _timed_out():
+                    local_model_rounds += 1
                     local_payloads = _get_local_payloads(
                         url=url,
                         probe_result=context_probe_result,
@@ -628,6 +653,7 @@ def _run(
                             break
 
                         cloud_escalated = True
+                        cloud_model_rounds += 1
                         cloud_plan = _coerce_cloud_plan(_get_cloud_payloads(
                             url=url,
                             probe_result=context_probe_result,
@@ -705,6 +731,7 @@ def _run(
                 # Deterministic transforms are now a fallback stage instead of
                 # the primary search strategy.
                 if not context_confirmed and not _timed_out():
+                    fallback_rounds += 1
                     for variant in variants:
                         if _timed_out():
                             break
@@ -741,6 +768,7 @@ def _run(
             for attempt in coordinated_attempts:
                 if _timed_out():
                     break
+                fallback_rounds += 1
                 ordered_params = list(attempt.param_payloads.keys())
                 primary_param = ordered_params[0]
                 total_transforms_tried += 1
@@ -777,6 +805,11 @@ def _run(
         params_tested=len(flat_params),
         params_reflected=len(reflected),
         kind="get",
+        target_tier=getattr(target_disposition, "tier", "live"),
+        local_model_rounds=local_model_rounds,
+        cloud_model_rounds=cloud_model_rounds,
+        fallback_rounds=fallback_rounds,
+        escalation_reasons=escalation_reasons,
     ))
 
 
@@ -1342,6 +1375,10 @@ def _run_dom(
 
     findings: list[ConfirmedFinding] = []
     cloud_escalated = False
+    local_model_rounds = 0
+    cloud_model_rounds = 0
+    fallback_rounds = 0
+    escalation_reasons: list[str] = []
     dom_session_lessons: list[Any] = []
     target_disposition: Any = None
     try:
@@ -1410,6 +1447,7 @@ def _run_dom(
                     delivery_mode="dom",
                     sink_context=hit.sink,
                 )
+                _append_reason(escalation_reasons, escalation_policy.note)
                 confirmed = False
                 fired_payload = ""
                 fired_url = hit.canary_url
@@ -1448,6 +1486,7 @@ def _run_dom(
                 )
 
                 if escalation_policy.use_local and not _timed_out():
+                    local_model_rounds += 1
                     local_stage = _start_async_payload_stage(lambda: _get_dom_local_payloads(
                         context=dom_context,
                         model=model,
@@ -1514,6 +1553,7 @@ def _run_dom(
                         ) or (not local_done and time.monotonic() >= cloud_delay_deadline)
                         if should_start_cloud:
                             cloud_rounds_started += 1
+                            cloud_model_rounds += 1
                             cloud_escalated = True
                             cloud_stage = _start_async_payload_stage(lambda: _get_dom_cloud_payloads(
                                 context=dom_context,
@@ -1565,6 +1605,7 @@ def _run_dom(
                     time.sleep(0.05)
 
                 if not confirmed and not _timed_out():
+                    fallback_rounds += 1
                     fallback_payloads = fallback_payloads_for_sink(hit.sink)
                     exec_ok, exec_payload, exec_detail = attempt_dom_payloads(
                         browser=browser,
@@ -1647,6 +1688,11 @@ def _run_dom(
                 or "No DOM source-to-sink taint path was confirmed."
             )
         ),
+        target_tier=getattr(target_disposition, "tier", "live"),
+        local_model_rounds=local_model_rounds,
+        cloud_model_rounds=cloud_model_rounds,
+        fallback_rounds=fallback_rounds,
+        escalation_reasons=escalation_reasons,
     ))
 
 
@@ -1928,6 +1974,7 @@ def _run_post(
                 getattr(target_disposition, "reason", "")
                 or "No reflection was confirmed during bounded discovery."
             ),
+            target_tier=getattr(target_disposition, "tier", "hard_dead"),
         ))
         return
 
@@ -1943,6 +1990,7 @@ def _run_post(
                 getattr(target_disposition, "reason", "")
                 or "Reflection exists, but no executable context was confirmed."
             ),
+            target_tier=getattr(target_disposition, "tier", "soft_dead"),
         ))
         return
 
@@ -1954,12 +2002,17 @@ def _run_post(
         put_result(WorkerResult(
             url=post_form.action_url, status="error",
             error=f"Playwright start failed: {exc}", waf=waf_hint,
+            target_tier=getattr(target_disposition, "tier", ""),
         ))
         return
 
     confirmed_findings: list[ConfirmedFinding] = []
     total_transforms_tried = 0
     cloud_escalated = False
+    local_model_rounds = 0
+    cloud_model_rounds = 0
+    fallback_rounds = 0
+    escalation_reasons: list[str] = []
 
     try:
         for probe_result in injectable:
@@ -1981,10 +2034,12 @@ def _run_post(
                     delivery_mode="post",
                     context_type=context_type,
                 )
+                _append_reason(escalation_reasons, escalation_policy.note)
                 cloud_plan = CloudPayloadPlan()
                 context_confirmed = False
 
                 if escalation_policy.use_local and not context_confirmed and not _timed_out():
+                    local_model_rounds += 1
                     local_payloads = _get_local_payloads(
                         url=post_form.source_page_url,
                         probe_result=context_probe_result,
@@ -2048,6 +2103,7 @@ def _run_post(
                             break
 
                         cloud_escalated = True
+                        cloud_model_rounds += 1
                         cloud_plan = _coerce_cloud_plan(_get_cloud_payloads(
                             url=post_form.source_page_url,
                             probe_result=context_probe_result,
@@ -2125,6 +2181,7 @@ def _run_post(
                         )
 
                 if not context_confirmed and not _timed_out():
+                    fallback_rounds += 1
                     for variant in variants:
                         if _timed_out():
                             break
@@ -2173,4 +2230,9 @@ def _run_post(
         params_tested=len(post_form.param_names),
         params_reflected=len(reflected),
         kind="post",
+        target_tier=getattr(target_disposition, "tier", "live"),
+        local_model_rounds=local_model_rounds,
+        cloud_model_rounds=cloud_model_rounds,
+        fallback_rounds=fallback_rounds,
+        escalation_reasons=escalation_reasons,
     ))

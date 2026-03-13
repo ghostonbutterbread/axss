@@ -88,6 +88,42 @@ def test_report_moves_dom_taint_out_of_confirmed_section() -> None:
     assert "DOM taint only." in report
 
 
+def test_report_includes_pilot_summary_and_budget_table() -> None:
+    report = _build_report(
+        [
+            WorkerResult(
+                url="https://example.test/live",
+                kind="get",
+                status="no_execution",
+                target_tier="live",
+                local_model_rounds=1,
+                cloud_model_rounds=2,
+                fallback_rounds=1,
+                params_tested=1,
+                params_reflected=1,
+                escalation_reasons=["Reduced local model budget because the target is operating in a stealth/high-friction probe mode."],
+            ),
+            WorkerResult(
+                url="https://example.test/dead",
+                kind="dom",
+                status="no_execution",
+                dead_target=True,
+                dead_reason="No DOM taint path was confirmed during runtime discovery.",
+                target_tier="hard_dead",
+            ),
+        ],
+        config_summary="rate=5",
+    )
+
+    assert "## Pilot Summary" in report
+    assert "hard-dead `1`" in report
+    assert "live `1`" in report
+    assert "Model rounds: local `1`, cloud `2`" in report
+    assert "## Pilot Budget By Target (2)" in report
+    assert "Reduced local model budget because the target is operating in a stealth/high-friction probe mode." in report
+    assert "No DOM taint path was confirmed during runtime discovery." in report
+
+
 def test_html_body_payloads_include_uppercase_safe_variants() -> None:
     payloads = html_body_payloads(
         frozenset(set('ABCDEFGHIJKLMNOPQRSTUVWXYZ<>"=&#0123456789();/')),

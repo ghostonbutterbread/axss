@@ -6,7 +6,7 @@
 
 ## What this tool is
 
-`axss` is a context-aware XSS scanner for authorized penetration testing. It crawls a live target, maps every GET parameter and POST form it finds, probes each one for reflection and filter behavior, then generates ranked payloads tailored to what the probe observed. It fires each payload through a real Playwright browser and confirms JavaScript execution via dialog hooks, console output, or network beacon. It covers reflected XSS, session-stored XSS, and POST forms protected by dynamic CSRF tokens.
+`axss` is a context-aware XSS scanner for authorized penetration testing. It crawls a live target, maps every GET parameter and POST form it finds, probes each one for reflection and filter behavior, then generates ranked payloads tailored to what the probe observed. It fires each payload through a real Playwright browser and confirms JavaScript execution via dialog hooks, console output, or network beacon. It covers reflected XSS, session-stored XSS, POST forms protected by dynamic CSRF tokens, and DOM XSS via runtime source→sink discovery.
 
 ## Visual flow
 
@@ -21,19 +21,29 @@ Active scan flow (GET + POST + DOM)
   - DOM: runtime taint paths, source type, sink, code location
          |
          v
+  classify target behavior
+  - adaptive probe mode: standard / budgeted / stealth
+  - browser-required edge handling
+  - reflection transforms and tested charset
+  - dead target vs live target
+  - pilot telemetry: tier + local/cloud/fallback budget
+         |
+         v
   build enriched reasoning context
   - parsed page state
   - framework / sink hints
   - auth notes
   - probe lessons
+  - target behavior profile
   - curated findings
          |
          v
   ask model per execution context
   - GET / POST: per reflection context
   - DOM: per tainted source -> sink path
-  - local model first
-  - cloud model if local is weak or misses
+  - config-gated AI backend / tool / model selection
+  - local model first when worth the budget
+  - cloud model if local is weak, skipped, or misses
   - optional recursive cloud rounds (`--attempts N`) with execution feedback
          |
          v
@@ -56,6 +66,15 @@ Payload generation only (`--generate`)
       -> ask model
       -> merge / rank output
       -> return payload list
+
+
+Interesting URL triage (`--interesting urls.txt`)
+
+  read URL list
+      -> resolve AI backend from config / CLI overrides
+      -> rank likely XSS-interesting URLs in chunks
+      -> print shortlist
+      -> write markdown report
 ```
 
 ## Learning Model
@@ -71,6 +90,8 @@ Payload generation only (`--generate`)
   objective string, and URL as plain parameters.
 - Active probe observations (surviving chars, reflection context) are kept as ephemeral
   session lessons passed directly into the generation prompt — nothing is written to disk.
+- Active scans also build a compact behavior profile from discovery: probe mode,
+  tested charset, browser-required edge handling, transforms, and dead-target disposition.
 - Confirmed XSS findings go to the scan report, not the knowledge base.
 
 **If you are an AI agent reading this:** use the command patterns below directly. No preamble is needed — the tool is designed for scripted and agentic use. Every flag described here is stable and documented in `--help`.
@@ -89,6 +110,9 @@ Goal: scan a live web target for XSS
   │
   ├── You already know the exact endpoints to test
   │     axss --urls endpoints.txt --active
+  │
+  ├── You want the AI to shortlist the most promising URLs before deep testing
+  │     axss --interesting urls.txt -o list
   │
   ├── Target has a WAF
   │     axss -u "https://target.com" --active --waf cloudflare
@@ -147,6 +171,13 @@ For POST forms: GETs the source page before every request to extract the current
 
 Tracking params (`utm_*`, `gclid`, `fbclid`, `msclkid`, etc.) are silently skipped — never reflected in page content.
 
+The probe controller is adaptive:
+- **standard** — full probe charset on ordinary surfaces
+- **budgeted** — reduced charset on very broad surfaces
+- **stealth** — quieter param-shaped seeds and a reduced charset on strong-edge, auth, or sensitive paths
+
+Those decisions are recorded and passed into the model prompt as observed target behavior, not guessed WAF lore.
+
 ### Stored XSS sweep (POST forms)
 
 If the canary is not in the POST response, `axss` sweeps follow-up pages in order:
@@ -163,10 +194,11 @@ Two execution modes matter here:
 
 1. **Active scan (`--active`, `--reflected`, `--stored`, `--dom`)**
    - Probe first
-   - Build enriched reasoning context from parsed page state, probe observations, session lessons, and curated findings
-   - Ask the local model per execution context
+   - Build enriched reasoning context from parsed page state, probe observations, target behavior profile, session lessons, and curated findings
+   - Classify the target as hard-dead / soft-dead / live before spending more model budget
+   - Ask the local model per execution context only when the behavior policy says local is worth trying
    - GET / POST isolate one reflection context per model call; DOM isolates one tainted source -> sink path per model call
-   - Escalate to cloud only if the local model misses or produces weak output
+   - Escalate to cloud only if the local model misses, is skipped, or produces weak output
    - If `--attempts N` is greater than `1`, each cloud round tests its payload batch and feeds the failure outcome into the next cloud prompt
    - If model-driven payloads do not confirm execution, fall back to deterministic context-aware transforms
 
@@ -186,6 +218,28 @@ Each GET URL, POST form, and DOM XSS runtime target gets an isolated worker proc
 - `network` — outbound request to internal beacon hostname
 
 Confirmed findings are printed to the CLI with the exact fired URL, then written to `~/.axss/reports/<domain>_<timestamp>.md`.
+The scan summary also prints pilot tier counts and aggregate local/cloud/fallback rounds for the whole run.
+
+Targets that do not produce enough technical signal are explicitly classified and reported:
+- **hard-dead** — no reflection / no DOM taint path during bounded discovery
+- **soft-dead** — some reflection exists, but no executable context or useful filter signal justified more model spend
+- **live** — executable reflection or taint signal justified deeper execution attempts
+- **high-value** — target still produced exploitable signal under stealth-style probing
+
+### Pilot telemetry
+
+Active scans now emit pilot-oriented budget telemetry so you can sanity-check controller decisions on a real program before widening scope:
+- per-target tier: `hard_dead`, `soft_dead`, `live`, `high_value`
+- per-target AI budget:
+  - local model rounds
+  - cloud model rounds
+  - deterministic fallback rounds
+- per-target reasoning notes explaining why local was skipped, shortened, or why cloud was prioritized
+
+Both the terminal summary and the markdown report include this telemetry. That makes it easier to answer:
+- which targets were dropped early and why
+- which targets burned cloud budget
+- whether the controller is escalating intelligently or just paying for noise
 
 ### Knowledge base
 
@@ -281,6 +335,21 @@ axss --urls endpoints.txt --active --workers 4 \
 axss --urls endpoints.txt --active -j results.json
 ```
 
+### Interesting URL triage
+
+```bash
+# Rank a URL file by how promising each entry looks for deeper XSS testing
+axss --interesting urls.txt -o list
+
+# Write JSON as well as the markdown report
+axss --interesting urls.txt -o json -j interesting.json
+
+# Force CLI backend for triage
+axss --interesting urls.txt --backend cli --cli-tool claude
+```
+
+`--interesting` is designed for narrowing large URL lists into high-value single-target runs. It uses the same config-gated AI backend selection as payload generation and active scans.
+
 ### Payload generation only (no browser execution)
 
 ```bash
@@ -336,6 +405,7 @@ axss --help
 |------|---------|-------------|
 | `-u, --url TARGET` | — | Fetch and scan a live URL |
 | `--urls FILE` | — | Scan one URL per line (no crawl, assumes pre-enumerated surface) |
+| `--interesting FILE` | — | Rank one URL per line by how promising each entry looks for deeper XSS testing |
 | `-i, --input FILE_OR_SNIPPET` | — | Parse a local file or raw HTML string |
 | `--active` | off | Fire payloads in Playwright and confirm execution |
 | `--reflected` | off | Test reflected XSS only (GET params); implies `--active` |
@@ -408,7 +478,10 @@ cat > ~/.axss/config.json <<'EOF'
 {
   "default_model": "qwen3.5:9b",
   "use_cloud": true,
-  "cloud_model": "anthropic/claude-3-5-sonnet"
+  "cloud_model": "anthropic/claude-3-5-sonnet",
+  "ai_backend": "cli",
+  "cli_tool": "claude",
+  "cli_model": null
 }
 EOF
 
@@ -457,7 +530,7 @@ axss -u "https://target.com" --active --backend cli --cli-tool codex
 
 `setup.sh` auto-detects `claude`/`codex` on PATH and writes the result to `~/.axss/config.json`. Use `--backend api|cli` flag to override at runtime.
 
-Cloud escalation only fires when local model output fails a quality check. Use `--no-cloud` to disable entirely.
+Every AI-enabled path resolves backend/tool/model through config first, then applies explicit CLI flag overrides. Cloud escalation only fires when local model output fails a quality check, is skipped by policy, or the target context is marked as cloud-first. Use `--no-cloud` to disable entirely.
 
 ### Model escalation chain
 
@@ -465,8 +538,14 @@ Cloud escalation only fires when local model output fails a quality check. Use `
 Context-aware generator (always runs, no LLM)
     │
     ▼
+Adaptive decision policy
+    ├── skip model entirely for dead targets
+    ├── local first for simple / low-friction contexts
+    └── cloud-first for selected hard / high-friction contexts
+    │
+    ▼
 Local Ollama (qwen3.5:9b default, findings-enriched prompt)
-    │ if output weak (< 3 payloads or all generic)
+    │ if output weak (< 3 payloads or all generic), skipped, or misses
     ▼
 Cloud escalation (one of:)
   ├── CLI backend (--backend cli)
@@ -495,6 +574,10 @@ Cloud escalation (one of:)
 ```
 
 `ai_backend` and `cli_tool` are auto-configured by `setup.sh` based on what CLI tools are found on PATH. Set `ai_backend` to `"api"` to use OpenRouter/OpenAI keys instead.
+
+### `--interesting` cost note
+
+When `--interesting FILE` runs with `ai_backend: "api"` (or `--backend api`), axss prints a warning before starting because large URL files may require multiple paid API requests. CLI backend runs do not show this warning.
 
 ### `~/.axss/keys`
 
@@ -595,3 +678,4 @@ python xssy/learn.py
 - **Blind XSS:** No callback server. `--sink-url` covers self-visible stored XSS; payloads rendered only in admin panels or other users' sessions require out-of-band confirmation (planned).
 - **Stored XSS scope:** The post-injection sweep covers all pages visited during the crawl. Payloads stored and rendered outside the crawl boundary require `--sink-url`.
 - **SPA crawl coverage:** `--browser-crawl` discovers routes visible after initial load and user-triggered navigation. Deep lazy-loaded routes may require higher `--depth`.
+- **Interesting URL triage:** `--interesting` is a prioritization tool, not a vulnerability detector. It ranks URLs worth deeper testing but does not prove exploitability by itself.

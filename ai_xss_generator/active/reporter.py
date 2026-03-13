@@ -85,6 +85,34 @@ def _build_report(results: Sequence[WorkerResult], config_summary: str) -> str:
         lines.append(f"**Config:** {config_summary}  ")
     lines += ["", "---", ""]
 
+    pilot_summary = _pilot_summary(results)
+    lines += [
+        "## Pilot Summary",
+        "",
+        f"- Target tiers: hard-dead `{pilot_summary['hard_dead']}`, soft-dead `{pilot_summary['soft_dead']}`, live `{pilot_summary['live']}`, high-value `{pilot_summary['high_value']}`, unknown `{pilot_summary['unknown']}`",
+        f"- Model rounds: local `{pilot_summary['local_rounds']}`, cloud `{pilot_summary['cloud_rounds']}`",
+        f"- Deterministic fallback rounds: `{pilot_summary['fallback_rounds']}`",
+        f"- Cloud-escalated targets: `{pilot_summary['cloud_targets']}` / `{len(results)}`",
+        "",
+    ]
+
+    if results:
+        lines += [
+            f"## Pilot Budget By Target ({len(results)})",
+            "",
+            "| URL | Kind | Tier | Status | Local | Cloud | Fallback | Signal | Reasoning |",
+            "|-----|------|------|--------|-------|-------|----------|--------|-----------|",
+        ]
+        for r in results:
+            signal = _pilot_signal(r).replace("|", "\\|")
+            reasoning = _pilot_reasoning(r).replace("|", "\\|")
+            lines.append(
+                f"| `{r.url}` | `{getattr(r, 'kind', 'get')}` | `{_result_tier(r)}` | `{r.status}` | "
+                f"`{getattr(r, 'local_model_rounds', 0)}` | `{getattr(r, 'cloud_model_rounds', 0)}` | "
+                f"`{getattr(r, 'fallback_rounds', 0)}` | {signal} | {reasoning} |"
+            )
+        lines += ["", "---", ""]
+
     # ── Confirmed Findings ────────────────────────────────────────────────────
     if all_findings:
         lines += [
@@ -169,6 +197,63 @@ def _build_report(results: Sequence[WorkerResult], config_summary: str) -> str:
     ]
 
     return "\n".join(lines)
+
+
+def _result_tier(result: WorkerResult) -> str:
+    tier = str(getattr(result, "target_tier", "") or "").strip().lower()
+    return tier or "unknown"
+
+
+def _pilot_summary(results: Sequence[WorkerResult]) -> dict[str, int]:
+    summary = {
+        "hard_dead": 0,
+        "soft_dead": 0,
+        "live": 0,
+        "high_value": 0,
+        "unknown": 0,
+        "local_rounds": 0,
+        "cloud_rounds": 0,
+        "fallback_rounds": 0,
+        "cloud_targets": 0,
+    }
+    for result in results:
+        tier = _result_tier(result)
+        if tier not in summary:
+            tier = "unknown"
+        summary[tier] += 1
+        summary["local_rounds"] += int(getattr(result, "local_model_rounds", 0) or 0)
+        summary["cloud_rounds"] += int(getattr(result, "cloud_model_rounds", 0) or 0)
+        summary["fallback_rounds"] += int(getattr(result, "fallback_rounds", 0) or 0)
+        if getattr(result, "cloud_escalated", False) or int(getattr(result, "cloud_model_rounds", 0) or 0) > 0:
+            summary["cloud_targets"] += 1
+    return summary
+
+
+def _pilot_signal(result: WorkerResult) -> str:
+    parts: list[str] = []
+    params_tested = int(getattr(result, "params_tested", 0) or 0)
+    params_reflected = int(getattr(result, "params_reflected", 0) or 0)
+    if params_tested:
+        parts.append(f"params {params_reflected}/{params_tested}")
+    if result.status in {"confirmed", "taint_only"}:
+        findings = len(getattr(result, "confirmed_findings", []) or [])
+        if findings:
+            parts.append(f"findings {findings}")
+    if getattr(result, "dead_target", False):
+        parts.append("dead-target stop")
+    return "; ".join(parts) or "no explicit signal"
+
+
+def _pilot_reasoning(result: WorkerResult) -> str:
+    reasons = [str(item).strip() for item in getattr(result, "escalation_reasons", []) or [] if str(item).strip()]
+    if reasons:
+        preview = "; ".join(reasons[:2])
+        if len(reasons) > 2:
+            preview += f"; +{len(reasons) - 2} more"
+        return preview
+    if getattr(result, "dead_reason", ""):
+        return str(result.dead_reason)
+    return "No special escalation note recorded."
 
 
 def _format_finding(index: int, f: ConfirmedFinding) -> list[str]:

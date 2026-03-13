@@ -137,6 +137,13 @@ def _result_to_dict(r: "WorkerResult") -> dict:
         "duration_seconds": r.duration_seconds,
         "params_tested": r.params_tested,
         "params_reflected": r.params_reflected,
+        "dead_target": getattr(r, "dead_target", False),
+        "dead_reason": getattr(r, "dead_reason", ""),
+        "target_tier": getattr(r, "target_tier", ""),
+        "local_model_rounds": getattr(r, "local_model_rounds", 0),
+        "cloud_model_rounds": getattr(r, "cloud_model_rounds", 0),
+        "fallback_rounds": getattr(r, "fallback_rounds", 0),
+        "escalation_reasons": list(getattr(r, "escalation_reasons", []) or []),
         "confirmed_findings": [_finding_to_dict(f) for f in r.confirmed_findings],
     }
 
@@ -155,6 +162,13 @@ def _dict_to_result(d: dict) -> "WorkerResult":
         duration_seconds=d.get("duration_seconds", 0.0),
         params_tested=d.get("params_tested", 0),
         params_reflected=d.get("params_reflected", 0),
+        dead_target=d.get("dead_target", False),
+        dead_reason=d.get("dead_reason", ""),
+        target_tier=d.get("target_tier", ""),
+        local_model_rounds=d.get("local_model_rounds", 0),
+        cloud_model_rounds=d.get("cloud_model_rounds", 0),
+        fallback_rounds=d.get("fallback_rounds", 0),
+        escalation_reasons=list(d.get("escalation_reasons", []) or []),
     )
 
 
