@@ -71,6 +71,8 @@ _STRATEGY_SCHEMA_BLOCK = """      "strategy": {
         "coordination_hint": "single_param | multi_param | fragment_only | same_tag_pivot"
       },"""
 
+_GENERATION_PHASES = ("scout", "contextual", "research")
+
 def _extract_probe_context(context: ParsedContext) -> tuple[str, str, str]:
     """Return (primary_sink_type, context_type, surviving_chars) from context.
 
@@ -318,6 +320,186 @@ def _execution_feedback_section(past_lessons: list[Any] | None) -> str:
         "observations": observations[:2],
     }
     return "EXECUTION FEEDBACK PROFILE:\n" + json.dumps(compact, indent=2) + "\n"
+
+
+def _generation_output_schema(phase: str) -> dict[str, Any]:
+    if phase == "scout":
+        return {
+            "type": "object",
+            "properties": {
+                "payloads": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "payload": {"type": "string"},
+                            "title": {"type": "string"},
+                            "test_vector": {"type": "string"},
+                            "bypass_family": {"type": "string"},
+                        },
+                        "required": ["payload", "title", "test_vector", "bypass_family"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["payloads"],
+            "additionalProperties": False,
+        }
+    if phase == "contextual":
+        return {
+            "type": "object",
+            "properties": {
+                "payloads": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "payload": {"type": "string"},
+                            "title": {"type": "string"},
+                            "explanation": {"type": "string"},
+                            "test_vector": {"type": "string"},
+                            "tags": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                            "target_sink": {"type": "string"},
+                            "bypass_family": {"type": "string"},
+                            "risk_score": {"type": "integer"},
+                        },
+                        "required": [
+                            "payload",
+                            "title",
+                            "explanation",
+                            "test_vector",
+                            "tags",
+                            "target_sink",
+                            "bypass_family",
+                            "risk_score",
+                        ],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["payloads"],
+            "additionalProperties": False,
+        }
+    return None
+
+
+def _prompt_for_generation_phase(
+    context: ParsedContext,
+    phase: str,
+    reference_payloads: list[Any] | None = None,
+    waf: str | None = None,
+    past_findings: list[Finding] | None = None,
+    past_lessons: list[Any] | None = None,
+) -> str:
+    if phase == "research":
+        return _cloud_prompt_for_context(
+            context,
+            reference_payloads=reference_payloads,
+            waf=waf,
+            past_findings=past_findings,
+            past_lessons=past_lessons,
+        )
+    dom_runtime = _extract_dom_runtime_context(context)
+    if dom_runtime:
+        return _compact_dom_prompt_for_cloud(
+            context,
+            waf=waf,
+            past_findings=past_findings,
+            past_lessons=past_lessons,
+        )
+
+    sink_type, context_type, surviving_chars = _extract_probe_context(context)
+    behavior_section = _behavior_profile_section(context)
+    waf_knowledge_section = _waf_knowledge_section(context)
+    effective_constraints_section = _effective_constraints_section(
+        context,
+        waf=waf,
+        past_lessons=past_lessons,
+    )
+    execution_feedback_section = _execution_feedback_section(past_lessons)
+    auth_section = ""
+    if context.auth_notes:
+        auth_section = (
+            "SESSION CONTEXT:\n"
+            + "\n".join(f"  - {note}" for note in context.auth_notes[:3])
+            + "\n"
+        )
+    probe_lines = [
+        f"Target URL: {context.source}",
+        f"Primary sink type: {sink_type or 'unknown'}",
+        f"Reflection context: {context_type or 'unknown'}",
+        f"Confirmed surviving special characters: {surviving_chars or '(none observed)'}",
+    ]
+    if phase == "scout":
+        return (
+            "You are helping with an authorized XSS assessment. Generate payloads, not analysis.\n"
+            "Return ONLY strict JSON with a top-level {\"payloads\": [...]}.\n\n"
+            + "\n".join(probe_lines)
+            + "\n"
+            "Important: surviving-character probes track punctuation and metacharacters only. "
+            "Do not assume letters or digits are blocked unless explicitly stated.\n"
+            "Task: produce 3-4 concise payloads likely to execute in this exact context.\n"
+            "Focus on the most plausible attack family first. Avoid explanations outside the JSON.\n"
+            "Each payload object must include payload, title, test_vector, bypass_family.\n"
+            + behavior_section
+            + waf_knowledge_section
+            + effective_constraints_section
+            + execution_feedback_section
+            + auth_section
+        ).strip()
+
+    findings_section = ""
+    if past_findings:
+        compact_findings = [
+            {
+                "payload": finding.payload,
+                "bypass_family": finding.bypass_family,
+                "sink_type": finding.sink_type,
+            }
+            for finding in past_findings[:3]
+        ]
+        findings_section = "Related findings:\n" + json.dumps(compact_findings, indent=2) + "\n"
+    lessons_section = ""
+    if past_lessons:
+        lessons_section = lessons_prompt_section(past_lessons[:3]) + "\n"
+    seeds: list[str] = []
+    if context_type == "html_attr_url":
+        seeds = [
+            "javascript:alert(1)",
+            "java\tscript:alert(1)",
+            "javascript&#x3a;alert(1)",
+        ]
+    elif "html_body" in context_type:
+        seeds = [
+            "&#x3C;SVG/ONLOAD=ALERT(1)&#x3E;",
+            "&#60;IMG SRC=X ONERROR=ALERT(1)&#62;",
+            "&#x3c;DETAILS OPEN ONTOGGLE=ALERT(1)&#x3e;",
+        ]
+    seed_section = ""
+    if seeds:
+        seed_section = "Seed examples:\n" + "\n".join(f"- {seed}" for seed in seeds) + "\n"
+    return (
+        "You are helping with an authorized XSS assessment. Generate XSS payloads, not analysis.\n"
+        "Return ONLY strict JSON with a top-level {\"payloads\": [...]}.\n\n"
+        + "\n".join(probe_lines)
+        + "\n"
+        "Important: surviving-character probes track punctuation and metacharacters only. "
+        "Do not assume letters or digits are blocked unless explicitly stated.\n"
+        "Task: produce 4-6 payloads that are likely to execute in this exact context.\n"
+        "Prefer materially distinct candidates. Keep the output compact and execution-focused.\n"
+        "Each payload object must include payload, title, explanation, test_vector, tags, target_sink, bypass_family, risk_score.\n"
+        + seed_section
+        + behavior_section
+        + waf_knowledge_section
+        + effective_constraints_section
+        + execution_feedback_section
+        + lessons_section
+        + findings_section
+        + auth_section
+    ).strip()
 
 
 # ---------------------------------------------------------------------------
@@ -1227,9 +1409,11 @@ def _generate_with_openai_compat(
     past_findings: list[Finding] | None = None,
     past_lessons: list[Any] | None = None,
     request_timeout_seconds: int = 120,
+    phase: str = "research",
 ) -> list[PayloadCandidate]:
-    prompt = _cloud_prompt_for_context(
+    prompt = _prompt_for_generation_phase(
         context,
+        phase=phase,
         reference_payloads=reference_payloads,
         waf=waf,
         past_findings=past_findings,
@@ -1279,6 +1463,7 @@ def _generate_with_openrouter(
     past_findings: list[Finding] | None = None,
     past_lessons: list[Any] | None = None,
     request_timeout_seconds: int = 120,
+    phase: str = "research",
 ) -> list[PayloadCandidate]:
     from ai_xss_generator.config import load_api_key
     api_key = os.environ.get("OPENROUTER_API_KEY", "") or load_api_key("openrouter_api_key")
@@ -1295,6 +1480,7 @@ def _generate_with_openrouter(
         past_findings=past_findings,
         past_lessons=past_lessons,
         request_timeout_seconds=request_timeout_seconds,
+        phase=phase,
     )
 
 
@@ -1305,6 +1491,7 @@ def _generate_with_openai(
     past_findings: list[Finding] | None = None,
     past_lessons: list[Any] | None = None,
     request_timeout_seconds: int = 120,
+    phase: str = "research",
 ) -> list[PayloadCandidate]:
     from ai_xss_generator.config import load_api_key
     api_key = os.environ.get("OPENAI_API_KEY", "") or load_api_key("openai_api_key")
@@ -1321,6 +1508,7 @@ def _generate_with_openai(
         past_findings=past_findings,
         past_lessons=past_lessons,
         request_timeout_seconds=request_timeout_seconds,
+        phase=phase,
     )
 
 
@@ -1339,34 +1527,52 @@ def _generate_with_cli(
 ) -> tuple[list[PayloadCandidate], str]:
     """Generate payloads by calling the CLI backend, with cross-tool failover."""
     from ai_xss_generator.cli_runner import _trace_preview, generate_via_cli_with_tool
-    from ai_xss_generator.ai_capabilities import GENERATION_ROLE, recommended_timeout_seconds
-    prompt = _cloud_prompt_for_context(
-        context,
-        reference_payloads=reference_payloads,
-        waf=waf,
-        past_findings=past_findings,
-        past_lessons=past_lessons,
-    )
-    timeout_seconds = recommended_timeout_seconds(tool, GENERATION_ROLE, 60)
-    raw, actual_tool = generate_via_cli_with_tool(
-        tool,
-        prompt,
-        cli_model,
-        timeout_seconds=timeout_seconds,
-    )
-    log.debug("CLI backend resolved to %s for %s", actual_tool, context.source)
-    try:
-        data = _extract_json_blob(raw)
-    except Exception as exc:
-        log.debug(
-            "CLI backend (%s) returned non-JSON or malformed JSON for %s: %s\nRaw preview:\n%s",
-            actual_tool,
-            context.source,
-            exc,
-            _trace_preview(raw),
+    from ai_xss_generator.ai_capabilities import GENERATION_ROLE, recommended_timeout_seconds_for_phase
+
+    last_error: Exception | None = None
+    last_tool = tool
+    for phase in _GENERATION_PHASES:
+        prompt = _prompt_for_generation_phase(
+            context,
+            phase=phase,
+            reference_payloads=reference_payloads,
+            waf=waf,
+            past_findings=past_findings,
+            past_lessons=past_lessons,
         )
-        raise
-    return _normalize_payloads(data.get("payloads", []), source=f"cli:{actual_tool}"), actual_tool
+        timeout_seconds = recommended_timeout_seconds_for_phase(tool, GENERATION_ROLE, phase, 60)
+        schema = _generation_output_schema(phase)
+        try:
+            raw, actual_tool = generate_via_cli_with_tool(
+                tool,
+                prompt,
+                cli_model,
+                timeout_seconds=timeout_seconds,
+                schema=schema,
+            )
+            last_tool = actual_tool
+            log.debug("CLI backend resolved to %s for %s (%s phase)", actual_tool, context.source, phase)
+            data = _extract_json_blob(raw)
+            payloads = _normalize_payloads(data.get("payloads", []), source=f"cli:{actual_tool}")
+            if not _is_weak_output(payloads) or phase == "research":
+                return payloads, actual_tool
+        except Exception as exc:
+            last_error = exc
+            raw_preview = ""
+            if isinstance(exc, Exception):
+                raw_preview = ""
+            log.debug(
+                "CLI backend (%s) failed for %s during %s phase: %s%s",
+                last_tool,
+                context.source,
+                phase,
+                exc,
+                f"\nRaw preview:\n{_trace_preview(raw_preview)}" if raw_preview else "",
+            )
+            continue
+    if last_error is not None:
+        raise last_error
+    return [], last_tool
 
 
 def _try_cloud(
@@ -1404,30 +1610,35 @@ def _try_cloud(
 
     # ── API backend (original behaviour) ────────────────────────────────────
     from ai_xss_generator.config import load_api_key
-    from ai_xss_generator.ai_capabilities import GENERATION_ROLE, recommended_api_timeout_seconds
-    api_timeout_seconds = recommended_api_timeout_seconds(cloud_model, GENERATION_ROLE, 120)
-    if os.environ.get("OPENROUTER_API_KEY") or load_api_key("openrouter_api_key"):
-        try:
-            payloads = _generate_with_openrouter(
-                context,
-                cloud_model,
-                request_timeout_seconds=api_timeout_seconds,
-                **kwargs,
-            )
-            return payloads, "openrouter"
-        except Exception:
-            pass
+    from ai_xss_generator.ai_capabilities import GENERATION_ROLE, recommended_api_timeout_seconds_for_phase
+    for phase in _GENERATION_PHASES:
+        api_timeout_seconds = recommended_api_timeout_seconds_for_phase(cloud_model, GENERATION_ROLE, phase, 120)
+        if os.environ.get("OPENROUTER_API_KEY") or load_api_key("openrouter_api_key"):
+            try:
+                payloads = _generate_with_openrouter(
+                    context,
+                    cloud_model,
+                    request_timeout_seconds=api_timeout_seconds,
+                    phase=phase,
+                    **kwargs,
+                )
+                if not _is_weak_output(payloads) or phase == "research":
+                    return payloads, "openrouter"
+            except Exception:
+                pass
 
-    if os.environ.get("OPENAI_API_KEY") or load_api_key("openai_api_key"):
-        try:
-            payloads = _generate_with_openai(
-                context,
-                request_timeout_seconds=api_timeout_seconds,
-                **kwargs,
-            )
-            return payloads, "openai"
-        except Exception:
-            pass
+        if os.environ.get("OPENAI_API_KEY") or load_api_key("openai_api_key"):
+            try:
+                payloads = _generate_with_openai(
+                    context,
+                    request_timeout_seconds=api_timeout_seconds,
+                    phase=phase,
+                    **kwargs,
+                )
+                if not _is_weak_output(payloads) or phase == "research":
+                    return payloads, "openai"
+            except Exception:
+                pass
 
     return [], ""
 

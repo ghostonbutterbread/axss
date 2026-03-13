@@ -1,9 +1,17 @@
 from __future__ import annotations
 
+import json
+
 from ai_xss_generator.active.worker import _build_cloud_feedback_lessons
 from ai_xss_generator.active.executor import ExecutionResult
 from ai_xss_generator.behavior import attach_behavior_profile, build_target_behavior_profile
-from ai_xss_generator.models import _cloud_prompt_for_context, _normalize_payloads
+from ai_xss_generator.models import (
+    _cloud_prompt_for_context,
+    _generate_with_cli,
+    _generation_output_schema,
+    _normalize_payloads,
+    _prompt_for_generation_phase,
+)
 from ai_xss_generator.types import ParsedContext
 
 
@@ -269,3 +277,88 @@ def test_cloud_prompt_includes_edge_execution_feedback_details() -> None:
     assert '"fragment_dropped"' in prompt
     assert '"delivery_outcomes": [' in prompt
     assert '"query_preserved"' in prompt
+
+
+def test_generation_output_schema_scout_is_minimal() -> None:
+    schema = _generation_output_schema("scout")
+    payload_item = schema["properties"]["payloads"]["items"]
+
+    assert payload_item["required"] == ["payload", "title", "test_vector", "bypass_family"]
+    assert "strategy" not in payload_item["properties"]
+
+
+def test_prompt_for_generation_phase_scout_is_smaller_than_research() -> None:
+    context = ParsedContext(source="https://example.test/search?q=x", source_type="url")
+
+    scout = _prompt_for_generation_phase(context, "scout")
+    research = _prompt_for_generation_phase(context, "research")
+
+    assert len(scout) < len(research)
+    assert "15-25 payloads" not in scout
+    assert "Return ONLY strict JSON" in scout
+
+
+def test_generate_with_cli_escalates_from_scout_to_contextual(monkeypatch) -> None:
+    context = ParsedContext(source="https://example.test/search?q=x", source_type="url")
+    calls: list[tuple[str, int | None, dict[str, object] | None]] = []
+
+    def fake_generate(tool: str, prompt: str, model: str | None = None, *, timeout_seconds: int | None = None, schema=None):
+        calls.append((prompt, timeout_seconds, schema))
+        if len(calls) == 1:
+            return json.dumps({"payloads": [{"payload": "javascript:1", "title": "weak", "test_vector": "?q=javascript:1", "bypass_family": "weak"}]}), tool
+        return json.dumps(
+            {
+                "payloads": [
+                    {
+                        "payload": "javascript:alert(1)",
+                        "title": "uri",
+                        "explanation": "fits href",
+                        "test_vector": "?q=javascript:alert(1)",
+                        "tags": ["uri"],
+                        "target_sink": "href",
+                        "bypass_family": "javascript-uri",
+                        "risk_score": 80,
+                    },
+                    {
+                        "payload": "java\tscript:alert(1)",
+                        "title": "tab uri",
+                        "explanation": "fits href",
+                        "test_vector": "?q=java%09script:alert(1)",
+                        "tags": ["uri"],
+                        "target_sink": "href",
+                        "bypass_family": "whitespace-in-scheme",
+                        "risk_score": 81,
+                    },
+                    {
+                        "payload": "javascript://%0Aalert(1)",
+                        "title": "comment",
+                        "explanation": "fits href",
+                        "test_vector": "?q=javascript://%250Aalert(1)",
+                        "tags": ["uri"],
+                        "target_sink": "href",
+                        "bypass_family": "comment-injection",
+                        "risk_score": 79,
+                    },
+                ]
+            }
+        ), tool
+
+    monkeypatch.setattr("ai_xss_generator.cli_runner.generate_via_cli_with_tool", fake_generate)
+    monkeypatch.setattr(
+        "ai_xss_generator.ai_capabilities.recommended_timeout_seconds_for_phase",
+        lambda tool, role, phase, fallback: {"scout": 20, "contextual": 45, "research": 90}[phase],
+    )
+
+    payloads, actual_tool = _generate_with_cli(context, "claude", None)
+
+    assert actual_tool == "claude"
+    assert len(payloads) == 3
+    assert len(calls) == 2
+    assert calls[0][1] == 20
+    assert calls[1][1] == 45
+    assert calls[0][2]["properties"]["payloads"]["items"]["required"] == [
+        "payload",
+        "title",
+        "test_vector",
+        "bypass_family",
+    ]

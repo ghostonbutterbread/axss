@@ -31,7 +31,7 @@ def test_generate_via_cli_falls_back_from_claude_to_codex() -> None:
 
     assert tool == "codex"
     assert raw == '{"payloads": []}'
-    codex.assert_called_once_with("prompt", None, timeout_seconds=None)
+    codex.assert_called_once_with("prompt", None, timeout_seconds=None, schema=None)
 
 
 def test_trace_preview_sanitizes_terminal_controls_and_truncates() -> None:
@@ -142,7 +142,7 @@ def test_generate_via_cli_tries_each_tool_once_when_both_fail() -> None:
             generate_via_cli_with_tool("claude", "prompt")
 
     claude.assert_called_once_with("prompt", None, timeout_seconds=None)
-    codex.assert_called_once_with("prompt", None, timeout_seconds=None)
+    codex.assert_called_once_with("prompt", None, timeout_seconds=None, schema=None)
 
 
 def test_generate_with_cli_labels_payloads_with_actual_fallback_tool() -> None:

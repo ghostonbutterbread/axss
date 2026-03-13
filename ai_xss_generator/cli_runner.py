@@ -274,10 +274,17 @@ def generate_via_cli_with_tool(
     model: str | None = None,
     *,
     timeout_seconds: int | None = None,
+    schema: dict[str, object] | None = None,
 ) -> tuple[str, str]:
     """Dispatch to the correct CLI tool with automatic failover to the alternate CLI."""
     try:
-        return generate_via_cli_no_fallback(tool, prompt, model, timeout_seconds=timeout_seconds), tool
+        return generate_via_cli_no_fallback(
+            tool,
+            prompt,
+            model,
+            timeout_seconds=timeout_seconds,
+            schema=schema,
+        ), tool
     except CliInvocationError as exc:
         alt = _alternate_tool(tool)
         if not exc.fallback_recommended:
@@ -289,7 +296,13 @@ def generate_via_cli_with_tool(
             exc,
         )
         try:
-            return generate_via_cli_no_fallback(alt, prompt, model, timeout_seconds=timeout_seconds), alt
+            return generate_via_cli_no_fallback(
+                alt,
+                prompt,
+                model,
+                timeout_seconds=timeout_seconds,
+                schema=schema,
+            ), alt
         except CliInvocationError as alt_exc:
             raise RuntimeError(
                 f"{tool} CLI failed ({exc}); fallback {alt} CLI also failed ({alt_exc})"
@@ -302,12 +315,13 @@ def generate_via_cli_no_fallback(
     model: str | None = None,
     *,
     timeout_seconds: int | None = None,
+    schema: dict[str, object] | None = None,
 ) -> str:
     """Dispatch to the requested CLI tool only, without cross-tool failover."""
     if tool == "claude":
         return call_claude(prompt, model, timeout_seconds=timeout_seconds)
     if tool == "codex":
-        return call_codex(prompt, model, timeout_seconds=timeout_seconds)
+        return call_codex(prompt, model, timeout_seconds=timeout_seconds, schema=schema)
     raise ValueError(f"Unknown CLI tool: {tool!r} — expected 'claude' or 'codex'")
 
 
@@ -317,6 +331,7 @@ def generate_via_cli(
     model: str | None = None,
     *,
     timeout_seconds: int | None = None,
+    schema: dict[str, object] | None = None,
 ) -> str:
     """Dispatch to the correct CLI tool and return raw stdout.
 
@@ -333,7 +348,13 @@ def generate_via_cli(
         RuntimeError: if the CLI tool is not found, times out, or exits non-zero.
         ValueError:   if *tool* is not a recognised CLI tool name.
     """
-    raw, _ = generate_via_cli_with_tool(tool, prompt, model, timeout_seconds=timeout_seconds)
+    raw, _ = generate_via_cli_with_tool(
+        tool,
+        prompt,
+        model,
+        timeout_seconds=timeout_seconds,
+        schema=schema,
+    )
     return raw
 
 

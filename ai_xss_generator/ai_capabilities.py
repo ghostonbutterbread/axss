@@ -485,6 +485,17 @@ def recommended_timeout_seconds(tool: str, role: str, fallback: int) -> int:
     return fallback
 
 
+def recommended_timeout_seconds_for_phase(tool: str, role: str, phase: str, fallback: int) -> int:
+    base = recommended_timeout_seconds(tool, role, fallback)
+    if phase == "scout":
+        return max(15, min(base, max(15, base // 2)))
+    if phase == "contextual":
+        return max(30, base)
+    if phase == "research":
+        return max(60, min(180, int(base * 2)))
+    return fallback
+
+
 def recommended_api_timeout_seconds(model: str, role: str, fallback: int) -> int:
     capability = get_api_model_capability(model)
     if not capability:
@@ -493,6 +504,17 @@ def recommended_api_timeout_seconds(model: str, role: str, fallback: int) -> int
     suggested = role_info.get("suggested_timeout_seconds")
     if isinstance(suggested, int) and suggested > 0:
         return suggested
+    return fallback
+
+
+def recommended_api_timeout_seconds_for_phase(model: str, role: str, phase: str, fallback: int) -> int:
+    base = recommended_api_timeout_seconds(model, role, fallback)
+    if phase == "scout":
+        return max(20, min(base, max(20, base // 2)))
+    if phase == "contextual":
+        return max(45, base)
+    if phase == "research":
+        return max(75, min(240, int(base * 2)))
     return fallback
 
 
