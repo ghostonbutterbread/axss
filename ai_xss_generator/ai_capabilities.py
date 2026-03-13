@@ -34,6 +34,39 @@ CAPABILITIES_PATH = CONFIG_DIR / "model_capabilities.json"
 GENERATION_ROLE = "xss_payload_generation"
 REASONING_ROLE = "xss_context_reasoning"
 _SUPPORTED_TOOLS = ("claude", "codex")
+_BLOCK_MARKERS = (
+    "can't help with",
+    "cannot help with",
+    "can't assist with",
+    "cannot assist with",
+    "i can’t help with",
+    "i cannot help with",
+    "i can’t assist with",
+    "i cannot assist with",
+    "can't help with that",
+    "cannot help with that",
+    "can't assist with that",
+    "cannot assist with that",
+    "i can’t help with that",
+    "i cannot help with that",
+    "i can’t assist with that",
+    "i cannot assist with that",
+    "can't generate xss",
+    "cannot generate xss",
+    "can't provide xss",
+    "cannot provide xss",
+    "malicious",
+    "harmful",
+    "disallowed",
+    "policy",
+    "not able to comply",
+    "unable to comply",
+    "not able to provide",
+    "unable to provide",
+    "i must refuse",
+    "i need to refuse",
+    "refuse",
+)
 
 
 @dataclass(frozen=True)
@@ -136,6 +169,11 @@ def _tool_reasoning_prompt() -> str:
         "families for a reflected href attribute where javascript: may be filtered but whitespace-broken "
         "scheme variants might work. Keep the answer concise and practical."
     )
+
+
+def _looks_blocked_response(text: str) -> bool:
+    lowered = text.lower()
+    return any(marker in lowered for marker in _BLOCK_MARKERS)
 
 
 def _capability_timeout(tool: str, role: str) -> int:
@@ -254,6 +292,14 @@ def _evaluate_generation(tool: str, model: str | None) -> dict[str, Any]:
             model,
             timeout_seconds=_capability_timeout(tool, GENERATION_ROLE),
         )
+        if _looks_blocked_response(raw):
+            latency_ms = int((time.monotonic() - start) * 1000)
+            return {
+                "status": "fail",
+                "latency_ms": latency_ms,
+                "note": "response appears to be policy-blocked/refused for XSS generation",
+                "suggested_timeout_seconds": _suggested_timeout(latency_ms, 45 if tool == "codex" else 30),
+            }
         data = _extract_json_blob(raw)
         payloads = _normalize_payloads(data.get("payloads", []), source=f"capability:{tool}")
         latency_ms = int((time.monotonic() - start) * 1000)
@@ -285,8 +331,12 @@ def _evaluate_reasoning(tool: str, model: str | None) -> dict[str, Any]:
         raw = _call_reasoning_tool(tool, model, _capability_timeout(tool, REASONING_ROLE))
         latency_ms = int((time.monotonic() - start) * 1000)
         stripped = raw.strip()
-        status = "pass" if len(stripped) >= 20 else "fail"
-        note = "returned non-empty reasoning output" if status == "pass" else "returned an empty reasoning result"
+        blocked = _looks_blocked_response(stripped)
+        status = "pass" if len(stripped) >= 20 and not blocked else "fail"
+        if blocked:
+            note = "response appears to be policy-blocked/refused for XSS reasoning"
+        else:
+            note = "returned non-empty reasoning output" if status == "pass" else "returned an empty reasoning result"
         return {
             "status": status,
             "latency_ms": latency_ms,
@@ -307,6 +357,14 @@ def _evaluate_api_generation(model: str) -> dict[str, Any]:
     start = time.monotonic()
     try:
         raw = _call_api_generation(model, 45)
+        if _looks_blocked_response(raw):
+            latency_ms = int((time.monotonic() - start) * 1000)
+            return {
+                "status": "fail",
+                "latency_ms": latency_ms,
+                "note": "response appears to be policy-blocked/refused for XSS generation",
+                "suggested_timeout_seconds": _suggested_timeout(latency_ms, 45),
+            }
         data = _extract_json_blob(raw)
         payloads = _normalize_payloads(data.get("payloads", []), source=f"capability:{model}")
         latency_ms = int((time.monotonic() - start) * 1000)
@@ -338,8 +396,12 @@ def _evaluate_api_reasoning(model: str) -> dict[str, Any]:
         raw = _call_api_reasoning(model, 30)
         latency_ms = int((time.monotonic() - start) * 1000)
         stripped = raw.strip()
-        status = "pass" if len(stripped) >= 20 else "fail"
-        note = "returned non-empty reasoning output" if status == "pass" else "returned an empty reasoning result"
+        blocked = _looks_blocked_response(stripped)
+        status = "pass" if len(stripped) >= 20 and not blocked else "fail"
+        if blocked:
+            note = "response appears to be policy-blocked/refused for XSS reasoning"
+        else:
+            note = "returned non-empty reasoning output" if status == "pass" else "returned an empty reasoning result"
         return {
             "status": status,
             "latency_ms": latency_ms,
@@ -501,6 +563,49 @@ def choose_api_generation_model(
             + "."
         )
     return preferred_model, ""
+
+
+def reasoning_role_warning(
+    *,
+    backend: str,
+    tool: str | None = None,
+    model: str | None = None,
+    auto_check: bool = True,
+) -> str:
+    if backend == "cli":
+        if not tool:
+            return ""
+        capability = get_tool_capability(tool)
+        if capability is None and auto_check:
+            capability = run_cli_capability_check(tool, model=model)
+        if capability is None:
+            return ""
+        role_info = _roles_for(capability).get(REASONING_ROLE, {}) or {}
+        if role_info.get("status") == "fail":
+            note = str(role_info.get("note", "")).strip()
+            return (
+                f"Configured reasoning model '{tool}' is not validated for XSS reasoning"
+                + (f" ({note})" if note else "")
+                + "."
+            )
+        return ""
+    if backend == "api":
+        if not model:
+            return ""
+        capability = get_api_model_capability(model)
+        if capability is None and auto_check:
+            capability = run_api_capability_check(model)
+        if capability is None:
+            return ""
+        role_info = (capability.get("roles", {}) or {}).get(REASONING_ROLE, {}) or {}
+        if role_info.get("status") == "fail":
+            note = str(role_info.get("note", "")).strip()
+            return (
+                f"Configured reasoning model '{model}' is not validated for XSS reasoning"
+                + (f" ({note})" if note else "")
+                + "."
+            )
+    return ""
 
 
 def _render_capability_rows(store: dict[str, Any]) -> list[dict[str, str]]:

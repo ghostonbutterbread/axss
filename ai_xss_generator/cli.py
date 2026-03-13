@@ -1505,7 +1505,7 @@ def main(argv: list[str] | None = None) -> int:
     cli_tool = ai_config.cli_tool
     cli_model = ai_config.cli_model
     if use_cloud and ai_backend == "cli":
-        from ai_xss_generator.ai_capabilities import choose_generation_tool
+        from ai_xss_generator.ai_capabilities import choose_generation_tool, reasoning_role_warning
 
         resolved_tool, tool_note = choose_generation_tool(
             ai_config.xss_generation_model,
@@ -1515,8 +1515,16 @@ def main(argv: list[str] | None = None) -> int:
         if tool_note:
             warn(tool_note)
         cli_tool = resolved_tool
+        reasoning_note = reasoning_role_warning(
+            backend="cli",
+            tool=ai_config.xss_reasoning_model,
+            model=cli_model,
+            auto_check=True,
+        )
+        if reasoning_note:
+            warn(reasoning_note)
     elif use_cloud and ai_backend == "api":
-        from ai_xss_generator.ai_capabilities import choose_api_generation_model
+        from ai_xss_generator.ai_capabilities import choose_api_generation_model, reasoning_role_warning
 
         resolved_api_model, model_note = choose_api_generation_model(
             cloud_model,
@@ -1526,6 +1534,13 @@ def main(argv: list[str] | None = None) -> int:
         if model_note:
             warn(model_note)
         cloud_model = resolved_api_model
+        reasoning_note = reasoning_role_warning(
+            backend="api",
+            model=ai_config.reasoning_role.model or ai_config.cloud_model,
+            auto_check=True,
+        )
+        if reasoning_note:
+            warn(reasoning_note)
     from dataclasses import replace as _dc_replace
     ai_config = _dc_replace(
         ai_config,
