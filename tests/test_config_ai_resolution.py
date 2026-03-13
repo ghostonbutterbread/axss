@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from ai_xss_generator.config import AIRoleConfig, AppConfig, DEFAULT_MODEL, resolve_ai_config
+from ai_xss_generator import config as config_module
+from ai_xss_generator.config import AIRoleConfig, AppConfig, DEFAULT_MODEL, load_config, resolve_ai_config
 
 
 def test_resolve_ai_config_uses_config_defaults() -> None:
@@ -118,3 +119,66 @@ def test_resolve_ai_config_prefers_nested_role_config() -> None:
     assert resolved.api_fallback_models == ("openai/gpt-4.1-mini",)
     assert resolved.generation_role.backend == "api"
     assert resolved.reasoning_role.tool == "codex"
+
+
+def test_load_config_accepts_comments_and_new_key_names(tmp_path, monkeypatch) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        """
+        {
+          // Local-only fallback model
+          "local_model": "qwen3.5:27b",
+          "enable_remote_escalation": false,
+          "ai_backend": "cli",
+          "cli_tool": "claude",
+          "cli_model": null,
+          "cloud_model": "anthropic/claude-3-5-sonnet"
+        }
+        """,
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config_module, "CONFIG_PATH", config_path)
+
+    loaded = load_config()
+
+    assert loaded.default_model == "qwen3.5:27b"
+    assert loaded.use_cloud is False
+    assert loaded.ai_backend == "cli"
+    assert loaded.cli_tool == "claude"
+
+
+def test_load_config_accepts_advanced_role_jsonc(tmp_path, monkeypatch) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        """
+        {
+          "local_model": "qwen3.5:9b",
+          "enable_remote_escalation": true,
+          "ai": {
+            "roles": {
+              "generation": {
+                "backend": "cli",
+                "tool": "claude",
+                "model": null,
+                "fallback_models": []
+              },
+              "reasoning": {
+                "backend": "cli",
+                "tool": "codex",
+                "model": null,
+                "fallback_models": []
+              }
+            }
+          }
+        }
+        """,
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config_module, "CONFIG_PATH", config_path)
+
+    loaded = load_config()
+
+    assert loaded.default_model == "qwen3.5:9b"
+    assert loaded.use_cloud is True
+    assert loaded.generation_role.tool == "claude"
+    assert loaded.reasoning_role.tool == "codex"

@@ -13,6 +13,46 @@ CONFIG_PATH = CONFIG_DIR / "config.json"
 KEYS_PATH   = CONFIG_DIR / "keys"
 
 
+def _strip_json_comments(text: str) -> str:
+    out: list[str] = []
+    in_string = False
+    escape = False
+    i = 0
+    length = len(text)
+    while i < length:
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < length else ""
+        if in_string:
+            out.append(ch)
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            i += 1
+            continue
+        if ch == '"':
+            in_string = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "/" and nxt == "/":
+            i += 2
+            while i < length and text[i] not in "\r\n":
+                i += 1
+            continue
+        if ch == "/" and nxt == "*":
+            i += 2
+            while i + 1 < length and not (text[i] == "*" and text[i + 1] == "/"):
+                i += 1
+            i = min(i + 2, length)
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def load_api_key(name: str) -> str:
     """Return *name* from ~/.axss/keys, or "" if not present.
 
@@ -179,18 +219,18 @@ def _derive_reasoning_role_from_legacy(config: AppConfig, generation_role: AIRol
 
 def load_config() -> AppConfig:
     try:
-        raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        raw = json.loads(_strip_json_comments(CONFIG_PATH.read_text(encoding="utf-8")))
     except (FileNotFoundError, OSError, json.JSONDecodeError):
         return AppConfig()
 
     if not isinstance(raw, dict):
         return AppConfig()
 
-    default_model = raw.get("default_model", DEFAULT_MODEL)
+    default_model = raw.get("local_model", raw.get("default_model", DEFAULT_MODEL))
     if not isinstance(default_model, str) or not default_model.strip():
         default_model = DEFAULT_MODEL
 
-    use_cloud = raw.get("use_cloud", True)
+    use_cloud = raw.get("enable_remote_escalation", raw.get("use_cloud", True))
     if not isinstance(use_cloud, bool):
         use_cloud = True
 
