@@ -26,6 +26,34 @@ have_cmd() {
   command -v "$1" >/dev/null 2>&1
 }
 
+file_sha256() {
+  local path="$1"
+  if have_cmd sha256sum; then
+    sha256sum "$path" | awk '{print $1}'
+    return 0
+  fi
+  if have_cmd shasum; then
+    shasum -a 256 "$path" | awk '{print $1}'
+    return 0
+  fi
+  if have_cmd openssl; then
+    openssl dgst -sha256 "$path" | awk '{print $NF}'
+    return 0
+  fi
+  return 1
+}
+
+playwright_install_args() {
+  case "$(uname -s 2>/dev/null || echo unknown)" in
+    Linux)
+      echo "chromium --with-deps"
+      ;;
+    *)
+      echo "chromium"
+      ;;
+  esac
+}
+
 # Resolve the system Python 3 executable (python3 > python > error).
 # Sets PYTHON to the full path of the first working Python 3.10+ found.
 find_python() {
@@ -257,6 +285,8 @@ init_axss_dir() {
   # 1. Main config dir — private to owner
   mkdir -p "$CONFIG_DIR"
   chmod 700 "$CONFIG_DIR"
+  mkdir -p "$CONFIG_DIR/reports" "$CONFIG_DIR/sessions"
+  chmod 700 "$CONFIG_DIR/reports" "$CONFIG_DIR/sessions"
 
   # 2. config.json — create with defaults on first run; on subsequent runs only
   #    update the local model recommendation + detected AI defaults so user edits
@@ -431,7 +461,7 @@ fi
 # Only reinstall packages (and playwright browser) when requirements.txt has changed
 # or packages are broken.  The stamp file stores the last successful hash.
 REQS_HASH_FILE="$CONFIG_DIR/.reqs_hash"
-REQS_CURRENT_HASH="$(sha256sum "$ROOT_DIR/requirements.txt" 2>/dev/null | cut -d' ' -f1)"
+REQS_CURRENT_HASH="$(file_sha256 "$ROOT_DIR/requirements.txt" 2>/dev/null || true)"
 if [ -f "$REQS_HASH_FILE" ] && [ "$(cat "$REQS_HASH_FILE" 2>/dev/null)" = "$REQS_CURRENT_HASH" ] \
     && "$VENV_PYTHON" -m pip check >/dev/null 2>&1; then
   echo "Python packages up-to-date (requirements.txt unchanged) — skipping install."
@@ -440,8 +470,10 @@ else
   "$VENV_PYTHON" -m pip install -r "$ROOT_DIR/requirements.txt"
   # Install Playwright browser binaries required by Scrapling's stealth fetcher.
   # Playwright version is pinned in requirements.txt so this only runs when packages change.
+  # `--with-deps` is Linux-specific; keep other platforms on the simpler install path.
+  read -r -a PLAYWRIGHT_ARGS <<< "$(playwright_install_args)"
   _playwright_ok=1
-  if ! "$VENV_PYTHON" -m playwright install chromium --with-deps; then
+  if ! "$VENV_PYTHON" -m playwright install "${PLAYWRIGHT_ARGS[@]}"; then
     echo "Warning: playwright install chromium failed — active scanner (--active) will not work." >&2
     _playwright_ok=0
   fi
@@ -464,4 +496,4 @@ if [ "$CONFIG_MODE" = "preserve" ]; then
 else
   echo "Configured $CONFIG_PATH with local_model=$SELECTED_MODEL using ${CONFIG_MODE} layout"
 fi
-echo "Run ./setup.sh then axss --help anywhere"
+echo "Setup complete. Run axss --help"
