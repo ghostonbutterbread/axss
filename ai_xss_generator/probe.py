@@ -10,6 +10,7 @@ to the AI generator, so payloads are targeted to confirmed contexts.
 from __future__ import annotations
 
 import logging
+import json
 import os
 import re
 import secrets
@@ -159,6 +160,30 @@ class ReflectionContext:
     attr_name: str = ""
     """Attribute name for html_attr_* contexts (e.g. 'href', 'onclick')."""
 
+    tag_name: str = ""
+    """HTML tag name for reflected markup contexts when it can be inferred."""
+
+    quote_style: str = ""
+    """Quote style for reflected attr/json contexts: single | double | unquoted."""
+
+    html_subcontext: str = ""
+    """Narrower reflected HTML placement hint for prompt routing."""
+
+    attacker_prefix: str = ""
+    """Short local content prefix immediately before the reflected value."""
+
+    attacker_suffix: str = ""
+    """Short local content suffix immediately after the reflected value."""
+
+    payload_shape: str = ""
+    """Best-fit exploit shape such as quote_closure or same_tag_attr_pivot."""
+
+    subcontext_explanation: str = ""
+    """Short human-readable explanation of the reflected placement."""
+
+    evidence_confidence: float = 0.0
+    """Confidence that the inferred reflected subcontext is correct."""
+
     surviving_chars: frozenset[str] = field(default_factory=frozenset)
     """Probe chars that came back literally unmodified in the response."""
 
@@ -200,6 +225,32 @@ class ReflectionContext:
     @property
     def short_label(self) -> str:
         return self.context_type + (f"({self.attr_name})" if self.attr_name else "")
+
+
+def _truncate_context_fragment(value: str, *, limit: int = 120, tail: bool = True) -> str:
+    if len(value) <= limit:
+        return value
+    if tail:
+        return value[-limit:]
+    return value[:limit]
+
+
+def _clone_reflection_context(ctx: ReflectionContext, *, surviving_chars: frozenset[str]) -> ReflectionContext:
+    return ReflectionContext(
+        context_type=ctx.context_type,
+        attr_name=ctx.attr_name,
+        tag_name=ctx.tag_name,
+        quote_style=ctx.quote_style,
+        html_subcontext=ctx.html_subcontext,
+        attacker_prefix=ctx.attacker_prefix,
+        attacker_suffix=ctx.attacker_suffix,
+        payload_shape=ctx.payload_shape,
+        subcontext_explanation=ctx.subcontext_explanation,
+        evidence_confidence=ctx.evidence_confidence,
+        surviving_chars=surviving_chars,
+        snippet=ctx.snippet,
+        context_before=ctx.context_before,
+    )
 
 
 @dataclass(slots=True)
@@ -376,6 +427,104 @@ def _inside_inert_tag(before: str) -> bool:
     return False
 
 
+def _infer_tag_name(tag_content: str) -> str:
+    match = re.match(r"<\s*([A-Za-z][\w:-]*)", tag_content)
+    return match.group(1).lower() if match else ""
+
+
+def _build_reflected_explanation(
+    *,
+    context_type: str,
+    tag_name: str = "",
+    attr_name: str = "",
+    quote_style: str = "",
+) -> str:
+    if context_type == "html_attr_url":
+        style = f"{quote_style}-quoted " if quote_style in ("single", "double") else (
+            "unquoted " if quote_style == "unquoted" else ""
+        )
+        location = f"{style}{attr_name} attribute"
+        if tag_name:
+            location += f" on <{tag_name}>"
+        return f"Reflection is inside a {location}."
+    if context_type == "html_attr_event":
+        style = f"{quote_style}-quoted " if quote_style in ("single", "double") else (
+            "unquoted " if quote_style == "unquoted" else ""
+        )
+        location = f"{style}{attr_name} event handler"
+        if tag_name:
+            location += f" on <{tag_name}>"
+        return f"Reflection is inside a {location}."
+    if context_type == "html_attr_value":
+        style = f"{quote_style}-quoted " if quote_style in ("single", "double") else (
+            "unquoted " if quote_style == "unquoted" else ""
+        )
+        location = f"{style}{attr_name} attribute"
+        if tag_name:
+            location += f" on <{tag_name}>"
+        return f"Reflection is inside a {location}."
+    if context_type == "html_comment":
+        return "Reflection is inside an open HTML comment."
+    if context_type == "json_value":
+        style = f"{quote_style}-quoted " if quote_style else ""
+        return f"Reflection appears inside a {style}JSON string value.".strip()
+    return "Reflection appears in raw HTML body text."
+
+
+def _build_payload_shape(context_type: str, attr_name: str, quote_style: str) -> str:
+    if context_type == "html_attr_url":
+        if attr_name == "srcdoc":
+            return "same_tag_attr_pivot_or_srcdoc"
+        if quote_style in ("single", "double"):
+            return "scheme_or_quote_closure"
+        return "scheme_or_same_tag_attr_pivot"
+    if context_type == "html_attr_event":
+        return "event_handler_in_place"
+    if context_type == "html_attr_value":
+        if quote_style in ("single", "double"):
+            return "quote_closure_or_same_tag_attr_pivot"
+        return "same_tag_attr_pivot"
+    if context_type == "html_comment":
+        return "comment_breakout"
+    if context_type == "json_value":
+        return "json_string_breakout"
+    return "raw_tag_injection"
+
+
+def _build_html_subcontext(context_type: str, attr_name: str, quote_style: str) -> str:
+    if context_type == "html_attr_url":
+        prefix = {
+            "single": "single_quoted",
+            "double": "double_quoted",
+            "unquoted": "unquoted",
+        }.get(quote_style, "unknown")
+        suffix = "srcdoc_attr" if attr_name == "srcdoc" else "url_attr"
+        return f"{prefix}_{suffix}"
+    if context_type == "html_attr_event":
+        prefix = {
+            "single": "single_quoted",
+            "double": "double_quoted",
+            "unquoted": "unquoted",
+        }.get(quote_style, "unknown")
+        return f"{prefix}_event_attr"
+    if context_type == "html_attr_value":
+        prefix = {
+            "single": "single_quoted",
+            "double": "double_quoted",
+            "unquoted": "unquoted",
+        }.get(quote_style, "unknown")
+        return f"{prefix}_attr_value"
+    if context_type == "html_comment":
+        return "html_comment"
+    if context_type == "json_value":
+        prefix = {
+            "single": "single_quoted",
+            "double": "double_quoted",
+        }.get(quote_style, "quoted")
+        return f"{prefix}_json_value"
+    return "raw_html_body"
+
+
 def _classify_context_at(html: str, idx: int, canary: str) -> ReflectionContext | None:
     """Determine the XSS injection context at *idx* in *html*.
 
@@ -396,7 +545,18 @@ def _classify_context_at(html: str, idx: int, canary: str) -> ReflectionContext 
     copen = before.rfind("<!--")
     cclose = before.rfind("-->")
     if copen != -1 and (cclose == -1 or cclose < copen):
-        return ReflectionContext(context_type="html_comment", snippet=snippet)
+        comment_start = max(copen, idx - 80)
+        comment_end = min(len(html), idx + len(canary) + 80)
+        return ReflectionContext(
+            context_type="html_comment",
+            html_subcontext="html_comment",
+            attacker_prefix=_truncate_context_fragment(html[comment_start:idx]),
+            attacker_suffix=_truncate_context_fragment(html[idx + len(canary):comment_end], tail=False),
+            payload_shape="comment_breakout",
+            subcontext_explanation=_build_reflected_explanation(context_type="html_comment"),
+            evidence_confidence=0.9,
+            snippet=snippet,
+        )
 
     # 2. Inside a <script> block?
     script_open_pos = before.rfind("<script")
@@ -439,31 +599,120 @@ def _classify_context_at(html: str, idx: int, canary: str) -> ReflectionContext 
     last_tag_close = before.rfind(">")
     if last_tag_open != -1 and last_tag_open > last_tag_close:
         tag_content = before[last_tag_open:]
-        attr_m = re.search(r"""([\w:-]+)\s*=\s*["']?[^"'<>]*$""", tag_content)
+        tag_name = _infer_tag_name(tag_content)
+        attr_m = re.search(r"""([\w:-]+)\s*=\s*(?:(['"])([^'"]*)|([^\s"'<>`=]*))$""", tag_content)
         if attr_m:
             attr_name = attr_m.group(1).lower()
+            quote_char = attr_m.group(2) or ""
+            quote_style = {"'": "single", '"': "double"}.get(quote_char, "unquoted")
+            tag_end = html.find(">", idx)
+            attacker_prefix = _truncate_context_fragment(tag_content)
+            attacker_suffix = ""
+            if tag_end != -1:
+                attacker_suffix = _truncate_context_fragment(
+                    html[idx + len(canary): tag_end + 1],
+                    tail=False,
+                )
             if attr_name.startswith("on"):
                 return ReflectionContext(
-                    context_type="html_attr_event", attr_name=attr_name, snippet=snippet
+                    context_type="html_attr_event",
+                    attr_name=attr_name,
+                    tag_name=tag_name,
+                    quote_style=quote_style,
+                    html_subcontext=_build_html_subcontext("html_attr_event", attr_name, quote_style),
+                    attacker_prefix=attacker_prefix,
+                    attacker_suffix=attacker_suffix,
+                    payload_shape=_build_payload_shape("html_attr_event", attr_name, quote_style),
+                    subcontext_explanation=_build_reflected_explanation(
+                        context_type="html_attr_event",
+                        tag_name=tag_name,
+                        attr_name=attr_name,
+                        quote_style=quote_style,
+                    ),
+                    evidence_confidence=0.96,
+                    snippet=snippet,
                 )
             if attr_name in (
                 "href", "src", "action", "formaction", "data",
                 "xlink:href", "content", "srcdoc",
             ):
                 return ReflectionContext(
-                    context_type="html_attr_url", attr_name=attr_name, snippet=snippet
+                    context_type="html_attr_url",
+                    attr_name=attr_name,
+                    tag_name=tag_name,
+                    quote_style=quote_style,
+                    html_subcontext=_build_html_subcontext("html_attr_url", attr_name, quote_style),
+                    attacker_prefix=attacker_prefix,
+                    attacker_suffix=attacker_suffix,
+                    payload_shape=_build_payload_shape("html_attr_url", attr_name, quote_style),
+                    subcontext_explanation=_build_reflected_explanation(
+                        context_type="html_attr_url",
+                        tag_name=tag_name,
+                        attr_name=attr_name,
+                        quote_style=quote_style,
+                    ),
+                    evidence_confidence=0.96,
+                    snippet=snippet,
                 )
             return ReflectionContext(
-                context_type="html_attr_value", attr_name=attr_name, snippet=snippet
+                context_type="html_attr_value",
+                attr_name=attr_name,
+                tag_name=tag_name,
+                quote_style=quote_style,
+                html_subcontext=_build_html_subcontext("html_attr_value", attr_name, quote_style),
+                attacker_prefix=attacker_prefix,
+                attacker_suffix=attacker_suffix,
+                payload_shape=_build_payload_shape("html_attr_value", attr_name, quote_style),
+                subcontext_explanation=_build_reflected_explanation(
+                    context_type="html_attr_value",
+                    tag_name=tag_name,
+                    attr_name=attr_name,
+                    quote_style=quote_style,
+                ),
+                evidence_confidence=0.94,
+                snippet=snippet,
             )
 
     # 4. JSON value heuristic
     stripped_before = before.rstrip()
     if stripped_before.endswith(('": "', "': '", '":"', "':'")):
-        return ReflectionContext(context_type="json_value", snippet=snippet)
+        quote_style = "double" if stripped_before.endswith(('": "', '":"')) else "single"
+        return ReflectionContext(
+            context_type="json_value",
+            quote_style=quote_style,
+            html_subcontext=_build_html_subcontext("json_value", "", quote_style),
+            attacker_prefix=_truncate_context_fragment(before),
+            attacker_suffix=_truncate_context_fragment(
+                html[idx + len(canary): min(len(html), idx + len(canary) + 100)],
+                tail=False,
+            ),
+            payload_shape=_build_payload_shape("json_value", "", quote_style),
+            subcontext_explanation=_build_reflected_explanation(
+                context_type="json_value",
+                quote_style=quote_style,
+            ),
+            evidence_confidence=0.88,
+            snippet=snippet,
+        )
 
     # 5. Raw HTML body (fallback)
-    return ReflectionContext(context_type="html_body", snippet=snippet)
+    body_start = max(last_tag_close + 1, idx - 80)
+    next_tag_open = html.find("<", idx + len(canary))
+    if next_tag_open == -1:
+        next_tag_open = min(len(html), idx + len(canary) + 80)
+    return ReflectionContext(
+        context_type="html_body",
+        html_subcontext="raw_html_body",
+        attacker_prefix=_truncate_context_fragment(html[body_start:idx]),
+        attacker_suffix=_truncate_context_fragment(
+            html[idx + len(canary):next_tag_open],
+            tail=False,
+        ),
+        payload_shape="raw_tag_injection",
+        subcontext_explanation=_build_reflected_explanation(context_type="html_body"),
+        evidence_confidence=0.82,
+        snippet=snippet,
+    )
 
 
 def _find_reflections(html: str, canary: str) -> list[ReflectionContext]:
@@ -838,13 +1087,7 @@ def _probe_param(
                         probe_mode=probe_plan.mode,
                         tested_chars=probe_plan.chars,
                         reflections=[
-                            ReflectionContext(
-                                context_type=ctx.context_type,
-                                attr_name=ctx.attr_name,
-                                surviving_chars=_surviving,
-                                snippet=ctx.snippet,
-                                context_before=ctx.context_before,
-                            )
+                            _clone_reflection_context(ctx, surviving_chars=_surviving)
                             for ctx in _sink_refs
                         ],
                     )
@@ -884,13 +1127,7 @@ def _probe_param(
         probe_mode=probe_plan.mode,
         tested_chars=probe_plan.chars,
         reflections=[
-            ReflectionContext(
-                context_type=ctx.context_type,
-                attr_name=ctx.attr_name,
-                surviving_chars=surviving,
-                snippet=ctx.snippet,
-                context_before=ctx.context_before,
-            )
+            _clone_reflection_context(ctx, surviving_chars=surviving)
             for ctx in reflections
         ],
     )
@@ -982,13 +1219,7 @@ def _probe_param_playwright(
         probe_mode=probe_plan.mode,
         tested_chars=probe_plan.chars,
         reflections=[
-            ReflectionContext(
-                context_type=ctx.context_type,
-                attr_name=ctx.attr_name,
-                surviving_chars=surviving,
-                snippet=ctx.snippet,
-                context_before=ctx.context_before,
-            )
+            _clone_reflection_context(ctx, surviving_chars=surviving)
             for ctx in reflections
         ],
     )
@@ -1147,13 +1378,7 @@ def probe_url(
                                     probe_mode=probe_plan.mode,
                                     tested_chars=probe_plan.chars,
                                     reflections=[
-                                        ReflectionContext(
-                                            context_type=ctx.context_type,
-                                            attr_name=ctx.attr_name,
-                                            surviving_chars=_surviving,
-                                            snippet=ctx.snippet,
-                                            context_before=ctx.context_before,
-                                        )
+                                        _clone_reflection_context(ctx, surviving_chars=_surviving)
                                         for ctx in _sink_refs
                                     ],
                                 )
@@ -1487,13 +1712,7 @@ def probe_post_form(
                 probe_mode=probe_plan.mode,
                 tested_chars=probe_plan.chars,
                 reflections=[
-                    ReflectionContext(
-                        context_type=ctx.context_type,
-                        attr_name=ctx.attr_name,
-                        surviving_chars=surviving,
-                        snippet=ctx.snippet,
-                        context_before=ctx.context_before,
-                    )
+                    _clone_reflection_context(ctx, surviving_chars=surviving)
                     for ctx in reflections
                 ],
             )
@@ -1531,6 +1750,21 @@ def enrich_context(context: ParsedContext, probe_results: list[ProbeResult]) -> 
                 f"[probe:CONFIRMED] '{result.param_name}' → {ctx.short_label} "
                 f"surviving={chars_str!r} tested={tested_chars!r} mode={probe_mode} [{status}]"
             )
+            subcontext_payload = {
+                "param_name": result.param_name,
+                "context_type": ctx.context_type,
+                "attr_name": ctx.attr_name,
+                "tag_name": ctx.tag_name,
+                "quote_style": ctx.quote_style,
+                "html_subcontext": ctx.html_subcontext,
+                "payload_shape": ctx.payload_shape,
+                "attacker_prefix": ctx.attacker_prefix,
+                "attacker_suffix": ctx.attacker_suffix,
+                "snippet": _truncate_context_fragment(ctx.snippet, limit=180, tail=False),
+                "explanation": ctx.subcontext_explanation,
+                "confidence": round(ctx.evidence_confidence, 2) if ctx.evidence_confidence else 0.0,
+            }
+            extra_notes.append("[probe:SUBCONTEXT] " + json.dumps(subcontext_payload, ensure_ascii=True))
 
     return dc_replace(
         context,

@@ -114,6 +114,53 @@ def _extract_dom_runtime_context(context: ParsedContext) -> dict[str, str]:
     return {}
 
 
+def _extract_reflected_subcontext(
+    context: ParsedContext,
+    desired_context: str = "",
+) -> dict[str, Any]:
+    """Return the best reflected subcontext note for the current reflected sink."""
+    prefix = "[probe:SUBCONTEXT] "
+    candidates: list[dict[str, Any]] = []
+    for note in context.notes:
+        if not note.startswith(prefix):
+            continue
+        try:
+            payload = json.loads(note[len(prefix):])
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        candidates.append(payload)
+
+    if not candidates:
+        return {}
+
+    desired = desired_context.strip()
+    if desired:
+        matching = [
+            item for item in candidates
+            if str(item.get("context_type", "") or "").strip() == desired
+        ]
+        if matching:
+            candidates = matching
+
+    best = candidates[0]
+    compact = {
+        "context_type": str(best.get("context_type", "") or ""),
+        "tag_name": str(best.get("tag_name", "") or ""),
+        "attr_name": str(best.get("attr_name", "") or ""),
+        "quote_style": str(best.get("quote_style", "") or ""),
+        "html_subcontext": str(best.get("html_subcontext", "") or ""),
+        "payload_shape": str(best.get("payload_shape", "") or ""),
+        "attacker_prefix": str(best.get("attacker_prefix", "") or ""),
+        "attacker_suffix": str(best.get("attacker_suffix", "") or ""),
+        "explanation": str(best.get("explanation", "") or ""),
+        "snippet": str(best.get("snippet", "") or ""),
+        "confidence": best.get("confidence", 0.0) or 0.0,
+    }
+    return {key: value for key, value in compact.items() if value not in ("", [], {}, None)}
+
+
 def _behavior_profile_section(context: ParsedContext) -> str:
     profile = extract_behavior_profile(context)
     if not profile:
@@ -350,6 +397,7 @@ def _waf_knowledge_data(context: ParsedContext) -> dict[str, Any]:
 def _context_envelope(context: ParsedContext, waf: str | None = None) -> dict[str, Any]:
     sink_type, context_type, surviving_chars = _extract_probe_context(context)
     dom_runtime = _extract_dom_runtime_context(context)
+    reflected_subcontext = _extract_reflected_subcontext(context, desired_context=context_type)
     behavior = extract_behavior_profile(context) or {}
     envelope: dict[str, Any] = {
         "target_url": context.source,
@@ -369,6 +417,8 @@ def _context_envelope(context: ParsedContext, waf: str | None = None) -> dict[st
         envelope["dom_runtime"] = dom_runtime
         if (dom_runtime.get("sink") or "").strip().lower() == "document.write":
             envelope["dom_subcontext"] = _document_write_subcontext(context)
+    elif reflected_subcontext:
+        envelope["reflected_subcontext"] = reflected_subcontext
     return {key: value for key, value in envelope.items() if value not in ("", [], {}, None, False)}
 
 

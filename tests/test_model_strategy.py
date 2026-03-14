@@ -12,6 +12,9 @@ from ai_xss_generator.models import (
     _normalize_payloads,
     _prompt_for_generation_phase,
 )
+from ai_xss_generator.probe import ProbeResult
+from ai_xss_generator.probe import ReflectionContext
+from ai_xss_generator.probe import enrich_context
 from ai_xss_generator.types import ParsedContext
 from ai_xss_generator.types import PayloadCandidate
 
@@ -356,6 +359,80 @@ def test_generation_phase_prompts_use_envelopes_instead_of_full_context_blob() -
     assert "PLANNING ENVELOPE" in scout
     assert "SUPPLEMENTAL CONTEXT" in research
     assert "Full parsed context" not in research
+
+
+def test_enrich_context_writes_reflected_subcontext_note() -> None:
+    context = ParsedContext(source="https://example.test/page?next=x", source_type="url")
+
+    enriched = enrich_context(
+        context,
+        [
+            ProbeResult(
+                param_name="next",
+                original_value="x",
+                probe_mode="standard",
+                tested_chars="<>'\"",
+                reflections=[
+                    ReflectionContext(
+                        context_type="html_attr_url",
+                        attr_name="href",
+                        tag_name="a",
+                        quote_style="double",
+                        html_subcontext="double_quoted_url_attr",
+                        attacker_prefix='<a href="',
+                        attacker_suffix='">Continue</a>',
+                        payload_shape="scheme_or_quote_closure",
+                        subcontext_explanation="Reflection is inside a double-quoted href attribute on <a>.",
+                        evidence_confidence=0.96,
+                        surviving_chars=frozenset({":", "/", '"'}),
+                        snippet='<a href="axss123">Continue</a>',
+                    )
+                ],
+            )
+        ],
+    )
+
+    assert any(note.startswith("[probe:SUBCONTEXT] ") for note in enriched.notes)
+
+
+def test_reflected_prompt_envelope_includes_reflected_subcontext() -> None:
+    base = ParsedContext(source="https://example.test/page?next=x", source_type="url")
+    enriched = enrich_context(
+        base,
+        [
+            ProbeResult(
+                param_name="next",
+                original_value="x",
+                probe_mode="standard",
+                tested_chars="<>'\"",
+                reflections=[
+                    ReflectionContext(
+                        context_type="html_attr_url",
+                        attr_name="href",
+                        tag_name="a",
+                        quote_style="double",
+                        html_subcontext="double_quoted_url_attr",
+                        attacker_prefix='<a class="cta" href="',
+                        attacker_suffix='">Continue</a>',
+                        payload_shape="scheme_or_quote_closure",
+                        subcontext_explanation="Reflection is inside a double-quoted href attribute on <a>.",
+                        evidence_confidence=0.96,
+                        surviving_chars=frozenset({":", "/", '"'}),
+                        snippet='<a class="cta" href="axss123">Continue</a>',
+                    )
+                ],
+            )
+        ],
+    )
+
+    prompt = _prompt_for_generation_phase(enriched, "contextual")
+
+    assert '"reflected_subcontext": {' in prompt
+    assert '"tag_name": "a"' in prompt
+    assert '"attr_name": "href"' in prompt
+    assert '"quote_style": "double"' in prompt
+    assert '"html_subcontext": "double_quoted_url_attr"' in prompt
+    assert '"payload_shape": "scheme_or_quote_closure"' in prompt
 
 
 def test_generate_with_cli_escalates_from_scout_to_contextual(monkeypatch) -> None:
