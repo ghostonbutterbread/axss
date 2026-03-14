@@ -322,6 +322,117 @@ def _execution_feedback_section(past_lessons: list[Any] | None) -> str:
     return "EXECUTION FEEDBACK PROFILE:\n" + json.dumps(compact, indent=2) + "\n"
 
 
+def _execution_feedback_data(past_lessons: list[Any] | None) -> dict[str, Any]:
+    section = _execution_feedback_section(past_lessons)
+    if not section:
+        return {}
+    return json.loads(section.split(":\n", 1)[1])
+
+
+def _effective_constraints_data(
+    context: ParsedContext,
+    waf: str | None = None,
+    past_lessons: list[Any] | None = None,
+) -> dict[str, Any]:
+    section = _effective_constraints_section(context, waf=waf, past_lessons=past_lessons)
+    if not section:
+        return {}
+    return json.loads(section.split(":\n", 1)[1])
+
+
+def _waf_knowledge_data(context: ParsedContext) -> dict[str, Any]:
+    section = _waf_knowledge_section(context)
+    if not section:
+        return {}
+    return json.loads(section.split(":\n", 1)[1])
+
+
+def _context_envelope(context: ParsedContext, waf: str | None = None) -> dict[str, Any]:
+    sink_type, context_type, surviving_chars = _extract_probe_context(context)
+    dom_runtime = _extract_dom_runtime_context(context)
+    behavior = extract_behavior_profile(context) or {}
+    envelope: dict[str, Any] = {
+        "target_url": context.source,
+        "delivery_mode": behavior.get("delivery_mode", ""),
+        "primary_sink": sink_type or dom_runtime.get("sink", ""),
+        "reflection_context": context_type,
+        "surviving_special_chars": surviving_chars,
+        "reflection_transforms": list(behavior.get("reflection_transforms", []) or [])[:3],
+        "probe_modes": list(behavior.get("probe_modes", []) or [])[:2],
+        "discovery_styles": list(behavior.get("discovery_styles", []) or [])[:2],
+        "browser_required": bool(behavior.get("browser_required", False)),
+        "auth_required": bool(behavior.get("auth_required", False)),
+        "frameworks": list(context.frameworks[:3]),
+        "waf_hint": waf or behavior.get("waf_name", ""),
+    }
+    if dom_runtime:
+        envelope["dom_runtime"] = dom_runtime
+        if (dom_runtime.get("sink") or "").strip().lower() == "document.write":
+            envelope["dom_subcontext"] = _document_write_subcontext(context)
+    return {key: value for key, value in envelope.items() if value not in ("", [], {}, None, False)}
+
+
+def _planning_envelope(
+    context: ParsedContext,
+    waf: str | None = None,
+    past_lessons: list[Any] | None = None,
+) -> dict[str, Any]:
+    effective = _effective_constraints_data(context, waf=waf, past_lessons=past_lessons)
+    waf_knowledge = _waf_knowledge_data(context)
+    envelope = {
+        "primary_families": list(effective.get("recommended_families", []) or [])[:3],
+        "avoid_families": list(effective.get("deprioritized_families", []) or [])[:4],
+        "observed_blockers": list(effective.get("observed_blockers", []) or [])[:4],
+        "observed_transforms": list(effective.get("observed_transforms", []) or [])[:3],
+        "delivery_modes_in_play": list(effective.get("attempted_delivery_modes", []) or [])[:3],
+        "delivery_outcomes": list(effective.get("delivery_outcomes", []) or [])[:3],
+        "required_strategy_shifts": list(effective.get("required_strategy_shifts", []) or [])[:3],
+        "required_delivery_shifts": list(effective.get("required_delivery_shifts", []) or [])[:3],
+        "creative_techniques": list(effective.get("creative_techniques", []) or [])[:3],
+    }
+    if waf_knowledge:
+        envelope["waf_prior"] = {
+            "engine_name": waf_knowledge.get("engine_name", ""),
+            "preferred_strategies": list(waf_knowledge.get("preferred_strategies", []) or [])[:3],
+            "avoid_strategies": list(waf_knowledge.get("avoid_strategies", []) or [])[:3],
+        }
+    return {key: value for key, value in envelope.items() if value not in ("", [], {}, None)}
+
+
+def _failure_envelope(past_lessons: list[Any] | None) -> dict[str, Any]:
+    feedback = _execution_feedback_data(past_lessons)
+    if not feedback:
+        return {}
+    envelope = {
+        "failed_families": list(feedback.get("failed_families", []) or [])[:4],
+        "attempted_delivery_modes": list(feedback.get("attempted_delivery_modes", []) or [])[:4],
+        "edge_blockers": list(feedback.get("edge_blockers", []) or [])[:4],
+        "delivery_outcomes": list(feedback.get("delivery_outcomes", []) or [])[:4],
+        "duplicate_payloads": list(feedback.get("duplicate_payloads", []) or [])[:3],
+        "observations": list(feedback.get("observations", []) or [])[:2],
+    }
+    return {key: value for key, value in envelope.items() if value not in ("", [], {}, None)}
+
+
+def _context_envelope_section(context: ParsedContext, waf: str | None = None) -> str:
+    return "CONTEXT ENVELOPE:\n" + json.dumps(_context_envelope(context, waf=waf), indent=2) + "\n"
+
+
+def _planning_envelope_section(
+    context: ParsedContext,
+    waf: str | None = None,
+    past_lessons: list[Any] | None = None,
+) -> str:
+    return "PLANNING ENVELOPE:\n" + json.dumps(_planning_envelope(context, waf=waf, past_lessons=past_lessons), indent=2) + "\n"
+
+
+def _failure_envelope_section(past_lessons: list[Any] | None) -> str:
+    envelope = _failure_envelope(past_lessons)
+    if not envelope:
+        return ""
+    return "FAILURE ENVELOPE:\n" + json.dumps(envelope, indent=2) + "\n"
+
+
 def _generation_output_schema(phase: str) -> dict[str, Any]:
     if phase == "scout":
         return {
@@ -412,14 +523,13 @@ def _prompt_for_generation_phase(
         )
 
     sink_type, context_type, surviving_chars = _extract_probe_context(context)
-    behavior_section = _behavior_profile_section(context)
-    waf_knowledge_section = _waf_knowledge_section(context)
-    effective_constraints_section = _effective_constraints_section(
+    context_envelope_section = _context_envelope_section(context, waf=waf)
+    planning_envelope_section = _planning_envelope_section(
         context,
         waf=waf,
         past_lessons=past_lessons,
     )
-    execution_feedback_section = _execution_feedback_section(past_lessons)
+    failure_envelope_section = _failure_envelope_section(past_lessons)
     auth_section = ""
     if context.auth_notes:
         auth_section = (
@@ -444,10 +554,9 @@ def _prompt_for_generation_phase(
             "Task: produce 3-4 concise payloads likely to execute in this exact context.\n"
             "Focus on the most plausible attack family first. Avoid explanations outside the JSON.\n"
             "Each payload object must include payload, title, test_vector, bypass_family.\n"
-            + behavior_section
-            + waf_knowledge_section
-            + effective_constraints_section
-            + execution_feedback_section
+            + context_envelope_section
+            + planning_envelope_section
+            + failure_envelope_section
             + auth_section
         ).strip()
 
@@ -492,10 +601,9 @@ def _prompt_for_generation_phase(
         "Prefer materially distinct candidates. Keep the output compact and execution-focused.\n"
         "Each payload object must include payload, title, explanation, test_vector, tags, target_sink, bypass_family, risk_score.\n"
         + seed_section
-        + behavior_section
-        + waf_knowledge_section
-        + effective_constraints_section
-        + execution_feedback_section
+        + context_envelope_section
+        + planning_envelope_section
+        + failure_envelope_section
         + lessons_section
         + findings_section
         + auth_section
@@ -569,14 +677,13 @@ def _prompt_for_context(
     lessons_section = ""
     if past_lessons:
         lessons_section = lessons_prompt_section(past_lessons) + "\n"
-    behavior_section = _behavior_profile_section(context)
-    waf_knowledge_section = _waf_knowledge_section(context)
-    effective_constraints_section = _effective_constraints_section(
+    context_envelope_section = _context_envelope_section(context, waf=waf)
+    planning_envelope_section = _planning_envelope_section(
         context,
         waf=waf,
         past_lessons=past_lessons,
     )
-    execution_feedback_section = _execution_feedback_section(past_lessons)
+    failure_envelope_section = _failure_envelope_section(past_lessons)
 
     # ── Section 2b: Auth context ──────────────────────────────────────────────
     auth_section = ""
@@ -614,8 +721,22 @@ def _prompt_for_context(
             + "\n"
         )
 
-    # ── Section 5: Context JSON ───────────────────────────────────────────────
-    context_blob = json.dumps(context.to_dict(), indent=2)
+    supplemental_context = {
+        "title": context.title,
+        "forms": len(context.forms),
+        "inputs": len(context.inputs),
+        "event_handlers": len(context.event_handlers),
+        "dom_sinks": [
+            {
+                "sink": sink.sink,
+                "location": sink.location,
+            }
+            for sink in context.dom_sinks[:4]
+        ],
+        "inline_scripts": context.inline_scripts[:2],
+        "auth_notes": context.auth_notes[:2],
+        "notes": context.notes[:4],
+    }
 
     # ── Bypass family hint ────────────────────────────────────────────────────
     family_list = ", ".join(BYPASS_FAMILIES)
@@ -649,8 +770,8 @@ Requirements:
 - Include a compact `strategy` object per payload so the scanner can reason about delivery shape, encoding style, and what to pivot to next if the attempt fails.
 - When the effective constraints justify it, consider uncommon but plausible techniques such as numeric entities, Unicode-width variants, mixed encodings, or parser-state pivots. Do not use novelty unless it materially helps this exact context.
 
-{probe_section}{dom_section}{behavior_section}{waf_knowledge_section}{effective_constraints_section}{execution_feedback_section}{lessons_section}{findings_section}{auth_section}{waf_section}{reference_section}Full parsed context:
-{context_blob}""".strip()
+{probe_section}{dom_section}{context_envelope_section}{planning_envelope_section}{failure_envelope_section}{lessons_section}{findings_section}{auth_section}{waf_section}{reference_section}SUPPLEMENTAL CONTEXT:
+{json.dumps(supplemental_context, indent=2)}""".strip()
 
 
 def _dom_sink_request_profile(sink: str) -> tuple[str, list[str]]:
@@ -725,14 +846,13 @@ def _compact_dom_prompt_for_local(
                 lesson_lines.append(f"- {title}: {summary}".strip(": "))
         if lesson_lines:
             lessons_section = "Runtime lessons:\n" + "\n".join(lesson_lines) + "\n"
-    behavior_section = _behavior_profile_section(context)
-    waf_knowledge_section = _waf_knowledge_section(context)
-    effective_constraints_section = _effective_constraints_section(
+    context_envelope_section = _context_envelope_section(context, waf=waf)
+    planning_envelope_section = _planning_envelope_section(
         context,
         waf=waf,
         past_lessons=past_lessons,
     )
-    execution_feedback_section = _execution_feedback_section(past_lessons)
+    failure_envelope_section = _failure_envelope_section(past_lessons)
 
     context_summary = {
         "source": context.source,
@@ -785,7 +905,7 @@ Requirements:
 
 DOM runtime:
 {json.dumps(dom_runtime, indent=2)}
-{waf_line}{behavior_section}{waf_knowledge_section}{effective_constraints_section}{execution_feedback_section}{lessons_section}{findings_section}Context summary:
+{waf_line}{context_envelope_section}{planning_envelope_section}{failure_envelope_section}{lessons_section}{findings_section}Context summary:
 {json.dumps(context_summary, indent=2)}""".strip()
 
 
@@ -933,14 +1053,13 @@ def _compact_dom_prompt_for_cloud(
                 lesson_lines.append(f"- {title}: {summary}".strip(": "))
         if lesson_lines:
             lessons_section = "Runtime lessons:\n" + "\n".join(lesson_lines) + "\n"
-    behavior_section = _behavior_profile_section(context)
-    waf_knowledge_section = _waf_knowledge_section(context)
-    effective_constraints_section = _effective_constraints_section(
+    context_envelope_section = _context_envelope_section(context, waf=waf)
+    planning_envelope_section = _planning_envelope_section(
         context,
         waf=waf,
         past_lessons=past_lessons,
     )
-    execution_feedback_section = _execution_feedback_section(past_lessons)
+    failure_envelope_section = _failure_envelope_section(past_lessons)
 
     context_summary = {
         "source": context.source,
@@ -1019,14 +1138,13 @@ def _document_write_prompt_for_cloud(
                 lesson_lines.append(f"- {title}: {summary}".strip(": "))
         if lesson_lines:
             lessons_section = "Runtime lessons:\n" + "\n".join(lesson_lines) + "\n"
-    behavior_section = _behavior_profile_section(context)
-    waf_knowledge_section = _waf_knowledge_section(context)
-    effective_constraints_section = _effective_constraints_section(
+    context_envelope_section = _context_envelope_section(context, waf=waf)
+    planning_envelope_section = _planning_envelope_section(
         context,
         waf=waf,
         past_lessons=past_lessons,
     )
-    execution_feedback_section = _execution_feedback_section(past_lessons)
+    failure_envelope_section = _failure_envelope_section(past_lessons)
 
     targeted_examples = [
         {
@@ -1100,7 +1218,7 @@ Document.write subcontext:
 {json.dumps(subcontext, indent=2)}
 Recommended payload families:
 {recommended}
-{waf_line}{behavior_section}{waf_knowledge_section}{effective_constraints_section}{execution_feedback_section}{lessons_section}Targeted examples:
+{waf_line}{context_envelope_section}{planning_envelope_section}{failure_envelope_section}{lessons_section}Targeted examples:
 {json.dumps(targeted_examples, indent=2)}
 Context summary:
 {json.dumps(context_summary, indent=2)}""".strip()

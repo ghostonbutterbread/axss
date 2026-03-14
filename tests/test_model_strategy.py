@@ -132,14 +132,17 @@ def test_cloud_prompt_includes_structured_execution_feedback_profile() -> None:
 
     prompt = _cloud_prompt_for_context(enriched, past_lessons=lessons, waf="akamai")
 
-    assert "EXECUTION FEEDBACK PROFILE" in prompt
+    assert "CONTEXT ENVELOPE" in prompt
+    assert "PLANNING ENVELOPE" in prompt
+    assert "FAILURE ENVELOPE" in prompt
     assert '"failed_families": [' in prompt
     assert '"plain_javascript_uri"' in prompt
     assert '"attempted_delivery_modes": [' in prompt
     assert '"required_strategy_shifts": [' in prompt
     assert '"required_delivery_shifts": [' in prompt
-    assert '"creative_techniques": [' in prompt
+    assert '"observed_blockers": [' in prompt
     assert "Unicode-width variants" in prompt
+    assert "Full parsed context" not in prompt
 
 
 def test_cloud_feedback_prefers_executed_delivery_history_over_planned_only_modes() -> None:
@@ -341,6 +344,18 @@ def test_prompt_for_generation_phase_scout_is_smaller_than_research() -> None:
     assert len(scout) < len(research)
     assert "15-25 payloads" not in scout
     assert "Return ONLY strict JSON" in scout
+
+
+def test_generation_phase_prompts_use_envelopes_instead_of_full_context_blob() -> None:
+    context = ParsedContext(source="https://example.test/search?q=x", source_type="url")
+
+    scout = _prompt_for_generation_phase(context, "scout")
+    research = _prompt_for_generation_phase(context, "research")
+
+    assert "CONTEXT ENVELOPE" in scout
+    assert "PLANNING ENVELOPE" in scout
+    assert "SUPPLEMENTAL CONTEXT" in research
+    assert "Full parsed context" not in research
 
 
 def test_generate_with_cli_escalates_from_scout_to_contextual(monkeypatch) -> None:
