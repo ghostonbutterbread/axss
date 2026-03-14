@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 from ai_xss_generator.active.worker import _build_cloud_feedback_lessons
 from ai_xss_generator.active.executor import ExecutionResult
 from ai_xss_generator.behavior import attach_behavior_profile, build_target_behavior_profile
+from ai_xss_generator.findings import Finding
 from ai_xss_generator.models import (
     _cloud_prompt_for_context,
     _generate_with_cli,
@@ -12,6 +14,7 @@ from ai_xss_generator.models import (
     _normalize_payloads,
     _prompt_for_generation_phase,
 )
+from ai_xss_generator.payloads import BASE_PAYLOADS, _match_payloads_to_context
 from ai_xss_generator.probe import ProbeResult
 from ai_xss_generator.probe import ReflectionContext
 from ai_xss_generator.probe import enrich_context
@@ -357,8 +360,100 @@ def test_generation_phase_prompts_use_envelopes_instead_of_full_context_blob() -
 
     assert "CONTEXT ENVELOPE" in scout
     assert "PLANNING ENVELOPE" in scout
-    assert "SUPPLEMENTAL CONTEXT" in research
-    assert "Full parsed context" not in research
+    assert "CONTEXT ENVELOPE" in research
+    assert "PLANNING ENVELOPE" in research
+    assert "SUPPLEMENTAL CONTEXT" not in research
+
+
+def test_match_payloads_to_context_prefers_url_shaped_payloads() -> None:
+    matched = _match_payloads_to_context(BASE_PAYLOADS, "html_attr_url", ":()/")
+
+    assert matched
+    assert all(any(tag in {"uri", "protocol", "href", "case-variant"} for tag in payload.tags) for payload in matched[:3])
+
+
+def test_contextual_prompt_prioritizes_success_and_similar_findings() -> None:
+    context = ParsedContext(
+        source="https://example.test/login?redirect=x",
+        source_type="url",
+        notes=["[probe:CONFIRMED] 'redirect' -> html_attr_url surviving=':()/;'"],
+    )
+    past_findings = [
+        Finding(
+            sink_type="href",
+            context_type="html_attr_url",
+            surviving_chars=":()/;",
+            bypass_family="whitespace-in-scheme",
+            payload="java\tscript:alert(1)",
+            explanation="Browsers normalize embedded ASCII tab before resolving the scheme.",
+        ),
+        Finding(
+            sink_type="html",
+            context_type="html_body",
+            surviving_chars="<>",
+            bypass_family="event-handler-injection",
+            payload="<img src=x onerror=alert(1)>",
+            explanation="Raw HTML executes when inserted into the document body.",
+        ),
+    ]
+    past_lessons = [
+        SimpleNamespace(
+            lesson_type="execution_feedback",
+            metadata={
+                "execution_confirmed": True,
+                "payload": "javascript:alert(1)",
+                "bypass_family": "case-variant",
+            }
+        ),
+        SimpleNamespace(
+            lesson_type="execution_feedback",
+            metadata={
+                "failed_families": ["plain_javascript_uri"],
+                "attempted_delivery_modes": ["query"],
+                "observation": "No dialog, console, or network execution signal fired.",
+            }
+        ),
+    ]
+
+    prompt = _prompt_for_generation_phase(
+        context,
+        "contextual",
+        past_findings=past_findings,
+        past_lessons=past_lessons,
+    )
+
+    assert "PAYLOADS THAT EXECUTED - generate similar techniques but NOT identical:" in prompt
+    assert "PAYLOADS THAT EXECUTED IN SIMILAR CONTEXTS (use as inspiration, mutate don't copy):" in prompt
+    assert '"context_type": "html_attr_url"' in prompt
+    assert '"why_it_works": "Browsers normalize embedded ASCII tab before resolving the scheme."' in prompt
+    assert prompt.index("PAYLOADS THAT EXECUTED - generate similar techniques but NOT identical:") < prompt.index("FAILURE ENVELOPE")
+
+
+def test_scout_prompt_uses_reference_payloads_as_seed_examples() -> None:
+    context = ParsedContext(
+        source="https://example.test/login?redirect=x",
+        source_type="url",
+        notes=["[probe:CONFIRMED] 'redirect' -> html_attr_url surviving=':()/;'"],
+    )
+    reference_payloads = [
+        PayloadCandidate(
+            payload="javascript:confirm(1)",
+            title="confirmed uri",
+            explanation="",
+            test_vector="?redirect=javascript:confirm(1)",
+            tags=["uri"],
+            bypass_family="case-variant",
+        )
+    ]
+
+    prompt = _prompt_for_generation_phase(
+        context,
+        "scout",
+        reference_payloads=reference_payloads,
+    )
+
+    assert "SEED PAYLOADS (mutate, do not copy):" in prompt
+    assert '"payload": "javascript:confirm(1)"' in prompt
 
 
 def test_enrich_context_writes_reflected_subcontext_note() -> None:

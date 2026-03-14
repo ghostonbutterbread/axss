@@ -22,7 +22,7 @@ from ai_xss_generator.findings import (
 )
 from ai_xss_generator.learning import build_memory_profile
 from ai_xss_generator.lessons import lessons_prompt_section
-from ai_xss_generator.payloads import base_payloads_for_context, rank_payloads
+from ai_xss_generator.payloads import BASE_PAYLOADS, _match_payloads_to_context, base_payloads_for_context, rank_payloads
 from ai_xss_generator.types import ParsedContext, PayloadCandidate, StrategyProfile
 
 log = logging.getLogger(__name__)
@@ -483,6 +483,218 @@ def _failure_envelope_section(past_lessons: list[Any] | None) -> str:
     return "FAILURE ENVELOPE:\n" + json.dumps(envelope, indent=2) + "\n"
 
 
+def _success_envelope(past_lessons: list[Any] | None) -> list[dict[str, str]]:
+    successful: list[dict[str, str]] = []
+    seen_payloads: set[str] = set()
+    for lesson in past_lessons or []:
+        metadata = getattr(lesson, "metadata", {}) or {}
+        if not (metadata.get("execution_confirmed") or metadata.get("confirmed_execution")):
+            continue
+        payload = str(metadata.get("payload", "") or "").strip()
+        if not payload or payload in seen_payloads:
+            continue
+        seen_payloads.add(payload)
+        family = str(metadata.get("bypass_family", "") or "").strip()
+        item = {"payload": payload}
+        if family:
+            item["bypass_family"] = family
+        successful.append(item)
+        if len(successful) >= 5:
+            break
+    return successful
+
+
+def _success_envelope_section(past_lessons: list[Any] | None) -> str:
+    envelope = _success_envelope(past_lessons)
+    if not envelope:
+        return ""
+    return (
+        "PAYLOADS THAT EXECUTED - generate similar techniques but NOT identical:\n"
+        + json.dumps(envelope, indent=2)
+        + "\n"
+    )
+
+
+def _payload_item_field(item: Any, field: str, default: Any = "") -> Any:
+    if hasattr(item, field):
+        return getattr(item, field, default)
+    if isinstance(item, dict):
+        return item.get(field, default)
+    if field == "payload":
+        return item
+    return default
+
+
+def _reference_payload_examples(
+    reference_payloads: list[Any] | None,
+    *,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    examples: list[dict[str, Any]] = []
+    seen_payloads: set[str] = set()
+    for item in reference_payloads or []:
+        payload = str(_payload_item_field(item, "payload", "") or "").strip()
+        if not payload or payload in seen_payloads:
+            continue
+        seen_payloads.add(payload)
+        tags = [
+            str(tag).strip()
+            for tag in (_payload_item_field(item, "tags", []) or [])
+            if str(tag).strip()
+        ]
+        bypass_family = str(_payload_item_field(item, "bypass_family", "") or "").strip()
+        if not bypass_family and tags:
+            bypass_family = infer_bypass_family(payload, tags)
+        example = {"payload": payload}
+        if bypass_family:
+            example["bypass_family"] = bypass_family
+        if tags:
+            example["tags"] = tags[:4]
+        examples.append(example)
+        if len(examples) >= limit:
+            break
+    return examples
+
+
+def _merged_reference_payloads(
+    reference_payloads: list[Any] | None,
+    past_lessons: list[Any] | None,
+) -> list[Any] | None:
+    merged: list[Any] = []
+    merged.extend(_success_envelope(past_lessons))
+    merged.extend(reference_payloads or [])
+    if not merged:
+        return None
+
+    deduped: list[Any] = []
+    seen_payloads: set[str] = set()
+    for item in merged:
+        payload = str(_payload_item_field(item, "payload", "") or "").strip()
+        if not payload or payload in seen_payloads:
+            continue
+        seen_payloads.add(payload)
+        deduped.append(item)
+    return deduped or None
+
+
+def _normalized_context_label(context_type: str) -> str:
+    normalized = (context_type or "").strip().lower()
+    if normalized.startswith("html_body"):
+        return "html_body"
+    if normalized.startswith("html_attr_value"):
+        return "html_attr_value"
+    if normalized.startswith("html_attr_url"):
+        return "html_attr_url"
+    if normalized.startswith("js_string_dq"):
+        return "js_string_dq"
+    if normalized.startswith("js_string_sq"):
+        return "js_string_sq"
+    if normalized.startswith("js_code"):
+        return "js_code"
+    if normalized.startswith("html_comment"):
+        return "html_comment"
+    return normalized
+
+
+def _similar_findings_examples(
+    past_findings: list[Finding] | None,
+    *,
+    context_type: str,
+    limit: int = 5,
+) -> list[dict[str, str]]:
+    if not past_findings:
+        return []
+
+    normalized_context = _normalized_context_label(context_type)
+    scored: list[tuple[int, Finding]] = []
+    seen_payloads: set[str] = set()
+    for finding in past_findings:
+        payload = str(finding.payload or "").strip()
+        if not payload or payload in seen_payloads:
+            continue
+        seen_payloads.add(payload)
+
+        finding_context = _normalized_context_label(finding.context_type)
+        score = 0
+        if finding_context == normalized_context:
+            score += 4
+        elif normalized_context and finding_context and normalized_context.split("_", 1)[0] == finding_context.split("_", 1)[0]:
+            score += 2
+        if finding.explanation:
+            score += 1
+        if finding.bypass_family:
+            score += 1
+        scored.append((score, finding))
+
+    scored.sort(key=lambda item: (-item[0], -item[1].confidence, item[1].payload))
+    return [
+        {
+            "payload": finding.payload,
+            "bypass_family": finding.bypass_family,
+            "context_type": finding.context_type,
+            "why_it_works": finding.explanation,
+        }
+        for _, finding in scored[:limit]
+    ]
+
+
+def _similar_findings_section(
+    past_findings: list[Finding] | None,
+    *,
+    context_type: str,
+    limit: int = 5,
+) -> str:
+    examples = _similar_findings_examples(
+        past_findings,
+        context_type=context_type,
+        limit=limit,
+    )
+    if not examples:
+        return ""
+    return (
+        "PAYLOADS THAT EXECUTED IN SIMILAR CONTEXTS (use as inspiration, mutate don't copy):\n"
+        + json.dumps(examples, indent=2)
+        + "\n"
+    )
+
+
+def _seed_examples_for_context(
+    *,
+    context_type: str,
+    surviving_chars: str,
+    reference_payloads: list[Any] | None,
+) -> list[dict[str, Any]]:
+    reference_examples = _reference_payload_examples(reference_payloads, limit=5)
+    if reference_examples:
+        return reference_examples
+
+    seeds = _match_payloads_to_context(list(BASE_PAYLOADS), context_type, surviving_chars)
+    return [
+        {
+            "payload": payload.payload,
+            "bypass_family": payload.bypass_family or infer_bypass_family(payload.payload, payload.tags),
+            "tags": payload.tags[:4],
+        }
+        for payload in seeds
+    ]
+
+
+def _seed_examples_section(
+    *,
+    context_type: str,
+    surviving_chars: str,
+    reference_payloads: list[Any] | None,
+) -> str:
+    examples = _seed_examples_for_context(
+        context_type=context_type,
+        surviving_chars=surviving_chars,
+        reference_payloads=reference_payloads,
+    )
+    if not examples:
+        return ""
+    return "SEED PAYLOADS (mutate, do not copy):\n" + json.dumps(examples, indent=2) + "\n"
+
+
 def _generation_output_schema(phase: str) -> dict[str, Any]:
     if phase == "scout":
         return {
@@ -555,6 +767,7 @@ def _prompt_for_generation_phase(
     past_findings: list[Finding] | None = None,
     past_lessons: list[Any] | None = None,
 ) -> str:
+    reference_payloads = _merged_reference_payloads(reference_payloads, past_lessons)
     if phase == "research":
         return _cloud_prompt_for_context(
             context,
@@ -579,6 +792,7 @@ def _prompt_for_generation_phase(
         waf=waf,
         past_lessons=past_lessons,
     )
+    success_envelope_section = _success_envelope_section(past_lessons)
     failure_envelope_section = _failure_envelope_section(past_lessons)
     auth_section = ""
     if context.auth_notes:
@@ -593,68 +807,49 @@ def _prompt_for_generation_phase(
         f"Reflection context: {context_type or 'unknown'}",
         f"Confirmed surviving special characters: {surviving_chars or '(none observed)'}",
     ]
+    seed_section = _seed_examples_section(
+        context_type=context_type,
+        surviving_chars=surviving_chars,
+        reference_payloads=reference_payloads,
+    )
     if phase == "scout":
         return (
             "You are helping with an authorized XSS assessment. Generate payloads, not analysis.\n"
             "Return ONLY strict JSON with a top-level {\"payloads\": [...]}.\n\n"
             + "\n".join(probe_lines)
             + "\n"
-            "Important: surviving-character probes track punctuation and metacharacters only. "
-            "Do not assume letters or digits are blocked unless explicitly stated.\n"
+            "Only special-character survival is measured; do not assume letters or digits are blocked.\n"
             "Task: produce 3-4 concise payloads likely to execute in this exact context.\n"
-            "Focus on the most plausible attack family first. Avoid explanations outside the JSON.\n"
+            "Use the seed payloads as inspiration and mutate them for this context.\n"
             "Each payload object must include payload, title, test_vector, bypass_family.\n"
+            + seed_section
             + context_envelope_section
             + planning_envelope_section
+            + success_envelope_section
             + failure_envelope_section
             + auth_section
         ).strip()
 
-    findings_section = ""
-    if past_findings:
-        compact_findings = [
-            {
-                "payload": finding.payload,
-                "bypass_family": finding.bypass_family,
-                "sink_type": finding.sink_type,
-            }
-            for finding in past_findings[:3]
-        ]
-        findings_section = "Related findings:\n" + json.dumps(compact_findings, indent=2) + "\n"
-    lessons_section = ""
-    if past_lessons:
-        lessons_section = lessons_prompt_section(past_lessons[:3]) + "\n"
-    seeds: list[str] = []
-    if context_type == "html_attr_url":
-        seeds = [
-            "javascript:alert(1)",
-            "java\tscript:alert(1)",
-            "javascript&#x3a;alert(1)",
-        ]
-    elif "html_body" in context_type:
-        seeds = [
-            "&#x3C;SVG/ONLOAD=ALERT(1)&#x3E;",
-            "&#60;IMG SRC=X ONERROR=ALERT(1)&#62;",
-            "&#x3c;DETAILS OPEN ONTOGGLE=ALERT(1)&#x3e;",
-        ]
-    seed_section = ""
-    if seeds:
-        seed_section = "Seed examples:\n" + "\n".join(f"- {seed}" for seed in seeds) + "\n"
+    findings_section = _similar_findings_section(
+        past_findings,
+        context_type=context_type,
+        limit=5,
+    )
     return (
         "You are helping with an authorized XSS assessment. Generate XSS payloads, not analysis.\n"
         "Return ONLY strict JSON with a top-level {\"payloads\": [...]}.\n\n"
         + "\n".join(probe_lines)
         + "\n"
-        "Important: surviving-character probes track punctuation and metacharacters only. "
-        "Do not assume letters or digits are blocked unless explicitly stated.\n"
+        "Only special-character survival is measured; do not assume letters or digits are blocked.\n"
         "Task: produce 4-6 payloads that are likely to execute in this exact context.\n"
+        "Past successful payloads are the primary few-shot examples: mutate them, do not repeat them exactly.\n"
         "Prefer materially distinct candidates. Keep the output compact and execution-focused.\n"
         "Each payload object must include payload, title, explanation, test_vector, tags, target_sink, bypass_family, risk_score.\n"
         + seed_section
         + context_envelope_section
         + planning_envelope_section
+        + success_envelope_section
         + failure_envelope_section
-        + lessons_section
         + findings_section
         + auth_section
     ).strip()
@@ -727,6 +922,13 @@ def _prompt_for_context(
     lessons_section = ""
     if past_lessons:
         lessons_section = lessons_prompt_section(past_lessons) + "\n"
+    behavior_section = _behavior_profile_section(context)
+    waf_knowledge_section = _waf_knowledge_section(context)
+    effective_constraints_section = _effective_constraints_section(
+        context,
+        waf=waf,
+        past_lessons=past_lessons,
+    )
     context_envelope_section = _context_envelope_section(context, waf=waf)
     planning_envelope_section = _planning_envelope_section(
         context,
@@ -820,8 +1022,85 @@ Requirements:
 - Include a compact `strategy` object per payload so the scanner can reason about delivery shape, encoding style, and what to pivot to next if the attempt fails.
 - When the effective constraints justify it, consider uncommon but plausible techniques such as numeric entities, Unicode-width variants, mixed encodings, or parser-state pivots. Do not use novelty unless it materially helps this exact context.
 
-{probe_section}{dom_section}{context_envelope_section}{planning_envelope_section}{failure_envelope_section}{lessons_section}{findings_section}{auth_section}{waf_section}{reference_section}SUPPLEMENTAL CONTEXT:
+{probe_section}{dom_section}{behavior_section}{waf_knowledge_section}{effective_constraints_section}{context_envelope_section}{planning_envelope_section}{failure_envelope_section}{lessons_section}{findings_section}{auth_section}{waf_section}{reference_section}SUPPLEMENTAL CONTEXT:
 {json.dumps(supplemental_context, indent=2)}""".strip()
+
+
+def _compact_reflected_research_prompt(
+    context: ParsedContext,
+    reference_payloads: list[Any] | None = None,
+    waf: str | None = None,
+    past_findings: list[Finding] | None = None,
+    past_lessons: list[Any] | None = None,
+) -> str:
+    sink_type, context_type, surviving_chars = _extract_probe_context(context)
+    context_envelope_section = _context_envelope_section(context, waf=waf)
+    planning_envelope_section = _planning_envelope_section(
+        context,
+        waf=waf,
+        past_lessons=past_lessons,
+    )
+    success_envelope_section = _success_envelope_section(past_lessons)
+    failure_envelope_section = _failure_envelope_section(past_lessons)
+    findings_section = _similar_findings_section(
+        past_findings,
+        context_type=context_type,
+        limit=5,
+    )
+    seed_section = _seed_examples_section(
+        context_type=context_type,
+        surviving_chars=surviving_chars,
+        reference_payloads=reference_payloads,
+    )
+    auth_section = ""
+    if context.auth_notes:
+        auth_section = (
+            "SESSION CONTEXT:\n"
+            + "\n".join(f"  - {note}" for note in context.auth_notes[:3])
+            + "\n"
+        )
+
+    probe_lines = [
+        f"Target URL: {context.source}",
+        f"Primary sink type: {sink_type or 'unknown'}",
+        f"Reflection context: {context_type or 'unknown'}",
+        f"Confirmed surviving special characters: {surviving_chars or '(none observed)'}",
+    ]
+
+    return (
+        "You are generating payloads for an authorized XSS assessment.\n"
+        "Return ONLY a JSON object.\n\n"
+        "Output schema:\n"
+        "{\n"
+        "  \"payloads\": [\n"
+        "    {\n"
+        "      \"payload\": \"string\",\n"
+        "      \"title\": \"short name\",\n"
+        "      \"explanation\": \"why it fits this exact context\",\n"
+        "      \"test_vector\": \"exact delivery string\",\n"
+        "      \"tags\": [\"tag1\", \"tag2\"],\n"
+        "      \"target_sink\": \"sink name or empty\",\n"
+        f"{_STRATEGY_SCHEMA_BLOCK}\n"
+        "      \"bypass_family\": \"best-fit family\",\n"
+        "      \"risk_score\": 1-100\n"
+        "    }\n"
+        "  ]\n"
+        "}\n\n"
+        + "\n".join(probe_lines)
+        + "\n"
+        "Only special-character survival is measured; do not assume letters or digits are blocked.\n"
+        "Task: produce 8-12 payloads for this exact context.\n"
+        "Few-shot examples matter more than restating constraints: mutate successful and similar payloads instead of copying them.\n"
+        "If needed, use uncommon encodings such as numeric entities, Unicode-width variants, or mixed encoding only when they materially help this context.\n"
+        "Prefer materially distinct techniques and keep the output execution-focused.\n"
+        + seed_section
+        + context_envelope_section
+        + planning_envelope_section
+        + success_envelope_section
+        + failure_envelope_section
+        + findings_section
+        + auth_section
+    ).strip()
 
 
 def _dom_sink_request_profile(sink: str) -> tuple[str, list[str]]:
@@ -1079,19 +1358,12 @@ def _compact_dom_prompt_for_cloud(
     sink = dom_runtime.get("sink", "") or (context.dom_sinks[0].sink if context.dom_sinks else "")
     profile_name, profile_rules = _dom_sink_request_profile(sink)
     seed_examples = _dom_seed_examples(profile_name)
-
-    findings_section = ""
-    if past_findings:
-        slim = [
-            {
-                "payload": finding.payload,
-                "sink_type": finding.sink_type,
-                "context_type": finding.context_type,
-                "bypass_family": finding.bypass_family,
-            }
-            for finding in past_findings[:3]
-        ]
-        findings_section = "Related findings:\n" + json.dumps(slim, indent=2) + "\n"
+    behavior_section = _behavior_profile_section(context)
+    findings_section = _similar_findings_section(
+        past_findings,
+        context_type="dom_xss",
+        limit=5,
+    )
 
     lessons_section = ""
     if past_lessons:
@@ -1109,6 +1381,7 @@ def _compact_dom_prompt_for_cloud(
         waf=waf,
         past_lessons=past_lessons,
     )
+    success_envelope_section = _success_envelope_section(past_lessons)
     failure_envelope_section = _failure_envelope_section(past_lessons)
 
     context_summary = {
@@ -1164,7 +1437,7 @@ Requirements:
 
 DOM runtime:
 {json.dumps(dom_runtime, indent=2)}
-{waf_line}{behavior_section}{waf_knowledge_section}{effective_constraints_section}{execution_feedback_section}{lessons_section}{findings_section}{seed_section}Context summary:
+{waf_line}{context_envelope_section}{planning_envelope_section}{success_envelope_section}{failure_envelope_section}{behavior_section}{lessons_section}{findings_section}{seed_section}Context summary:
 {json.dumps(context_summary, indent=2)}""".strip()
 
 
@@ -1177,6 +1450,7 @@ def _document_write_prompt_for_cloud(
     """Build a focused rich prompt for document.write DOM sinks."""
     dom_runtime = _extract_dom_runtime_context(context)
     subcontext = _document_write_subcontext(context)
+    behavior_section = _behavior_profile_section(context)
 
     lessons_section = ""
     if past_lessons:
@@ -1194,7 +1468,13 @@ def _document_write_prompt_for_cloud(
         waf=waf,
         past_lessons=past_lessons,
     )
+    success_envelope_section = _success_envelope_section(past_lessons)
     failure_envelope_section = _failure_envelope_section(past_lessons)
+    findings_section = _similar_findings_section(
+        past_findings,
+        context_type="dom_xss",
+        limit=5,
+    )
 
     targeted_examples = [
         {
@@ -1268,7 +1548,7 @@ Document.write subcontext:
 {json.dumps(subcontext, indent=2)}
 Recommended payload families:
 {recommended}
-{waf_line}{context_envelope_section}{planning_envelope_section}{failure_envelope_section}{lessons_section}Targeted examples:
+{waf_line}{context_envelope_section}{planning_envelope_section}{success_envelope_section}{failure_envelope_section}{behavior_section}{lessons_section}{findings_section}Targeted examples:
 {json.dumps(targeted_examples, indent=2)}
 Context summary:
 {json.dumps(context_summary, indent=2)}""".strip()
@@ -1282,6 +1562,7 @@ def _cloud_prompt_for_context(
     past_lessons: list[Any] | None = None,
 ) -> str:
     """Choose a cloud prompt shape based on the DOM sink profile."""
+    reference_payloads = _merged_reference_payloads(reference_payloads, past_lessons)
     dom_runtime = _extract_dom_runtime_context(context)
     if dom_runtime:
         sink = dom_runtime.get("sink", "") or (context.dom_sinks[0].sink if context.dom_sinks else "")
@@ -1300,7 +1581,7 @@ def _cloud_prompt_for_context(
                 past_findings=past_findings,
                 past_lessons=past_lessons,
             )
-    return _prompt_for_context(
+    return _compact_reflected_research_prompt(
         context,
         reference_payloads=reference_payloads,
         waf=waf,
@@ -1973,6 +2254,7 @@ def generate_cloud_payloads(
     or the cloud call fails.
     """
     sink_type, context_type, surviving_chars = _extract_probe_context(context)
+    reference_payloads = _merged_reference_payloads(reference_payloads, past_lessons)
     memory_profile = memory_profile or build_memory_profile(
         context=context,
         waf_name=waf,
@@ -2099,6 +2381,7 @@ def generate_payloads(
     Returns (payloads, engine, used_fallback, resolved_model).
     """
     mutator_plugins = mutator_plugins or []
+    reference_payloads = _merged_reference_payloads(reference_payloads, past_lessons)
 
     if progress is not None:
         progress("Loading relevant curated findings...")

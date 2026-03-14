@@ -4,6 +4,7 @@ from dataclasses import replace
 from urllib.parse import quote as url_quote
 
 from ai_xss_generator.encodings import encode as chain_encode, url_safe as chain_url_safe
+from ai_xss_generator.findings import infer_bypass_family
 from ai_xss_generator.types import ParsedContext, PayloadCandidate
 
 
@@ -177,6 +178,133 @@ BASE_PAYLOADS: list[PayloadCandidate] = [
         tags=["data-uri", "object", "html"],
     ),
 ]
+
+
+_CONTEXT_MATCH_RULES: dict[str, dict[str, set[str]]] = {
+    "html_body": {
+        "tags": {"html", "auto-trigger", "polyglot", "dom"},
+        "families": {"event-handler-injection", "svg-namespace", "srcdoc-injection", "data-uri"},
+    },
+    "html_attr_value": {
+        "tags": {"attribute-breakout", "event-handler", "quoted"},
+        "families": {"html-attribute-breakout", "event-handler-injection", "srcdoc-injection"},
+    },
+    "html_attr_url": {
+        "tags": {"uri", "protocol", "href", "case-variant"},
+        "families": {"whitespace-in-scheme", "case-variant", "html-entity-encoding", "data-uri"},
+    },
+    "js_string_dq": {
+        "tags": {"js-context", "quote-breakout", "concat"},
+        "families": {"js-string-breakout", "template-literal-breakout", "constructor-chain"},
+    },
+    "js_string_sq": {
+        "tags": {"js-context", "quote-breakout", "concat"},
+        "families": {"js-string-breakout", "template-literal-breakout", "constructor-chain"},
+    },
+    "js_code": {
+        "tags": {"constructor", "eval-bypass", "template-literal"},
+        "families": {"constructor-chain", "template-literal-breakout", "js-string-breakout"},
+    },
+    "html_comment": {
+        "tags": {"comment-breakout"},
+        "families": {"comment-breakout"},
+    },
+}
+
+
+def _payload_special_chars(payload: str) -> set[str]:
+    return {
+        char
+        for char in payload
+        if not char.isalnum() and not char.isspace()
+    }
+
+
+def _normalized_context_key(context_type: str) -> str:
+    normalized = (context_type or "").strip().lower()
+    if normalized.startswith("html_body"):
+        return "html_body"
+    if normalized.startswith("html_attr_value"):
+        return "html_attr_value"
+    if normalized.startswith("html_attr_url"):
+        return "html_attr_url"
+    if normalized.startswith("js_string_dq"):
+        return "js_string_dq"
+    if normalized.startswith("js_string_sq"):
+        return "js_string_sq"
+    if normalized.startswith("js_code"):
+        return "js_code"
+    if normalized.startswith("html_comment"):
+        return "html_comment"
+    return normalized
+
+
+def _payload_context_match_score(
+    payload: PayloadCandidate,
+    *,
+    context_type: str,
+    surviving_chars: str,
+) -> int:
+    context_key = _normalized_context_key(context_type)
+    rules = _CONTEXT_MATCH_RULES.get(context_key)
+    if not rules:
+        return 0
+
+    tags = {tag.strip().lower() for tag in payload.tags if tag.strip()}
+    family = (payload.bypass_family or infer_bypass_family(payload.payload, payload.tags)).strip().lower()
+    score = 0
+
+    tag_matches = tags & rules["tags"]
+    if tag_matches:
+        score += len(tag_matches) * 4
+    if family and family in rules["families"]:
+        score += 5
+
+    surviving = set(surviving_chars or "")
+    if surviving:
+        required = _payload_special_chars(payload.payload)
+        if required:
+            overlap = len(required & surviving)
+            missing = len(required - surviving)
+            score += overlap * 2
+            score -= missing * 3
+            if required.issubset(surviving):
+                score += 6
+
+    return score
+
+
+def _match_payloads_to_context(
+    payloads: list[PayloadCandidate],
+    context_type: str,
+    surviving_chars: str,
+) -> list[PayloadCandidate]:
+    indexed = list(enumerate(payloads))
+    scored: list[tuple[int, int, PayloadCandidate]] = []
+    for index, payload in indexed:
+        score = _payload_context_match_score(
+            payload,
+            context_type=context_type,
+            surviving_chars=surviving_chars,
+        )
+        if score > 0:
+            scored.append((score, index, payload))
+
+    if scored:
+        scored.sort(
+            key=lambda item: (
+                -item[0],
+                -item[2].risk_score,
+                item[1],
+            )
+        )
+        return [payload for _, _, payload in scored[:5]]
+
+    ranked = sorted(
+        indexed,
+        key=lambda item: (-item[1].risk_score, item[0]),
+    )
+    return [payload for _, payload in ranked[:5]]
 
 
 def _framework_payloads(context: ParsedContext) -> list[PayloadCandidate]:
