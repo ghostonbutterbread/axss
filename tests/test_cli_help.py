@@ -24,6 +24,7 @@ class CliHelpTest(unittest.TestCase):
         self.assertIn("-v, --verbose", help_text)
         self.assertIn("--merge-batch", help_text)
         self.assertIn("--attempts N", help_text)
+        self.assertIn("--deep", help_text)
         self.assertIn("--extreme", help_text)
         self.assertIn("--research", help_text)
         self.assertIn("--keep-searching", help_text)
@@ -59,6 +60,9 @@ class CliHelpTest(unittest.TestCase):
 
         args = parser.parse_args(["--memory-import", "/tmp/in.yaml"])
         self.assertEqual(args.memory_import, "/tmp/in.yaml")
+
+        args = parser.parse_args(["--deep"])
+        self.assertTrue(args.deep)
 
     def test_main_routes_upload_only_scan_to_active_runner(self) -> None:
         captured: dict[str, object] = {}

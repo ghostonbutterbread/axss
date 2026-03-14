@@ -230,6 +230,47 @@ def _summarize_failed_execution_results(results: list[Any]) -> str:
     return "No dialog, console, or network execution signal fired."
 
 
+def _reflected_payload_count(results: list[Any], fallback: int) -> int:
+    reflected = 0
+    for result in results:
+        if getattr(result, "error", None):
+            continue
+        reflected += 1
+    return reflected or fallback
+
+
+def _analyze_fast_failure_strategy(
+    *,
+    context: Any,
+    cloud_model: str,
+    waf_hint: str | None,
+    generated_count: int,
+    reflected_count: int,
+    ai_backend: str,
+    cli_tool: str,
+    cli_model: str | None,
+    phase_profile: str,
+) -> str:
+    from ai_xss_generator.models import analyze_deep_strategy_hint
+
+    if generated_count <= 0:
+        return ""
+    try:
+        return analyze_deep_strategy_hint(
+            context=context,
+            cloud_model=cloud_model,
+            generated_count=generated_count,
+            reflected_count=reflected_count,
+            waf=waf_hint,
+            ai_backend=ai_backend,
+            cli_tool=cli_tool,
+            cli_model=cli_model,
+            phase_profile=phase_profile,
+        )
+    except Exception:
+        return ""
+
+
 def _unique_new_payloads(payloads: list[Any], seen: set[str]) -> tuple[list[Any], list[str]]:
     fresh: list[Any] = []
     duplicates: list[str] = []
@@ -668,6 +709,7 @@ def run_worker(
     cli_tool: str = "claude",
     cli_model: str | None = None,
     cloud_attempts: int = 1,
+    deep: bool = False,
     waf_source: str | None = None,
     keep_searching: bool = False,
     extreme: bool = False,
@@ -706,6 +748,7 @@ def run_worker(
             cli_tool=cli_tool,
             cli_model=cli_model,
             cloud_attempts=cloud_attempts,
+            deep=deep,
             waf_source=waf_source,
             keep_searching=keep_searching,
             extreme=extreme,
@@ -737,6 +780,7 @@ def _run(
     cli_tool: str = "claude",
     cli_model: str | None = None,
     cloud_attempts: int = 1,
+    deep: bool = False,
     waf_source: str | None = None,
     keep_searching: bool = False,
     extreme: bool = False,
@@ -1027,6 +1071,7 @@ def _run(
                     surviving_chars = frozenset().union(
                         *(ctx.surviving_chars for ctx in context_probe_result.reflections)
                     )
+                    attempt_limit = max(1, cloud_attempts)
                     ekey = _escalation_key(
                         url=url,
                         param_name=param_name,
@@ -1036,8 +1081,10 @@ def _run(
                     )
                     cloud_feedback_lessons: list[Any] | None = None
                     seen_cloud_payloads: set[str] = set()
+                    fast_generated_count = 0
+                    fast_reflected_count = 0
 
-                    for attempt_number in range(1, max(1, cloud_attempts) + 1):
+                    for attempt_number in range(1, attempt_limit + 1):
                         if _timed_out():
                             break
 
@@ -1060,11 +1107,13 @@ def _run(
                             session_lessons=session_lessons,
                             feedback_lessons=cloud_feedback_lessons,
                             phase_profile=phase_profile,
+                            deep=deep,
                         ))
                         cloud_payloads, duplicate_payloads = _unique_new_payloads(
                             cloud_plan.payloads,
                             seen_cloud_payloads,
                         )
+                        fast_generated_count += len(cloud_payloads)
 
                         failed_results: list[Any] = []
                         for cp in cloud_payloads:
@@ -1095,7 +1144,7 @@ def _run(
                                         _cloud_attempt_note(
                                             cloud_plan.note,
                                             attempt_number,
-                                            max(1, cloud_attempts),
+                                            attempt_limit,
                                         ),
                                     ),
                                 )
@@ -1104,12 +1153,9 @@ def _run(
                                     break
                             failed_results.append(result)
 
-                        if context_done or attempt_number >= max(1, cloud_attempts):
-                            break
-
                         cloud_feedback_lessons = _build_cloud_feedback_lessons(
                             attempt_number=attempt_number,
-                            total_attempts=max(1, cloud_attempts),
+                            total_attempts=attempt_limit,
                             prompt_context=_cached_context,
                             delivery_mode="get",
                             context_type=context_type,
@@ -1119,6 +1165,79 @@ def _run(
                             duplicate_payloads=duplicate_payloads,
                             observation=_summarize_failed_execution_results(failed_results),
                         )
+                        fast_reflected_count += _reflected_payload_count(failed_results, len(cloud_payloads))
+                        if context_done or attempt_number >= attempt_limit:
+                            break
+
+                    if not context_done and not deep and not _timed_out() and fast_generated_count > 0:
+                        strategy_hint = _analyze_fast_failure_strategy(
+                            context=_cached_context,
+                            cloud_model=cloud_model,
+                            waf_hint=waf_hint,
+                            generated_count=fast_generated_count,
+                            reflected_count=fast_reflected_count or fast_generated_count,
+                            ai_backend=ai_backend,
+                            cli_tool=cli_tool,
+                            cli_model=cli_model,
+                            phase_profile=phase_profile,
+                        )
+                        cloud_model_rounds += 1
+                        cloud_plan = _coerce_cloud_plan(_get_cloud_payloads(
+                            url=url,
+                            probe_result=context_probe_result,
+                            cloud_model=cloud_model,
+                            waf=waf_hint,
+                            ekey=ekey,
+                            dedup_registry=dedup_registry,
+                            dedup_lock=dedup_lock,
+                            base_context=_cached_context,
+                            auth_headers=auth_headers,
+                            ai_backend=ai_backend,
+                            cli_tool=cli_tool,
+                            cli_model=cli_model,
+                            delivery_mode="get",
+                            session_lessons=session_lessons,
+                            feedback_lessons=cloud_feedback_lessons,
+                            phase_profile=phase_profile,
+                            phases=("contextual", "research"),
+                            strategy_hint=strategy_hint,
+                        ))
+                        cloud_payloads, _ = _unique_new_payloads(
+                            cloud_plan.payloads,
+                            seen_cloud_payloads,
+                        )
+                        for cp in cloud_payloads:
+                            if _timed_out():
+                                break
+                            total_transforms_tried += 1
+                            result = executor.fire(
+                                url=url,
+                                param_name=param_name,
+                                payload=_payload_text(cp),
+                                all_params=flat_params,
+                                transform_name="cloud_model",
+                                sink_url=sink_url,
+                                payload_candidate=cp,
+                            )
+                            if result.confirmed:
+                                finding = _make_finding(
+                                    url=url,
+                                    probe_result=context_probe_result,
+                                    context_type=context_type,
+                                    result=result,
+                                    waf=waf_hint,
+                                    source="cloud_model",
+                                    cloud_escalated=True,
+                                    ai_engine=cloud_plan.engine,
+                                    ai_note=_merge_ai_notes(
+                                        escalation_policy.note,
+                                        "Deep escalation after scout attempts exhausted.",
+                                        cloud_plan.note,
+                                    ),
+                                )
+                                if _record_context_finding(finding) and len(context_variant_keys) >= context_hit_cap:
+                                    context_done = True
+                                    break
 
                 if not context_done and waf_hint and not _timed_out():
                     waf_payloads = _waf_reference_payloads(waf_hint, context_probe_result, limit=4)
@@ -1364,6 +1483,190 @@ def _probe_result_for_context(probe_result: Any, context_type: str) -> Any:
     )
 
 
+def _sink_reflection_from_html(
+    url: str,
+    html: str,
+    canary: str,
+) -> tuple[str, Any, str] | None:
+    from ai_xss_generator.probe import _analyze_char_survival, _clone_reflection_context, _find_reflections
+
+    reflections = _find_reflections(html, canary)
+    if not reflections:
+        return None
+    surviving = _analyze_char_survival(html, canary)
+    normalized = [
+        _clone_reflection_context(
+            ctx,
+            surviving_chars=surviving or (getattr(ctx, "surviving_chars", frozenset()) or frozenset()),
+        )
+        for ctx in reflections
+    ]
+    best = next((ctx for ctx in normalized if getattr(ctx, "is_exploitable", False)), normalized[0])
+    return url, best, html
+
+
+def _fetch_sink_reflection(
+    session: Any,
+    sink_url: str,
+    canary: str,
+    auth_headers: dict[str, str] | None = None,
+) -> tuple[str, Any, str] | None:
+    from ai_xss_generator.probe import _resp_html, _session_get
+
+    req_kwargs: dict[str, Any] = {
+        "headers": {
+            **(auth_headers or {}),
+            "User-Agent": "axss/0.1 (+authorized security testing; scrapling)",
+        }
+    }
+    try:
+        response = _session_get(session, sink_url, req_kwargs)
+    except Exception as exc:
+        log.debug("Stored sink fetch failed for %s: %s", sink_url, exc)
+        return None
+    return _sink_reflection_from_html(sink_url, _resp_html(response), canary)
+
+
+def _discover_sink_context_from_crawled_pages(
+    session: Any,
+    canary: str,
+    crawled_pages: list[str] | None,
+    auth_headers: dict[str, str] | None = None,
+) -> tuple[str, Any, str] | None:
+    for candidate in list(dict.fromkeys(crawled_pages or [])):
+        result = _fetch_sink_reflection(session, candidate, canary, auth_headers)
+        if result is not None:
+            return result
+    return None
+
+
+def _discover_sink_from_crawled_pages(
+    session: Any,
+    canary: str,
+    crawled_pages: list[str] | None,
+    auth_headers: dict[str, str] | None = None,
+) -> tuple[str, str, str] | None:
+    result = _discover_sink_context_from_crawled_pages(
+        session,
+        canary,
+        crawled_pages,
+        auth_headers,
+    )
+    if result is None:
+        return None
+    sink_url, reflection, _html = result
+    surviving_chars = "".join(sorted(getattr(reflection, "surviving_chars", frozenset()) or frozenset()))
+    return sink_url, str(getattr(reflection, "context_type", "") or ""), surviving_chars
+
+
+def _override_probe_results_with_sink_reflection(
+    probe_results: list[Any],
+    param_names: list[str],
+    sink_reflection: Any,
+) -> list[Any]:
+    from ai_xss_generator.probe import PROBE_CHARS, ProbeResult, _clone_reflection_context
+
+    overridden: list[Any] = []
+    existing_by_param = {
+        str(getattr(result, "param_name", "") or ""): result
+        for result in probe_results
+        if str(getattr(result, "param_name", "") or "")
+    }
+    target_params = [str(name or "") for name in (param_names or []) if str(name or "").strip()]
+    if not target_params:
+        target_params = list(existing_by_param.keys())
+
+    for param_name in target_params:
+        existing = existing_by_param.get(param_name)
+        overridden.append(
+            ProbeResult(
+                param_name=param_name,
+                original_value=str(getattr(existing, "original_value", "") or ""),
+                reflections=[
+                    _clone_reflection_context(
+                        sink_reflection,
+                        surviving_chars=getattr(sink_reflection, "surviving_chars", frozenset()) or frozenset(),
+                    )
+                ],
+                error=None,
+                reflection_transform=str(getattr(existing, "reflection_transform", "") or ""),
+                discovery_style=str(getattr(existing, "discovery_style", "") or "stored_sink"),
+                probe_mode=str(getattr(existing, "probe_mode", "") or "stored_sink"),
+                tested_chars=str(getattr(existing, "tested_chars", "") or PROBE_CHARS),
+            )
+        )
+    return overridden
+
+
+def _autodiscover_post_sink_context(
+    *,
+    executor: Any,
+    post_form: Any,
+    manual_sink_url: str | None,
+    crawled_pages: list[str] | None,
+    auth_headers: dict[str, str] | None,
+    waf_hint: str | None,
+) -> tuple[str, Any | None, Any | None]:
+    from scrapling.fetchers import FetcherSession
+    from ai_xss_generator.parser import parse_target
+    from ai_xss_generator.probe import PROBE_CHARS, _PROBE_CLOSE, _PROBE_OPEN, _make_canary
+
+    canary = _make_canary()
+    discovery_payload = canary + _PROBE_OPEN + PROBE_CHARS + _PROBE_CLOSE
+    discovery_param = post_form.param_names[0] if post_form.param_names else ""
+    discovery_result = executor.fire_post(
+        source_page_url=post_form.source_page_url,
+        action_url=post_form.action_url,
+        param_name=discovery_param,
+        payload=discovery_payload,
+        all_param_names=post_form.param_names,
+        csrf_field=post_form.csrf_field,
+        transform_name="sink_discovery",
+        sink_url=manual_sink_url,
+    )
+
+    resolved_sink_url = manual_sink_url or str(getattr(discovery_result, "discovered_sink_url", "") or "")
+    sink_reflection_data: tuple[str, Any, str] | None = None
+    with FetcherSession(
+        impersonate="chrome",
+        stealthy_headers=True,
+        timeout=20,
+        follow_redirects=True,
+        retries=1,
+    ) as session:
+        if resolved_sink_url:
+            sink_reflection_data = _fetch_sink_reflection(
+                session,
+                resolved_sink_url,
+                canary,
+                auth_headers,
+            )
+        if sink_reflection_data is None and not manual_sink_url:
+            sink_reflection_data = _discover_sink_context_from_crawled_pages(
+                session,
+                canary,
+                crawled_pages,
+                auth_headers,
+            )
+
+    if sink_reflection_data is None:
+        return resolved_sink_url, None, None
+
+    resolved_sink_url, sink_reflection, sink_html = sink_reflection_data
+    parsed_sink_context: Any | None = None
+    try:
+        parsed_sink_context = parse_target(
+            url=resolved_sink_url,
+            html_value=None,
+            waf=waf_hint,
+            auth_headers=auth_headers,
+            cached_html=sink_html,
+        )
+    except Exception as exc:
+        log.debug("Stored sink parse failed for %s: %s", resolved_sink_url, exc)
+    return resolved_sink_url, sink_reflection, parsed_sink_context
+
+
 def _payload_matches_context(payload: str, context_type: str, attr_name: str = "") -> bool:
     lowered = payload.lower()
     has_markup = any(token in lowered for token in ("<", "&#60;", "\\u003c", "%3c"))
@@ -1498,6 +1801,51 @@ def _inject_dom_source(url: str, source_type: str, source_name: str, value: str)
     """Return *url* with *value* injected into the specified DOM-controlled source."""
     from ai_xss_generator.active.dom_xss import _inject_source
     return _inject_source(url, source_type, source_name, value)
+
+
+def _dom_reference_payloads_for_sink(sink: str) -> list[dict[str, Any]]:
+    from ai_xss_generator.active.dom_xss import fallback_payloads_for_sink
+
+    normalized_sink = str(sink or "").strip()
+    sink_tag = normalized_sink.lower() or "dom"
+    if sink_tag in {"innerhtml", "outerhtml", "insertadjacenthtml", "document.write", "document.writeln"}:
+        base_tags = ["dom_xss", "html", "auto-trigger", sink_tag]
+    elif sink_tag in {"eval", "function", "settimeout", "setinterval"}:
+        base_tags = ["dom_xss", "js-context", "execution", sink_tag]
+    else:
+        base_tags = ["dom_xss", "seed", sink_tag]
+
+    references: list[dict[str, Any]] = []
+    seen_payloads: set[str] = set()
+    for payload in fallback_payloads_for_sink(normalized_sink)[:6]:
+        payload_text = str(payload or "").strip()
+        if not payload_text or payload_text in seen_payloads:
+            continue
+        seen_payloads.add(payload_text)
+        references.append({
+            "payload": payload_text,
+            "bypass_family": infer_bypass_family(payload_text, base_tags),
+            "tags": list(base_tags),
+        })
+    return references
+
+
+def _dom_sink_from_context(context: Any) -> str:
+    dom_sinks = list(getattr(context, "dom_sinks", []) or [])
+    if dom_sinks:
+        return str(getattr(dom_sinks[0], "sink", "") or "")
+    prefix = "[dom:TAINT] "
+    for note in list(getattr(context, "notes", []) or []):
+        if not str(note).startswith(prefix):
+            continue
+        try:
+            payload = json.loads(str(note)[len(prefix):])
+        except Exception:
+            continue
+        sink = str(payload.get("sink", "") or "").strip()
+        if sink:
+            return sink
+    return ""
 
 
 def _cloud_note_for_engine(
@@ -1730,6 +2078,7 @@ def _get_dom_local_payloads(
         from ai_xss_generator.models import generate_dom_local_payloads
         from ai_xss_generator.learning import build_memory_profile
 
+        sink = _dom_sink_from_context(context)
         memory_profile = build_memory_profile(
             context=context,
             waf_name=waf,
@@ -1739,6 +2088,7 @@ def _get_dom_local_payloads(
             context=context,
             model=model,
             waf=waf,
+            reference_payloads=_dom_reference_payloads_for_sink(sink),
             memory_profile=memory_profile,
             past_lessons=session_lessons,
             local_timeout_seconds=local_timeout_seconds,
@@ -1767,6 +2117,9 @@ def _get_dom_cloud_payloads(
     session_lessons: list[Any] | None = None,
     feedback_lessons: list[Any] | None = None,
     phase_profile: str = "normal",
+    deep: bool = False,
+    phases: tuple[str, ...] | None = None,
+    strategy_hint: str | None = None,
 ) -> CloudPayloadPlan:
     """Call the cloud model once per unique DOM source → sink fingerprint."""
     use_dedup = not feedback_lessons
@@ -1785,6 +2138,7 @@ def _get_dom_cloud_payloads(
         from ai_xss_generator.models import generate_cloud_payloads
         from ai_xss_generator.learning import build_memory_profile
 
+        sink = _dom_sink_from_context(context)
         memory_profile = build_memory_profile(
             context=context,
             waf_name=waf,
@@ -1794,12 +2148,16 @@ def _get_dom_cloud_payloads(
             context=context,
             cloud_model=cloud_model,
             waf=waf,
+            reference_payloads=_dom_reference_payloads_for_sink(sink),
             past_lessons=_join_lessons(session_lessons, feedback_lessons),
             ai_backend=ai_backend,
             cli_tool=cli_tool,
             cli_model=cli_model,
             memory_profile=memory_profile,
             phase_profile=phase_profile,
+            deep=deep,
+            phases=phases,
+            strategy_hint=strategy_hint,
         )
         result_plan = CloudPayloadPlan(
             payloads=[p for p in payloads if getattr(p, "payload", "")],
@@ -1846,6 +2204,7 @@ def run_dom_worker(
     cli_tool: str = "claude",
     cli_model: str | None = None,
     cloud_attempts: int = 1,
+    deep: bool = False,
     waf_source: str | None = None,
     keep_searching: bool = False,
     extreme: bool = False,
@@ -1879,6 +2238,7 @@ def run_dom_worker(
             cli_tool=cli_tool,
             cli_model=cli_model,
             cloud_attempts=cloud_attempts,
+            deep=deep,
             waf_source=waf_source,
             keep_searching=keep_searching,
             extreme=extreme,
@@ -1905,6 +2265,7 @@ def _run_dom(
     cli_tool: str = "claude",
     cli_model: str | None = None,
     cloud_attempts: int = 1,
+    deep: bool = False,
     waf_source: str | None = None,
     keep_searching: bool = False,
     extreme: bool = False,
@@ -2067,6 +2428,7 @@ def _run_dom(
                 cloud_payloads: list[str] = []
                 cloud_feedback_lessons: list[Any] | None = None
                 seen_cloud_payloads: set[str] = set()
+                fast_generated_count = 0
                 cloud_delay_deadline = time.monotonic() + (
                     escalation_policy.cloud_start_after_seconds
                     if escalation_policy.cloud_start_after_seconds is not None
@@ -2163,6 +2525,7 @@ def _run_dom(
                                 session_lessons=dom_session_lessons,
                                 feedback_lessons=cloud_feedback_lessons,
                                 phase_profile=phase_profile,
+                                deep=deep,
                             ))
 
                     if cloud_stage is not None:
@@ -2174,23 +2537,24 @@ def _run_dom(
                                 cloud_plan.payloads,
                                 seen_cloud_payloads,
                             )
+                            fast_generated_count += len(cloud_payloads)
                             if _try_dom_payloads(cloud_payloads, "cloud_model"):
                                 break
+                            cloud_feedback_lessons = _build_cloud_feedback_lessons(
+                                attempt_number=cloud_rounds_started,
+                                total_attempts=max(1, cloud_attempts),
+                                prompt_context=dom_context,
+                                delivery_mode="dom",
+                                context_type="dom_xss",
+                                sink_context=hit.sink,
+                                payloads_tried=cloud_payloads,
+                                execution_results=[],
+                                duplicate_payloads=duplicate_payloads,
+                                observation="DOM sink stayed taint-only; no execution signal fired.",
+                            )
                             if cloud_rounds_started >= max(1, cloud_attempts):
                                 cloud_rounds_exhausted = True
                             else:
-                                cloud_feedback_lessons = _build_cloud_feedback_lessons(
-                                    attempt_number=cloud_rounds_started,
-                                    total_attempts=max(1, cloud_attempts),
-                                    prompt_context=dom_context,
-                                    delivery_mode="dom",
-                                    context_type="dom_xss",
-                                    sink_context=hit.sink,
-                                    payloads_tried=cloud_payloads,
-                                    execution_results=[],
-                                    duplicate_payloads=duplicate_payloads,
-                                    observation="DOM sink stayed taint-only; no execution signal fired.",
-                                )
                                 cloud_delay_deadline = time.monotonic()
 
                     if local_done and (not use_cloud or cloud_rounds_exhausted) and cloud_stage is None:
@@ -2200,6 +2564,47 @@ def _run_dom(
                     if local_done and not local_payloads and not use_cloud:
                         break
                     time.sleep(0.05)
+
+                if not confirmed and not deep and use_cloud and not _timed_out() and fast_generated_count > 0:
+                    strategy_hint = _analyze_fast_failure_strategy(
+                        context=dom_context,
+                        cloud_model=cloud_model,
+                        waf_hint=waf_hint,
+                        generated_count=fast_generated_count,
+                        reflected_count=fast_generated_count,
+                        ai_backend=ai_backend,
+                        cli_tool=cli_tool,
+                        cli_model=cli_model,
+                        phase_profile=phase_profile,
+                    )
+                    cloud_model_rounds += 1
+                    cloud_escalated = True
+                    cloud_plan = _coerce_cloud_plan(_get_dom_cloud_payloads(
+                        context=dom_context,
+                        cloud_model=cloud_model,
+                        waf=waf_hint,
+                        ekey=cloud_ekey,
+                        dedup_registry=dedup_registry,
+                        dedup_lock=dedup_lock,
+                        ai_backend=ai_backend,
+                        cli_tool=cli_tool,
+                        cli_model=cli_model,
+                        session_lessons=dom_session_lessons,
+                        feedback_lessons=cloud_feedback_lessons,
+                        phase_profile=phase_profile,
+                        phases=("contextual", "research"),
+                        strategy_hint=strategy_hint,
+                    ))
+                    cloud_payloads, _ = _unique_new_payloads(
+                        cloud_plan.payloads,
+                        seen_cloud_payloads,
+                    )
+                    if _try_dom_payloads(cloud_payloads, "cloud_model"):
+                        ai_note = _merge_ai_notes(
+                            escalation_policy.note,
+                            "Deep escalation after scout attempts exhausted.",
+                            cloud_plan.note,
+                        )
 
                 if not confirmed and not _timed_out():
                     fallback_rounds += 1
@@ -2491,6 +2896,9 @@ def _get_cloud_payloads(
     session_lessons: list[Any] | None = None,
     feedback_lessons: list[Any] | None = None,
     phase_profile: str = "normal",
+    deep: bool = False,
+    phases: tuple[str, ...] | None = None,
+    strategy_hint: str | None = None,
 ) -> CloudPayloadPlan:
     """Check dedup registry; call cloud model if this is a novel fingerprint.
 
@@ -2532,6 +2940,9 @@ def _get_cloud_payloads(
             cli_model=cli_model,
             memory_profile=memory_profile,
             phase_profile=phase_profile,
+            deep=deep,
+            phases=phases,
+            strategy_hint=strategy_hint,
         )
         result_plan = CloudPayloadPlan(
             payloads=[p.payload for p in payloads if p.payload],
@@ -2580,6 +2991,7 @@ def run_post_worker(
     cli_tool: str = "claude",
     cli_model: str | None = None,
     cloud_attempts: int = 1,
+    deep: bool = False,
     waf_source: str | None = None,
     keep_searching: bool = False,
     extreme: bool = False,
@@ -2613,6 +3025,7 @@ def run_post_worker(
             cli_tool=cli_tool,
             cli_model=cli_model,
             cloud_attempts=cloud_attempts,
+            deep=deep,
             waf_source=waf_source,
             keep_searching=keep_searching,
             extreme=extreme,
@@ -2646,6 +3059,7 @@ def _run_post(
     cli_tool: str = "claude",
     cli_model: str | None = None,
     cloud_attempts: int = 1,
+    deep: bool = False,
     waf_source: str | None = None,
     keep_searching: bool = False,
     extreme: bool = False,
@@ -2690,7 +3104,7 @@ def _run_post(
     )
 
     injectable = [r for r in probe_results if r.is_injectable]
-    reflected  = [r for r in probe_results if r.is_reflected]
+    reflected = [r for r in probe_results if r.is_reflected]
 
     _cached_context: Any = None
     try:
@@ -2706,9 +3120,48 @@ def _run_post(
     except Exception as exc:
         log.debug("Pre-parse of form source %s failed: %s", post_form.source_page_url, exc)
 
+    generation_context = _cached_context
+    effective_sink_url = sink_url
+
+    # Start Playwright executor
+    executor = ActiveExecutor(auth_headers=auth_headers)
+    try:
+        executor.start()
+    except Exception as exc:
+        put_result(WorkerResult(
+            url=post_form.action_url, status="error",
+            error=f"Playwright start failed: {exc}", waf=waf_hint,
+        ))
+        return
+
     post_session_lessons: list[Any] = []
     target_disposition: Any = None
     try:
+        if not _timed_out():
+            discovered_sink_url, sink_reflection, parsed_sink_context = _autodiscover_post_sink_context(
+                executor=executor,
+                post_form=post_form,
+                manual_sink_url=sink_url,
+                crawled_pages=crawled_pages,
+                auth_headers=auth_headers,
+                waf_hint=waf_hint,
+            )
+            if discovered_sink_url:
+                effective_sink_url = sink_url or discovered_sink_url
+            if sink_reflection is not None:
+                probe_results = _override_probe_results_with_sink_reflection(
+                    probe_results,
+                    post_form.param_names,
+                    sink_reflection,
+                )
+                reflected = [result for result in probe_results if result.is_reflected]
+                injectable = [result for result in probe_results if result.is_injectable]
+            if parsed_sink_context is not None:
+                if waf_source:
+                    from ai_xss_generator.waf_knowledge import analyze_waf_source, attach_waf_knowledge
+                    parsed_sink_context = attach_waf_knowledge(parsed_sink_context, analyze_waf_source(waf_source))
+                generation_context = parsed_sink_context
+
         from ai_xss_generator.behavior import (
             attach_behavior_profile,
             build_target_behavior_profile,
@@ -2726,19 +3179,19 @@ def _run_post(
             delivery_mode="post",
             waf_name=waf_hint,
             auth_required=bool(auth_headers),
-            context=_cached_context,
+            context=generation_context,
             probe_results=probe_results,
         )
-        _cached_context = attach_behavior_profile(_cached_context, behavior_profile)
+        generation_context = attach_behavior_profile(generation_context, behavior_profile)
         target_disposition = classify_target_disposition(
-            _cached_context,
+            generation_context,
             delivery_mode="post",
             reflected_params=len(reflected),
             injectable_params=len(injectable),
         )
 
         memory_profile = build_memory_profile(
-            context=_cached_context,
+            context=generation_context,
             waf_name=waf_hint,
             delivery_mode="post",
             target_host=urllib.parse.urlparse(post_form.action_url).netloc,
@@ -2746,9 +3199,9 @@ def _run_post(
         if auth_headers:
             memory_profile["auth_required"] = True
         post_session_lessons.extend(build_behavior_lessons(behavior_profile))
-        if _cached_context is not None:
+        if generation_context is not None:
             post_session_lessons.extend(build_mapping_lessons(
-                _cached_context,
+                generation_context,
                 memory_profile=memory_profile,
             ))
         if reflected:
@@ -2761,46 +3214,40 @@ def _run_post(
         log.debug("POST lesson build failed for %s: %s", post_form.action_url, exc)
 
     if not reflected:
-        put_result(WorkerResult(
-            url=post_form.action_url,
-            status="no_reflection",
-            waf=waf_hint,
-            params_tested=len(post_form.param_names),
-            dead_target=True,
-            dead_reason=(
-                getattr(target_disposition, "reason", "")
-                or "No reflection was confirmed during bounded discovery."
-            ),
-            target_tier=getattr(target_disposition, "tier", "hard_dead"),
-        ))
+        try:
+            put_result(WorkerResult(
+                url=post_form.action_url,
+                status="no_reflection",
+                waf=waf_hint,
+                params_tested=len(post_form.param_names),
+                dead_target=True,
+                dead_reason=(
+                    getattr(target_disposition, "reason", "")
+                    or "No reflection was confirmed during bounded discovery."
+                ),
+                target_tier=getattr(target_disposition, "tier", "hard_dead"),
+            ))
+        finally:
+            executor.stop()
         return
 
     if not injectable:
-        put_result(WorkerResult(
-            url=post_form.action_url,
-            status="no_reflection",
-            waf=waf_hint,
-            params_tested=len(post_form.param_names),
-            params_reflected=len(reflected),
-            dead_target=True,
-            dead_reason=(
-                getattr(target_disposition, "reason", "")
-                or "Reflection exists, but no executable context was confirmed."
-            ),
-            target_tier=getattr(target_disposition, "tier", "soft_dead"),
-        ))
-        return
-
-    # Start Playwright executor
-    executor = ActiveExecutor(auth_headers=auth_headers)
-    try:
-        executor.start()
-    except Exception as exc:
-        put_result(WorkerResult(
-            url=post_form.action_url, status="error",
-            error=f"Playwright start failed: {exc}", waf=waf_hint,
-            target_tier=getattr(target_disposition, "tier", ""),
-        ))
+        try:
+            put_result(WorkerResult(
+                url=post_form.action_url,
+                status="no_reflection",
+                waf=waf_hint,
+                params_tested=len(post_form.param_names),
+                params_reflected=len(reflected),
+                dead_target=True,
+                dead_reason=(
+                    getattr(target_disposition, "reason", "")
+                    or "Reflection exists, but no executable context was confirmed."
+                ),
+                target_tier=getattr(target_disposition, "tier", "soft_dead"),
+            ))
+        finally:
+            executor.stop()
         return
 
     confirmed_findings: list[ConfirmedFinding] = []
@@ -2827,7 +3274,7 @@ def _run_post(
                 from ai_xss_generator.behavior import derive_ai_escalation_policy
 
                 escalation_policy = derive_ai_escalation_policy(
-                    _cached_context,
+                    generation_context,
                     delivery_mode="post",
                     context_type=context_type,
                 )
@@ -2851,7 +3298,7 @@ def _run_post(
                         probe_result=context_probe_result,
                         model=model,
                         waf=waf_hint,
-                        base_context=_cached_context,
+                        base_context=generation_context,
                         auth_headers=auth_headers,
                         delivery_mode="post",
                         session_lessons=post_session_lessons,
@@ -2873,7 +3320,7 @@ def _run_post(
                             all_param_names=post_form.param_names,
                             csrf_field=post_form.csrf_field,
                             transform_name="local_model",
-                            sink_url=sink_url,
+                            sink_url=effective_sink_url,
                             payload_candidate=lp,
                         )
                         if result.confirmed:
@@ -2895,6 +3342,7 @@ def _run_post(
                     surviving_chars = frozenset().union(
                         *(ctx.surviving_chars for ctx in context_probe_result.reflections)
                     )
+                    attempt_limit = max(1, cloud_attempts)
                     ekey = _escalation_key(
                         url=post_form.action_url,
                         param_name=param_name,
@@ -2904,8 +3352,10 @@ def _run_post(
                     )
                     cloud_feedback_lessons: list[Any] | None = None
                     seen_cloud_payloads: set[str] = set()
+                    fast_generated_count = 0
+                    fast_reflected_count = 0
 
-                    for attempt_number in range(1, max(1, cloud_attempts) + 1):
+                    for attempt_number in range(1, attempt_limit + 1):
                         if _timed_out():
                             break
 
@@ -2919,7 +3369,7 @@ def _run_post(
                             ekey=ekey,
                             dedup_registry=dedup_registry,
                             dedup_lock=dedup_lock,
-                            base_context=_cached_context,
+                            base_context=generation_context,
                             auth_headers=auth_headers,
                             ai_backend=ai_backend,
                             cli_tool=cli_tool,
@@ -2928,11 +3378,13 @@ def _run_post(
                             session_lessons=post_session_lessons,
                             feedback_lessons=cloud_feedback_lessons,
                             phase_profile=phase_profile,
+                            deep=deep,
                         ))
                         cloud_payloads, duplicate_payloads = _unique_new_payloads(
                             cloud_plan.payloads,
                             seen_cloud_payloads,
                         )
+                        fast_generated_count += len(cloud_payloads)
 
                         failed_results: list[Any] = []
                         for cp in cloud_payloads:
@@ -2947,7 +3399,7 @@ def _run_post(
                                 all_param_names=post_form.param_names,
                                 csrf_field=post_form.csrf_field,
                                 transform_name="cloud_model",
-                                sink_url=sink_url,
+                                sink_url=effective_sink_url,
                                 payload_candidate=cp,
                             )
                             if result.confirmed:
@@ -2965,7 +3417,7 @@ def _run_post(
                                         _cloud_attempt_note(
                                             cloud_plan.note,
                                             attempt_number,
-                                            max(1, cloud_attempts),
+                                            attempt_limit,
                                         ),
                                     ),
                                 )
@@ -2974,13 +3426,10 @@ def _run_post(
                                     break
                             failed_results.append(result)
 
-                        if context_done or attempt_number >= max(1, cloud_attempts):
-                            break
-
                         cloud_feedback_lessons = _build_cloud_feedback_lessons(
                             attempt_number=attempt_number,
-                            total_attempts=max(1, cloud_attempts),
-                            prompt_context=_cached_context,
+                            total_attempts=attempt_limit,
+                            prompt_context=generation_context,
                             delivery_mode="post",
                             context_type=context_type,
                             sink_context=context_type,
@@ -2989,6 +3438,81 @@ def _run_post(
                             duplicate_payloads=duplicate_payloads,
                             observation=_summarize_failed_execution_results(failed_results),
                         )
+                        fast_reflected_count += _reflected_payload_count(failed_results, len(cloud_payloads))
+                        if context_done or attempt_number >= attempt_limit:
+                            break
+
+                    if not context_done and not deep and not _timed_out() and fast_generated_count > 0:
+                        strategy_hint = _analyze_fast_failure_strategy(
+                            context=generation_context,
+                            cloud_model=cloud_model,
+                            waf_hint=waf_hint,
+                            generated_count=fast_generated_count,
+                            reflected_count=fast_reflected_count or fast_generated_count,
+                            ai_backend=ai_backend,
+                            cli_tool=cli_tool,
+                            cli_model=cli_model,
+                            phase_profile=phase_profile,
+                        )
+                        cloud_model_rounds += 1
+                        cloud_plan = _coerce_cloud_plan(_get_cloud_payloads(
+                            url=post_form.source_page_url,
+                            probe_result=context_probe_result,
+                            cloud_model=cloud_model,
+                            waf=waf_hint,
+                            ekey=ekey,
+                            dedup_registry=dedup_registry,
+                            dedup_lock=dedup_lock,
+                            base_context=generation_context,
+                            auth_headers=auth_headers,
+                            ai_backend=ai_backend,
+                            cli_tool=cli_tool,
+                            cli_model=cli_model,
+                            delivery_mode="post",
+                            session_lessons=post_session_lessons,
+                            feedback_lessons=cloud_feedback_lessons,
+                            phase_profile=phase_profile,
+                            phases=("contextual", "research"),
+                            strategy_hint=strategy_hint,
+                        ))
+                        cloud_payloads, _ = _unique_new_payloads(
+                            cloud_plan.payloads,
+                            seen_cloud_payloads,
+                        )
+                        for cp in cloud_payloads:
+                            if _timed_out():
+                                break
+                            total_transforms_tried += 1
+                            result = executor.fire_post(
+                                source_page_url=post_form.source_page_url,
+                                action_url=post_form.action_url,
+                                param_name=param_name,
+                                payload=_payload_text(cp),
+                                all_param_names=post_form.param_names,
+                                csrf_field=post_form.csrf_field,
+                                transform_name="cloud_model",
+                                sink_url=effective_sink_url,
+                                payload_candidate=cp,
+                            )
+                            if result.confirmed:
+                                finding = _make_finding(
+                                    url=post_form.action_url,
+                                    probe_result=context_probe_result,
+                                    context_type=context_type,
+                                    result=result,
+                                    waf=waf_hint,
+                                    source="cloud_model",
+                                    cloud_escalated=True,
+                                    ai_engine=cloud_plan.engine,
+                                    ai_note=_merge_ai_notes(
+                                        escalation_policy.note,
+                                        "Deep escalation after scout attempts exhausted.",
+                                        cloud_plan.note,
+                                    ),
+                                )
+                                if _record_context_finding(finding) and len(context_variant_keys) >= context_hit_cap:
+                                    context_done = True
+                                    break
 
                 if not context_done and waf_hint and not _timed_out():
                     waf_payloads = _waf_reference_payloads(waf_hint, context_probe_result, limit=4)
@@ -3010,7 +3534,7 @@ def _run_post(
                             all_param_names=post_form.param_names,
                             csrf_field=post_form.csrf_field,
                             transform_name="waf_payload",
-                            sink_url=sink_url,
+                            sink_url=effective_sink_url,
                             payload_candidate=wp,
                         )
                         if result.confirmed:
@@ -3043,7 +3567,7 @@ def _run_post(
                             all_param_names=post_form.param_names,
                             csrf_field=post_form.csrf_field,
                             transform_name=variant.transform_name,
-                            sink_url=sink_url,
+                            sink_url=effective_sink_url,
                         )
 
                         if result.confirmed:

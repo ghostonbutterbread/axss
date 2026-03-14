@@ -359,10 +359,24 @@ def test_generation_phase_prompts_use_envelopes_instead_of_full_context_blob() -
     research = _prompt_for_generation_phase(context, "research")
 
     assert "CONTEXT ENVELOPE" in scout
-    assert "PLANNING ENVELOPE" in scout
+    assert "PLANNING ENVELOPE" not in scout
     assert "CONTEXT ENVELOPE" in research
     assert "PLANNING ENVELOPE" in research
     assert "SUPPLEMENTAL CONTEXT" not in research
+
+
+def test_scout_prompt_stays_compact_and_omits_session_context() -> None:
+    context = ParsedContext(
+        source="https://example.test/search?q=x",
+        source_type="url",
+        auth_notes=["session cookie present"],
+    )
+
+    scout = _prompt_for_generation_phase(context, "scout")
+
+    assert "SESSION CONTEXT" not in scout
+    assert "CONTEXT ENVELOPE" in scout
+    assert '"target_url"' not in scout
 
 
 def test_match_payloads_to_context_prefers_url_shaped_payloads() -> None:
@@ -427,6 +441,22 @@ def test_contextual_prompt_prioritizes_success_and_similar_findings() -> None:
     assert '"context_type": "html_attr_url"' in prompt
     assert '"why_it_works": "Browsers normalize embedded ASCII tab before resolving the scheme."' in prompt
     assert prompt.index("PAYLOADS THAT EXECUTED - generate similar techniques but NOT identical:") < prompt.index("FAILURE ENVELOPE")
+
+
+def test_contextual_prompt_includes_strategy_hint_in_planning_envelope() -> None:
+    context = ParsedContext(
+        source="https://example.test/login?redirect=x",
+        source_type="url",
+        notes=["[probe:CONFIRMED] 'redirect' -> html_attr_url surviving=':()/;'"],
+    )
+
+    prompt = _prompt_for_generation_phase(
+        context,
+        "contextual",
+        strategy_hint="Reflection likely lands in a passive URL sink, so pivot toward quote closure or same-tag handler injection.",
+    )
+
+    assert '"strategy_hint": "Reflection likely lands in a passive URL sink, so pivot toward quote closure or same-tag handler injection."' in prompt
 
 
 def test_scout_prompt_uses_reference_payloads_as_seed_examples() -> None:
@@ -530,7 +560,35 @@ def test_reflected_prompt_envelope_includes_reflected_subcontext() -> None:
     assert '"payload_shape": "scheme_or_quote_closure"' in prompt
 
 
-def test_generate_with_cli_escalates_from_scout_to_contextual(monkeypatch) -> None:
+def test_generate_with_cli_stays_in_scout_mode_by_default(monkeypatch) -> None:
+    context = ParsedContext(source="https://example.test/search?q=x", source_type="url")
+    calls: list[tuple[str, int | None, dict[str, object] | None]] = []
+
+    def fake_generate(tool: str, prompt: str, model: str | None = None, *, timeout_seconds: int | None = None, schema=None):
+        calls.append((prompt, timeout_seconds, schema))
+        return json.dumps({"payloads": [{"payload": "javascript:1", "title": "weak", "test_vector": "?q=javascript:1", "bypass_family": "weak"}]}), tool
+
+    monkeypatch.setattr("ai_xss_generator.cli_runner.generate_via_cli_with_tool", fake_generate)
+    monkeypatch.setattr(
+        "ai_xss_generator.ai_capabilities.recommended_timeout_seconds_for_phase",
+        lambda tool, role, phase, fallback, profile="normal": {"scout": 20, "contextual": 45, "research": 90}[phase],
+    )
+
+    payloads, actual_tool = _generate_with_cli(context, "claude", None)
+
+    assert actual_tool == "claude"
+    assert payloads == []
+    assert len(calls) == 1
+    assert calls[0][1] == 20
+    assert calls[0][2]["properties"]["payloads"]["items"]["required"] == [
+        "payload",
+        "title",
+        "test_vector",
+        "bypass_family",
+    ]
+
+
+def test_generate_with_cli_escalates_from_scout_to_contextual_in_deep_mode(monkeypatch) -> None:
     context = ParsedContext(source="https://example.test/search?q=x", source_type="url")
     calls: list[tuple[str, int | None, dict[str, object] | None]] = []
 
@@ -581,19 +639,13 @@ def test_generate_with_cli_escalates_from_scout_to_contextual(monkeypatch) -> No
         lambda tool, role, phase, fallback, profile="normal": {"scout": 20, "contextual": 45, "research": 90}[phase],
     )
 
-    payloads, actual_tool = _generate_with_cli(context, "claude", None)
+    payloads, actual_tool = _generate_with_cli(context, "claude", None, deep=True)
 
     assert actual_tool == "claude"
     assert len(payloads) == 3
     assert len(calls) == 2
     assert calls[0][1] == 20
     assert calls[1][1] == 45
-    assert calls[0][2]["properties"]["payloads"]["items"]["required"] == [
-        "payload",
-        "title",
-        "test_vector",
-        "bypass_family",
-    ]
 
 
 def test_recommended_timeout_seconds_for_phase_respects_research_profile() -> None:

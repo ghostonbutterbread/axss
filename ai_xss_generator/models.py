@@ -14,14 +14,11 @@ import requests
 
 from ai_xss_generator.behavior import extract_behavior_profile
 from ai_xss_generator.findings import (
-    BYPASS_FAMILIES,
     Finding,
-    findings_prompt_section,
     infer_bypass_family,
     relevant_findings,
 )
 from ai_xss_generator.learning import build_memory_profile
-from ai_xss_generator.lessons import lessons_prompt_section
 from ai_xss_generator.payloads import BASE_PAYLOADS, _match_payloads_to_context, base_payloads_for_context, rank_payloads
 from ai_xss_generator.types import ParsedContext, PayloadCandidate, StrategyProfile
 
@@ -72,6 +69,18 @@ _STRATEGY_SCHEMA_BLOCK = """      "strategy": {
       },"""
 
 _GENERATION_PHASES = ("scout", "contextual", "research")
+
+
+def _resolve_generation_phases(
+    *,
+    deep: bool = False,
+    phases: tuple[str, ...] | None = None,
+) -> tuple[str, ...]:
+    if phases:
+        return tuple(phase for phase in phases if phase in _GENERATION_PHASES)
+    if deep:
+        return _GENERATION_PHASES
+    return ("scout",)
 
 def _extract_probe_context(context: ParsedContext) -> tuple[str, str, str]:
     """Return (primary_sink_type, context_type, surviving_chars) from context.
@@ -186,11 +195,11 @@ def _behavior_profile_section(context: ParsedContext) -> str:
     return "TARGET BEHAVIOR PROFILE:\n" + json.dumps(compact, indent=2) + "\n"
 
 
-def _waf_knowledge_section(context: ParsedContext) -> str:
+def _waf_knowledge_data(context: ParsedContext) -> dict[str, Any]:
     profile = getattr(context, "waf_knowledge", None) or {}
     if not profile:
-        return ""
-    compact = {
+        return {}
+    return {
         "engine_name": profile.get("engine_name", ""),
         "confidence": profile.get("confidence", 0.0),
         "normalization": profile.get("normalization", {}),
@@ -201,20 +210,15 @@ def _waf_knowledge_section(context: ParsedContext) -> str:
         "avoid_strategies": list(profile.get("avoid_strategies", []) or [])[:5],
         "notes": list(profile.get("notes", []) or [])[:4],
     }
-    return (
-        "WAF SOURCE KNOWLEDGE (secondary to live observations — use as a prior, not ground truth):\n"
-        + json.dumps(compact, indent=2)
-        + "\n"
-    )
 
 
-def _effective_constraints_section(
+def _effective_constraints_data(
     context: ParsedContext,
     waf: str | None = None,
     past_lessons: list[Any] | None = None,
-) -> str:
+) -> dict[str, Any]:
     behavior = extract_behavior_profile(context) or {}
-    knowledge = getattr(context, "waf_knowledge", None) or {}
+    knowledge = _waf_knowledge_data(context)
     sink_type, context_type, surviving_chars = _extract_probe_context(context)
     dom_runtime = _extract_dom_runtime_context(context)
 
@@ -298,7 +302,7 @@ def _effective_constraints_section(
         if item not in deduped_creative:
             deduped_creative.append(item)
 
-    compact = {
+    return {
         "confirmed_sink": sink_type or dom_runtime.get("sink", ""),
         "reflection_context": context_type or "",
         "observed_blockers": observed_blockers[:5],
@@ -312,12 +316,11 @@ def _effective_constraints_section(
         "required_delivery_shifts": delivery_shifts[:4],
         "creative_techniques": deduped_creative[:4],
     }
-    return "EFFECTIVE CONSTRAINTS:\n" + json.dumps(compact, indent=2) + "\n"
 
 
-def _execution_feedback_section(past_lessons: list[Any] | None) -> str:
+def _execution_feedback_data(past_lessons: list[Any] | None) -> dict[str, Any]:
     if not past_lessons:
-        return ""
+        return {}
 
     failed_families: list[str] = []
     strategy_constraints: list[str] = []
@@ -354,9 +357,9 @@ def _execution_feedback_section(past_lessons: list[Any] | None) -> str:
             break
 
     if not any((failed_families, strategy_constraints, delivery_constraints, attempted_delivery_modes, edge_blockers, delivery_outcomes, duplicate_payloads, observations)):
-        return ""
+        return {}
 
-    compact = {
+    return {
         "failed_families": failed_families[:5],
         "strategy_shifts": strategy_constraints[:5],
         "delivery_shifts": delivery_constraints[:5],
@@ -366,39 +369,29 @@ def _execution_feedback_section(past_lessons: list[Any] | None) -> str:
         "duplicate_payloads": duplicate_payloads[:4],
         "observations": observations[:2],
     }
-    return "EXECUTION FEEDBACK PROFILE:\n" + json.dumps(compact, indent=2) + "\n"
 
 
-def _execution_feedback_data(past_lessons: list[Any] | None) -> dict[str, Any]:
-    section = _execution_feedback_section(past_lessons)
-    if not section:
-        return {}
-    return json.loads(section.split(":\n", 1)[1])
-
-
-def _effective_constraints_data(
+def _context_envelope(
     context: ParsedContext,
     waf: str | None = None,
-    past_lessons: list[Any] | None = None,
+    *,
+    compact: bool = False,
 ) -> dict[str, Any]:
-    section = _effective_constraints_section(context, waf=waf, past_lessons=past_lessons)
-    if not section:
-        return {}
-    return json.loads(section.split(":\n", 1)[1])
-
-
-def _waf_knowledge_data(context: ParsedContext) -> dict[str, Any]:
-    section = _waf_knowledge_section(context)
-    if not section:
-        return {}
-    return json.loads(section.split(":\n", 1)[1])
-
-
-def _context_envelope(context: ParsedContext, waf: str | None = None) -> dict[str, Any]:
     sink_type, context_type, surviving_chars = _extract_probe_context(context)
     dom_runtime = _extract_dom_runtime_context(context)
     reflected_subcontext = _extract_reflected_subcontext(context, desired_context=context_type)
     behavior = extract_behavior_profile(context) or {}
+    if compact:
+        compact_envelope = {
+            "waf_hint": waf or behavior.get("waf_name", ""),
+            "frameworks": list(context.frameworks[:3]),
+            "reflection_transforms": list(behavior.get("reflection_transforms", []) or [])[:3],
+        }
+        return {
+            key: value
+            for key, value in compact_envelope.items()
+            if value not in ("", [], {}, None, False)
+        }
     envelope: dict[str, Any] = {
         "target_url": context.source,
         "delivery_mode": behavior.get("delivery_mode", ""),
@@ -426,6 +419,7 @@ def _planning_envelope(
     context: ParsedContext,
     waf: str | None = None,
     past_lessons: list[Any] | None = None,
+    strategy_hint: str | None = None,
 ) -> dict[str, Any]:
     effective = _effective_constraints_data(context, waf=waf, past_lessons=past_lessons)
     waf_knowledge = _waf_knowledge_data(context)
@@ -440,6 +434,9 @@ def _planning_envelope(
         "required_delivery_shifts": list(effective.get("required_delivery_shifts", []) or [])[:3],
         "creative_techniques": list(effective.get("creative_techniques", []) or [])[:3],
     }
+    hint = str(strategy_hint or "").strip()
+    if hint:
+        envelope["strategy_hint"] = hint
     if waf_knowledge:
         envelope["waf_prior"] = {
             "engine_name": waf_knowledge.get("engine_name", ""),
@@ -464,16 +461,38 @@ def _failure_envelope(past_lessons: list[Any] | None) -> dict[str, Any]:
     return {key: value for key, value in envelope.items() if value not in ("", [], {}, None)}
 
 
-def _context_envelope_section(context: ParsedContext, waf: str | None = None) -> str:
-    return "CONTEXT ENVELOPE:\n" + json.dumps(_context_envelope(context, waf=waf), indent=2) + "\n"
+def _context_envelope_section(
+    context: ParsedContext,
+    waf: str | None = None,
+    *,
+    compact: bool = False,
+) -> str:
+    return (
+        "CONTEXT ENVELOPE:\n"
+        + json.dumps(_context_envelope(context, waf=waf, compact=compact), indent=2)
+        + "\n"
+    )
 
 
 def _planning_envelope_section(
     context: ParsedContext,
     waf: str | None = None,
     past_lessons: list[Any] | None = None,
+    strategy_hint: str | None = None,
 ) -> str:
-    return "PLANNING ENVELOPE:\n" + json.dumps(_planning_envelope(context, waf=waf, past_lessons=past_lessons), indent=2) + "\n"
+    return (
+        "PLANNING ENVELOPE:\n"
+        + json.dumps(
+            _planning_envelope(
+                context,
+                waf=waf,
+                past_lessons=past_lessons,
+                strategy_hint=strategy_hint,
+            ),
+            indent=2,
+        )
+        + "\n"
+    )
 
 
 def _failure_envelope_section(past_lessons: list[Any] | None) -> str:
@@ -766,6 +785,7 @@ def _prompt_for_generation_phase(
     waf: str | None = None,
     past_findings: list[Finding] | None = None,
     past_lessons: list[Any] | None = None,
+    strategy_hint: str | None = None,
 ) -> str:
     reference_payloads = _merged_reference_payloads(reference_payloads, past_lessons)
     if phase == "research":
@@ -775,6 +795,7 @@ def _prompt_for_generation_phase(
             waf=waf,
             past_findings=past_findings,
             past_lessons=past_lessons,
+            strategy_hint=strategy_hint,
         )
     dom_runtime = _extract_dom_runtime_context(context)
     if dom_runtime:
@@ -783,14 +804,18 @@ def _prompt_for_generation_phase(
             waf=waf,
             past_findings=past_findings,
             past_lessons=past_lessons,
+            strategy_hint=strategy_hint,
+            reference_payloads=reference_payloads,
         )
 
     sink_type, context_type, surviving_chars = _extract_probe_context(context)
+    scout_context_envelope_section = _context_envelope_section(context, waf=waf, compact=True)
     context_envelope_section = _context_envelope_section(context, waf=waf)
     planning_envelope_section = _planning_envelope_section(
         context,
         waf=waf,
         past_lessons=past_lessons,
+        strategy_hint=strategy_hint,
     )
     success_envelope_section = _success_envelope_section(past_lessons)
     failure_envelope_section = _failure_envelope_section(past_lessons)
@@ -802,7 +827,6 @@ def _prompt_for_generation_phase(
             + "\n"
         )
     probe_lines = [
-        f"Target URL: {context.source}",
         f"Primary sink type: {sink_type or 'unknown'}",
         f"Reflection context: {context_type or 'unknown'}",
         f"Confirmed surviving special characters: {surviving_chars or '(none observed)'}",
@@ -819,15 +843,13 @@ def _prompt_for_generation_phase(
             + "\n".join(probe_lines)
             + "\n"
             "Only special-character survival is measured; do not assume letters or digits are blocked.\n"
-            "Task: produce 3-4 concise payloads likely to execute in this exact context.\n"
+            "Task: produce 3-5 concise payloads likely to execute in this exact context.\n"
             "Use the seed payloads as inspiration and mutate them for this context.\n"
             "Each payload object must include payload, title, test_vector, bypass_family.\n"
+            + scout_context_envelope_section
             + seed_section
-            + context_envelope_section
-            + planning_envelope_section
             + success_envelope_section
             + failure_envelope_section
-            + auth_section
         ).strip()
 
     findings_section = _similar_findings_section(
@@ -845,185 +867,14 @@ def _prompt_for_generation_phase(
         "Past successful payloads are the primary few-shot examples: mutate them, do not repeat them exactly.\n"
         "Prefer materially distinct candidates. Keep the output compact and execution-focused.\n"
         "Each payload object must include payload, title, explanation, test_vector, tags, target_sink, bypass_family, risk_score.\n"
-        + seed_section
         + context_envelope_section
         + planning_envelope_section
+        + seed_section
         + success_envelope_section
         + failure_envelope_section
         + findings_section
         + auth_section
     ).strip()
-
-
-# ---------------------------------------------------------------------------
-# Prompt construction
-# ---------------------------------------------------------------------------
-
-def _prompt_for_context(
-    context: ParsedContext,
-    reference_payloads: list[Any] | None = None,
-    waf: str | None = None,
-    past_findings: list[Finding] | None = None,
-    past_lessons: list[Any] | None = None,
-) -> str:
-    """Build the LLM prompt.
-
-    Structure (ordered by importance for small-model attention):
-      1. Probe results (surviving chars, confirmed sink) — actionable, upfront
-      2. Past findings for this context (few-shot bypass examples)
-      3. WAF context (if any)
-      4. Reference public payloads (if any)
-      5. Full parsed context JSON
-      6. Output schema + requirements
-    """
-    sink_type, ctx_type, surviving_chars = _extract_probe_context(context)
-    dom_runtime = _extract_dom_runtime_context(context)
-
-    # ── Section 1: Active probe summary ──────────────────────────────────────
-    probe_section = ""
-    if sink_type or surviving_chars:
-        blocked_note = (
-            f"Only characters in {surviving_chars!r} survived — ALL others are filtered. "
-            "Payloads MUST be constructable from the surviving set."
-            if surviving_chars
-            else "No char survival data — assume conservative filter."
-        )
-        surviving_display = repr(surviving_chars) if surviving_chars else "unknown"
-        probe_section = (
-            "ACTIVE PROBE RESULTS (highest priority — payloads must fit these constraints):\n"
-            f"  confirmed_sink: {sink_type or 'unknown'}\n"
-            f"  reflection_context: {ctx_type or 'unknown'}\n"
-            f"  surviving_chars: {surviving_display}\n"
-            f"  {blocked_note}\n"
-        )
-
-    dom_section = ""
-    if dom_runtime:
-        sink = dom_runtime.get("sink", "") or sink_type or "unknown"
-        profile_name, profile_rules = _dom_sink_request_profile(sink)
-        profile_lines = "\n".join(f"  - {rule}" for rule in profile_rules)
-        dom_section = (
-            "DOM RUNTIME TAINT (highest priority for DOM scanning):\n"
-            f"  source_type: {dom_runtime.get('source_type') or 'unknown'}\n"
-            f"  source_name: {dom_runtime.get('source_name') or 'unknown'}\n"
-            f"  sink: {sink}\n"
-            f"  code_location: {dom_runtime.get('code_location') or 'unknown'}\n"
-            "  The canary already reached this sink at runtime. Generate payloads for this exact source→sink pair.\n"
-            "DOM SINK PROFILE:\n"
-            f"  profile: {profile_name}\n"
-            f"{profile_lines}\n"
-        )
-
-    # ── Section 2: Past findings (few-shot examples) ─────────────────────────
-    findings_section = ""
-    if past_findings:
-        findings_section = findings_prompt_section(past_findings) + "\n"
-
-    lessons_section = ""
-    if past_lessons:
-        lessons_section = lessons_prompt_section(past_lessons) + "\n"
-    behavior_section = _behavior_profile_section(context)
-    waf_knowledge_section = _waf_knowledge_section(context)
-    effective_constraints_section = _effective_constraints_section(
-        context,
-        waf=waf,
-        past_lessons=past_lessons,
-    )
-    context_envelope_section = _context_envelope_section(context, waf=waf)
-    planning_envelope_section = _planning_envelope_section(
-        context,
-        waf=waf,
-        past_lessons=past_lessons,
-    )
-    failure_envelope_section = _failure_envelope_section(past_lessons)
-
-    # ── Section 2b: Auth context ──────────────────────────────────────────────
-    auth_section = ""
-    if context.auth_notes:
-        auth_section = (
-            "SESSION CONTEXT (authenticated scan — all requests carry credentials):\n"
-            + "\n".join(f"  - {note}" for note in context.auth_notes)
-            + "\n"
-            "Consider payloads that leverage privileged state: authenticated endpoints, "
-            "stored/persistent XSS in user-controlled fields, CSRF-chained vectors.\n"
-        )
-
-    # ── Section 3: WAF ───────────────────────────────────────────────────────
-    waf_section = ""
-    if waf:
-        waf_section = (
-            f"WAF: {waf.title()} — prioritise bypass techniques for this WAF "
-            f"(encoding variants, alternative event handlers, namespace tricks, "
-            f"case mixing, whitespace tricks).\n"
-        )
-
-    # ── Section 4: Reference public payloads ─────────────────────────────────
-    reference_section = ""
-    if reference_payloads:
-        ref_items = [
-            {
-                "payload": p.payload if hasattr(p, "payload") else p.get("payload", ""),
-                "tags": p.tags if hasattr(p, "tags") else p.get("tags", []),
-            }
-            for p in reference_payloads[:15]
-        ]
-        reference_section = (
-            "Community reference payloads (technique inspiration only — adapt, don't copy):\n"
-            + json.dumps(ref_items, indent=2)
-            + "\n"
-        )
-
-    supplemental_context = {
-        "title": context.title,
-        "forms": len(context.forms),
-        "inputs": len(context.inputs),
-        "event_handlers": len(context.event_handlers),
-        "dom_sinks": [
-            {
-                "sink": sink.sink,
-                "location": sink.location,
-            }
-            for sink in context.dom_sinks[:4]
-        ],
-        "inline_scripts": context.inline_scripts[:2],
-        "auth_notes": context.auth_notes[:2],
-        "notes": context.notes[:4],
-    }
-
-    # ── Bypass family hint ────────────────────────────────────────────────────
-    family_list = ", ".join(BYPASS_FAMILIES)
-
-    return f"""You are generating offensive-security test payloads for an authorized XSS assessment.
-Return ONLY a JSON object — no markdown, no explanation outside the JSON.
-
-Output schema:
-{{
-  "payloads": [
-    {{
-      "payload": "string",
-      "title": "short name",
-      "explanation": "why it fits this specific context",
-      "test_vector": "exact delivery (e.g. ?param=...)",
-      "tags": ["tag1", "tag2"],
-      "target_sink": "sink name or empty",
-{_STRATEGY_SCHEMA_BLOCK}
-      "bypass_family": "one of: {family_list}",
-      "risk_score": 1-100
-    }}
-  ]
-}}
-
-Requirements:
-- Produce 15-25 payloads.
-- Payloads MUST be tailored to the detected sinks, surviving chars, and context above.
-- Generic payloads that ignore the probe results score low — be specific.
-- Include payloads from multiple bypass families that are plausible for this context.
-- Prefer compact, self-contained payloads with no external dependencies.
-- Include a compact `strategy` object per payload so the scanner can reason about delivery shape, encoding style, and what to pivot to next if the attempt fails.
-- When the effective constraints justify it, consider uncommon but plausible techniques such as numeric entities, Unicode-width variants, mixed encodings, or parser-state pivots. Do not use novelty unless it materially helps this exact context.
-
-{probe_section}{dom_section}{behavior_section}{waf_knowledge_section}{effective_constraints_section}{context_envelope_section}{planning_envelope_section}{failure_envelope_section}{lessons_section}{findings_section}{auth_section}{waf_section}{reference_section}SUPPLEMENTAL CONTEXT:
-{json.dumps(supplemental_context, indent=2)}""".strip()
 
 
 def _compact_reflected_research_prompt(
@@ -1032,6 +883,7 @@ def _compact_reflected_research_prompt(
     waf: str | None = None,
     past_findings: list[Finding] | None = None,
     past_lessons: list[Any] | None = None,
+    strategy_hint: str | None = None,
 ) -> str:
     sink_type, context_type, surviving_chars = _extract_probe_context(context)
     context_envelope_section = _context_envelope_section(context, waf=waf)
@@ -1039,6 +891,7 @@ def _compact_reflected_research_prompt(
         context,
         waf=waf,
         past_lessons=past_lessons,
+        strategy_hint=strategy_hint,
     )
     success_envelope_section = _success_envelope_section(past_lessons)
     failure_envelope_section = _failure_envelope_section(past_lessons)
@@ -1093,9 +946,9 @@ def _compact_reflected_research_prompt(
         "Few-shot examples matter more than restating constraints: mutate successful and similar payloads instead of copying them.\n"
         "If needed, use uncommon encodings such as numeric entities, Unicode-width variants, or mixed encoding only when they materially help this context.\n"
         "Prefer materially distinct techniques and keep the output execution-focused.\n"
-        + seed_section
         + context_envelope_section
         + planning_envelope_section
+        + seed_section
         + success_envelope_section
         + failure_envelope_section
         + findings_section
@@ -1146,11 +999,14 @@ def _compact_dom_prompt_for_local(
     waf: str | None = None,
     past_findings: list[Finding] | None = None,
     past_lessons: list[Any] | None = None,
+    strategy_hint: str | None = None,
+    reference_payloads: list[Any] | None = None,
 ) -> str:
     """Build a compact sink-specific DOM prompt for smaller local models."""
     dom_runtime = _extract_dom_runtime_context(context)
     sink = dom_runtime.get("sink", "") or (context.dom_sinks[0].sink if context.dom_sinks else "")
     profile_name, profile_rules = _dom_sink_request_profile(sink)
+    reference_payloads = _merged_reference_payloads(reference_payloads, past_lessons)
 
     findings_section = ""
     if past_findings:
@@ -1180,8 +1036,15 @@ def _compact_dom_prompt_for_local(
         context,
         waf=waf,
         past_lessons=past_lessons,
+        strategy_hint=strategy_hint,
     )
+    success_envelope_section = _success_envelope_section(past_lessons)
     failure_envelope_section = _failure_envelope_section(past_lessons)
+    seed_section = _seed_examples_section(
+        context_type="dom_xss",
+        surviving_chars="",
+        reference_payloads=reference_payloads,
+    )
 
     context_summary = {
         "source": context.source,
@@ -1234,7 +1097,7 @@ Requirements:
 
 DOM runtime:
 {json.dumps(dom_runtime, indent=2)}
-{waf_line}{context_envelope_section}{planning_envelope_section}{failure_envelope_section}{lessons_section}{findings_section}Context summary:
+{waf_line}{context_envelope_section}{planning_envelope_section}{success_envelope_section}{failure_envelope_section}{lessons_section}{findings_section}{seed_section}Context summary:
 {json.dumps(context_summary, indent=2)}""".strip()
 
 
@@ -1352,12 +1215,17 @@ def _compact_dom_prompt_for_cloud(
     waf: str | None = None,
     past_findings: list[Finding] | None = None,
     past_lessons: list[Any] | None = None,
+    strategy_hint: str | None = None,
+    reference_payloads: list[Any] | None = None,
 ) -> str:
     """Build a compact seeded DOM cloud prompt for simpler sink families."""
     dom_runtime = _extract_dom_runtime_context(context)
     sink = dom_runtime.get("sink", "") or (context.dom_sinks[0].sink if context.dom_sinks else "")
     profile_name, profile_rules = _dom_sink_request_profile(sink)
-    seed_examples = _dom_seed_examples(profile_name)
+    merged_reference_payloads = _merged_reference_payloads(reference_payloads, past_lessons)
+    seed_examples = _reference_payload_examples(merged_reference_payloads, limit=5)
+    if not seed_examples:
+        seed_examples = _dom_seed_examples(profile_name)
     behavior_section = _behavior_profile_section(context)
     findings_section = _similar_findings_section(
         past_findings,
@@ -1380,6 +1248,7 @@ def _compact_dom_prompt_for_cloud(
         context,
         waf=waf,
         past_lessons=past_lessons,
+        strategy_hint=strategy_hint,
     )
     success_envelope_section = _success_envelope_section(past_lessons)
     failure_envelope_section = _failure_envelope_section(past_lessons)
@@ -1446,6 +1315,8 @@ def _document_write_prompt_for_cloud(
     waf: str | None = None,
     past_findings: list[Finding] | None = None,
     past_lessons: list[Any] | None = None,
+    strategy_hint: str | None = None,
+    reference_payloads: list[Any] | None = None,
 ) -> str:
     """Build a focused rich prompt for document.write DOM sinks."""
     dom_runtime = _extract_dom_runtime_context(context)
@@ -1467,6 +1338,7 @@ def _document_write_prompt_for_cloud(
         context,
         waf=waf,
         past_lessons=past_lessons,
+        strategy_hint=strategy_hint,
     )
     success_envelope_section = _success_envelope_section(past_lessons)
     failure_envelope_section = _failure_envelope_section(past_lessons)
@@ -1475,6 +1347,13 @@ def _document_write_prompt_for_cloud(
         context_type="dom_xss",
         limit=5,
     )
+    seed_examples = _reference_payload_examples(
+        _merged_reference_payloads(reference_payloads, past_lessons),
+        limit=5,
+    )
+    seed_section = ""
+    if seed_examples:
+        seed_section = "Seed technique examples:\n" + json.dumps(seed_examples, indent=2) + "\n"
 
     targeted_examples = [
         {
@@ -1548,7 +1427,7 @@ Document.write subcontext:
 {json.dumps(subcontext, indent=2)}
 Recommended payload families:
 {recommended}
-{waf_line}{context_envelope_section}{planning_envelope_section}{success_envelope_section}{failure_envelope_section}{behavior_section}{lessons_section}{findings_section}Targeted examples:
+{waf_line}{context_envelope_section}{planning_envelope_section}{success_envelope_section}{failure_envelope_section}{behavior_section}{lessons_section}{findings_section}{seed_section}Targeted examples:
 {json.dumps(targeted_examples, indent=2)}
 Context summary:
 {json.dumps(context_summary, indent=2)}""".strip()
@@ -1560,6 +1439,7 @@ def _cloud_prompt_for_context(
     waf: str | None = None,
     past_findings: list[Finding] | None = None,
     past_lessons: list[Any] | None = None,
+    strategy_hint: str | None = None,
 ) -> str:
     """Choose a cloud prompt shape based on the DOM sink profile."""
     reference_payloads = _merged_reference_payloads(reference_payloads, past_lessons)
@@ -1573,6 +1453,8 @@ def _cloud_prompt_for_context(
                 waf=waf,
                 past_findings=past_findings,
                 past_lessons=past_lessons,
+                strategy_hint=strategy_hint,
+                reference_payloads=reference_payloads,
             )
         if profile_name != "document_write":
             return _compact_dom_prompt_for_cloud(
@@ -1580,6 +1462,8 @@ def _cloud_prompt_for_context(
                 waf=waf,
                 past_findings=past_findings,
                 past_lessons=past_lessons,
+                strategy_hint=strategy_hint,
+                reference_payloads=reference_payloads,
             )
     return _compact_reflected_research_prompt(
         context,
@@ -1587,6 +1471,7 @@ def _cloud_prompt_for_context(
         waf=waf,
         past_findings=past_findings,
         past_lessons=past_lessons,
+        strategy_hint=strategy_hint,
     )
 
 
@@ -1797,8 +1682,9 @@ def _generate_with_ollama(
     ready, resolved_model, reason = _ensure_ollama_model(model)
     if not ready:
         raise RuntimeError(f"Ollama unavailable: {reason}")
-    prompt = _prompt_for_context(
+    prompt = _prompt_for_generation_phase(
         context,
+        phase="scout",
         reference_payloads=reference_payloads,
         waf=waf,
         past_findings=past_findings,
@@ -1822,6 +1708,7 @@ def _generate_dom_local_with_ollama(
     past_findings: list[Finding] | None = None,
     past_lessons: list[Any] | None = None,
     request_timeout_seconds: int = 60,
+    reference_payloads: list[Any] | None = None,
 ) -> tuple[list[PayloadCandidate], str]:
     ready, resolved_model, reason = _ensure_ollama_model(model)
     if not ready:
@@ -1831,6 +1718,7 @@ def _generate_dom_local_with_ollama(
         waf=waf,
         past_findings=past_findings,
         past_lessons=past_lessons,
+        reference_payloads=reference_payloads,
     )
     response = requests.post(
         f"{OLLAMA_BASE_URL}/api/generate",
@@ -1859,6 +1747,7 @@ def _generate_with_openai_compat(
     past_lessons: list[Any] | None = None,
     request_timeout_seconds: int = 120,
     phase: str = "research",
+    strategy_hint: str | None = None,
 ) -> list[PayloadCandidate]:
     prompt = _prompt_for_generation_phase(
         context,
@@ -1867,6 +1756,7 @@ def _generate_with_openai_compat(
         waf=waf,
         past_findings=past_findings,
         past_lessons=past_lessons,
+        strategy_hint=strategy_hint,
     )
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -1913,6 +1803,7 @@ def _generate_with_openrouter(
     past_lessons: list[Any] | None = None,
     request_timeout_seconds: int = 120,
     phase: str = "research",
+    strategy_hint: str | None = None,
 ) -> list[PayloadCandidate]:
     from ai_xss_generator.config import load_api_key
     api_key = os.environ.get("OPENROUTER_API_KEY", "") or load_api_key("openrouter_api_key")
@@ -1930,6 +1821,7 @@ def _generate_with_openrouter(
         past_lessons=past_lessons,
         request_timeout_seconds=request_timeout_seconds,
         phase=phase,
+        strategy_hint=strategy_hint,
     )
 
 
@@ -1941,6 +1833,7 @@ def _generate_with_openai(
     past_lessons: list[Any] | None = None,
     request_timeout_seconds: int = 120,
     phase: str = "research",
+    strategy_hint: str | None = None,
 ) -> list[PayloadCandidate]:
     from ai_xss_generator.config import load_api_key
     api_key = os.environ.get("OPENAI_API_KEY", "") or load_api_key("openai_api_key")
@@ -1958,7 +1851,172 @@ def _generate_with_openai(
         past_lessons=past_lessons,
         request_timeout_seconds=request_timeout_seconds,
         phase=phase,
+        strategy_hint=strategy_hint,
     )
+
+
+# ---------------------------------------------------------------------------
+# Lightweight strategy analysis
+# ---------------------------------------------------------------------------
+
+def _strategy_hint_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "strategy_hint": {"type": "string"},
+        },
+        "required": ["strategy_hint"],
+        "additionalProperties": False,
+    }
+
+
+def _strategy_hint_prompt(
+    *,
+    generated_count: int,
+    reflected_count: int,
+    surviving_chars: str,
+    waf: str | None,
+    context_type: str,
+) -> str:
+    return (
+        "You are triaging failed payload execution for an authorized XSS assessment.\n"
+        "Return ONLY strict JSON with {\"strategy_hint\": \"...\"}.\n\n"
+        "Fast attempts exhausted. Results:\n"
+        f"- {generated_count} payloads generated, {reflected_count} reflected, 0 executed\n"
+        f"- Surviving chars: {surviving_chars or '(none observed)'}\n"
+        f"- WAF: {waf or 'none'}\n"
+        f"- Reflection context: {context_type or 'unknown'}\n"
+        "Why might payloads reflect but not execute? Pick ONE strategy for deeper analysis.\n"
+        "Keep strategy_hint to one short sentence naming one concrete pivot."
+    )
+
+
+def analyze_deep_strategy_hint(
+    *,
+    context: ParsedContext,
+    cloud_model: str,
+    generated_count: int,
+    reflected_count: int,
+    waf: str | None = None,
+    ai_backend: str = "api",
+    cli_tool: str = "claude",
+    cli_model: str | None = None,
+    phase_profile: str = "normal",
+) -> str:
+    from ai_xss_generator.ai_capabilities import (
+        GENERATION_ROLE,
+        recommended_api_timeout_seconds_for_phase,
+        recommended_timeout_seconds_for_phase,
+    )
+    from ai_xss_generator.cli_runner import generate_via_cli_with_tool
+    from ai_xss_generator.config import load_api_key
+
+    _, context_type, surviving_chars = _extract_probe_context(context)
+    dom_runtime = _extract_dom_runtime_context(context)
+    if dom_runtime:
+        context_type = dom_runtime.get("sink", "") or context_type
+    prompt = _strategy_hint_prompt(
+        generated_count=generated_count,
+        reflected_count=reflected_count,
+        surviving_chars=surviving_chars,
+        waf=waf,
+        context_type=context_type,
+    )
+    schema = _strategy_hint_schema()
+
+    if ai_backend == "cli":
+        timeout_seconds = recommended_timeout_seconds_for_phase(
+            cli_tool,
+            GENERATION_ROLE,
+            "scout",
+            30,
+            profile=phase_profile,
+        )
+        try:
+            raw, _ = generate_via_cli_with_tool(
+                cli_tool,
+                prompt,
+                cli_model,
+                timeout_seconds=timeout_seconds,
+                schema=schema,
+            )
+            data = _extract_json_blob(raw)
+            return str(data.get("strategy_hint", "") or "").strip()
+        except Exception:
+            return ""
+
+    api_timeout_seconds = recommended_api_timeout_seconds_for_phase(
+        cloud_model,
+        GENERATION_ROLE,
+        "scout",
+        45,
+        profile=phase_profile,
+    )
+    headers = {"Content-Type": "application/json"}
+
+    openrouter_key = os.environ.get("OPENROUTER_API_KEY", "") or load_api_key("openrouter_api_key")
+    if openrouter_key:
+        try:
+            response = requests.post(
+                f"{OPENROUTER_BASE_URL}/chat/completions",
+                headers={
+                    **headers,
+                    "Authorization": f"Bearer {openrouter_key}",
+                    "HTTP-Referer": "https://github.com/axss",
+                    "X-Title": "axss",
+                },
+                json={
+                    "model": cloud_model,
+                    "response_format": {"type": "json_object"},
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "Return strict JSON for authorized XSS strategy triage.",
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                    "temperature": 0.2,
+                },
+                timeout=max(1, api_timeout_seconds),
+            )
+            response.raise_for_status()
+            content = response.json()["choices"][0]["message"]["content"]
+            data = _extract_json_blob(content)
+            return str(data.get("strategy_hint", "") or "").strip()
+        except Exception:
+            pass
+
+    openai_key = os.environ.get("OPENAI_API_KEY", "") or load_api_key("openai_api_key")
+    if openai_key:
+        try:
+            response = requests.post(
+                f"{OPENAI_BASE_URL}/chat/completions",
+                headers={
+                    **headers,
+                    "Authorization": f"Bearer {openai_key}",
+                },
+                json={
+                    "model": OPENAI_FALLBACK_MODEL,
+                    "response_format": {"type": "json_object"},
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "Return strict JSON for authorized XSS strategy triage.",
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                    "temperature": 0.2,
+                },
+                timeout=max(1, api_timeout_seconds),
+            )
+            response.raise_for_status()
+            content = response.json()["choices"][0]["message"]["content"]
+            data = _extract_json_blob(content)
+            return str(data.get("strategy_hint", "") or "").strip()
+        except Exception:
+            pass
+
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -1974,6 +2032,9 @@ def _generate_with_cli(
     past_findings: list[Finding] | None = None,
     past_lessons: list[Any] | None = None,
     phase_profile: str = "normal",
+    deep: bool = False,
+    phases: tuple[str, ...] | None = None,
+    strategy_hint: str | None = None,
 ) -> tuple[list[PayloadCandidate], str]:
     """Generate payloads by calling the CLI backend, with cross-tool failover."""
     from ai_xss_generator.cli_runner import _trace_preview, generate_via_cli_with_tool
@@ -1981,7 +2042,7 @@ def _generate_with_cli(
 
     last_error: Exception | None = None
     last_tool = tool
-    for phase in _GENERATION_PHASES:
+    for phase in _resolve_generation_phases(deep=deep, phases=phases):
         prompt = _prompt_for_generation_phase(
             context,
             phase=phase,
@@ -1989,6 +2050,7 @@ def _generate_with_cli(
             waf=waf,
             past_findings=past_findings,
             past_lessons=past_lessons,
+            strategy_hint=strategy_hint,
         )
         timeout_seconds = recommended_timeout_seconds_for_phase(
             tool,
@@ -2042,6 +2104,9 @@ def _try_cloud(
     cli_tool: str = "claude",
     cli_model: str | None = None,
     phase_profile: str = "normal",
+    deep: bool = False,
+    phases: tuple[str, ...] | None = None,
+    strategy_hint: str | None = None,
 ) -> tuple[list[PayloadCandidate], str]:
     """Attempt cloud generation. Returns (payloads, engine_label).
 
@@ -2064,6 +2129,9 @@ def _try_cloud(
                 cli_tool,
                 cli_model,
                 phase_profile=phase_profile,
+                deep=deep,
+                phases=phases,
+                strategy_hint=strategy_hint,
                 **kwargs,
             )
             return payloads, f"cli:{actual_tool}"
@@ -2074,7 +2142,7 @@ def _try_cloud(
     # ── API backend (original behaviour) ────────────────────────────────────
     from ai_xss_generator.config import load_api_key
     from ai_xss_generator.ai_capabilities import GENERATION_ROLE, recommended_api_timeout_seconds_for_phase
-    for phase in _GENERATION_PHASES:
+    for phase in _resolve_generation_phases(deep=deep, phases=phases):
         api_timeout_seconds = recommended_api_timeout_seconds_for_phase(
             cloud_model,
             GENERATION_ROLE,
@@ -2089,6 +2157,7 @@ def _try_cloud(
                     cloud_model,
                     request_timeout_seconds=api_timeout_seconds,
                     phase=phase,
+                    strategy_hint=strategy_hint,
                     **kwargs,
                 )
                 if not _is_weak_output(payloads) or phase == "research":
@@ -2102,6 +2171,7 @@ def _try_cloud(
                     context,
                     request_timeout_seconds=api_timeout_seconds,
                     phase=phase,
+                    strategy_hint=strategy_hint,
                     **kwargs,
                 )
                 if not _is_weak_output(payloads) or phase == "research":
@@ -2241,6 +2311,9 @@ def generate_cloud_payloads(
     cli_model: str | None = None,
     memory_profile: dict[str, Any] | None = None,
     phase_profile: str = "normal",
+    deep: bool = False,
+    phases: tuple[str, ...] | None = None,
+    strategy_hint: str | None = None,
     # Legacy params — accepted but ignored
     allowed_memory_tiers: "Any" = None,
     allowed_lesson_tiers: "Any" = None,
@@ -2281,6 +2354,9 @@ def generate_cloud_payloads(
         cli_tool=cli_tool,
         cli_model=cli_model,
         phase_profile=phase_profile,
+        deep=deep,
+        phases=phases,
+        strategy_hint=strategy_hint,
     )
 
     return payloads, engine
@@ -2290,6 +2366,7 @@ def generate_dom_local_payloads(
     context: ParsedContext,
     model: str,
     waf: str | None = None,
+    reference_payloads: list[Any] | None = None,
     past_findings: list[Finding] | None = None,
     past_lessons: list[Any] | None = None,
     memory_profile: dict[str, Any] | None = None,
@@ -2321,6 +2398,7 @@ def generate_dom_local_payloads(
         past_findings=past_findings,
         past_lessons=past_lessons,
         request_timeout_seconds=local_timeout_seconds,
+        reference_payloads=reference_payloads,
     )
 
 
@@ -2363,6 +2441,7 @@ def generate_payloads(
     past_lessons: list[Any] | None = None,
     memory_profile: dict[str, Any] | None = None,
     local_timeout_seconds: int = 120,
+    deep: bool = False,
     # Legacy params — accepted but ignored
     allowed_memory_tiers: Any = None,
     allowed_lesson_tiers: Any = None,
@@ -2445,6 +2524,7 @@ def generate_payloads(
             ai_backend=ai_backend,
             cli_tool=cli_tool,
             cli_model=cli_model,
+            deep=deep,
         )
 
         if cloud_payloads:

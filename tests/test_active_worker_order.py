@@ -10,6 +10,7 @@ from ai_xss_generator.active.dom_xss import DomTaintHit
 from ai_xss_generator.behavior import attach_behavior_profile, build_target_behavior_profile
 from ai_xss_generator.active.worker import (
     WorkerResult,
+    _discover_sink_from_crawled_pages,
     _dom_hit_priority,
     _probe_result_for_context,
     _run,
@@ -925,7 +926,7 @@ def test_dom_worker_retries_cloud_with_feedback_before_fallback():
     assert "Cloud attempt 2/2." in results[0].confirmed_findings[0].ai_note
 
 
-def test_dom_worker_runs_fallback_only_after_all_cloud_attempts_fail():
+def test_dom_worker_runs_deep_escalation_before_fallback_after_fast_attempts_fail():
     url = "https://example.test/#start"
     dom_hits = [
         DomTaintHit(
@@ -944,6 +945,10 @@ def test_dom_worker_runs_fallback_only_after_all_cloud_attempts_fail():
 
     def _cloud_payloads(**kwargs):
         feedback = kwargs.get("feedback_lessons")
+        phases = kwargs.get("phases")
+        if phases:
+            actions.append(f"deep:{','.join(phases)}:{kwargs.get('strategy_hint')}")
+            return ["dom-deep"]
         actions.append(f"cloud:{0 if not feedback else len(feedback)}")
         if feedback:
             return ["dom-cloud-2"]
@@ -966,6 +971,7 @@ def test_dom_worker_runs_fallback_only_after_all_cloud_attempts_fail():
         patch("ai_xss_generator.active.dom_xss.fallback_payloads_for_sink", return_value=["dom-fallback"]),
         patch("ai_xss_generator.active.worker._get_dom_local_payloads", return_value=[]),
         patch("ai_xss_generator.active.worker._get_dom_cloud_payloads", side_effect=_cloud_payloads),
+        patch("ai_xss_generator.active.worker._analyze_fast_failure_strategy", return_value="Try same-tag pivots before full markup."),
         patch("ai_xss_generator.active.worker._DOM_CLOUD_START_AFTER_SECONDS", 0.0),
     ):
         _run_dom(
@@ -990,6 +996,8 @@ def test_dom_worker_runs_fallback_only_after_all_cloud_attempts_fail():
         "fire:dom-cloud-1",
         "cloud:1",
         "fire:dom-cloud-2",
+        "deep:contextual,research:Try same-tag pivots before full markup.",
+        "fire:dom-deep",
         "fire:dom-fallback",
     ]
     assert results and results[0].status == "confirmed"
@@ -1051,6 +1059,7 @@ def test_post_worker_runs_local_model_per_context_before_any_fallback():
         patch("ai_xss_generator.probe.probe_post_form", return_value=[probe_result]),
         patch("ai_xss_generator.parser.parse_target", return_value=_fake_context(post_form.source_page_url)),
         patch("ai_xss_generator.active.executor.ActiveExecutor", FakeExecutor),
+        patch("ai_xss_generator.active.worker._autodiscover_post_sink_context", return_value=("", None, None)),
         patch(
             "ai_xss_generator.active.transforms.all_variants_for_probe",
             return_value=[
@@ -1141,6 +1150,7 @@ def test_post_worker_retries_cloud_with_feedback_before_fallback():
         patch("ai_xss_generator.probe.probe_post_form", return_value=[probe_result]),
         patch("ai_xss_generator.parser.parse_target", return_value=_fake_context(post_form.source_page_url)),
         patch("ai_xss_generator.active.executor.ActiveExecutor", FakeExecutor),
+        patch("ai_xss_generator.active.worker._autodiscover_post_sink_context", return_value=("", None, None)),
         patch(
             "ai_xss_generator.active.transforms.all_variants_for_probe",
             return_value=[("q", "html_body", [TransformVariant("raw", "fallback-html")])],
@@ -1231,6 +1241,7 @@ def test_post_worker_uses_deterministic_fallback_only_after_local_and_cloud_fail
         patch("ai_xss_generator.probe.probe_post_form", return_value=[probe_result]),
         patch("ai_xss_generator.parser.parse_target", return_value=_fake_context(post_form.source_page_url)),
         patch("ai_xss_generator.active.executor.ActiveExecutor", FakeExecutor),
+        patch("ai_xss_generator.active.worker._autodiscover_post_sink_context", return_value=("", None, None)),
         patch(
             "ai_xss_generator.active.transforms.all_variants_for_probe",
             return_value=[
@@ -1264,6 +1275,116 @@ def test_post_worker_uses_deterministic_fallback_only_after_local_and_cloud_fail
     assert actions == ["local:html_body", "cloud:html_body", "fire:raw"]
     assert results and results[0].status == "confirmed"
     assert results[0].confirmed_findings[0].source == "phase1_transform"
+
+
+def test_discover_sink_from_crawled_pages_extracts_context_and_surviving_chars() -> None:
+    canary = "axssbeef"
+    html = f"<div>{canary}AXSSOP<>AXSSCL</div>"
+
+    class FakeSession:
+        def get(self, url, **kwargs):
+            return SimpleNamespace(text=html, body=None)
+
+    discovered = _discover_sink_from_crawled_pages(
+        FakeSession(),
+        canary,
+        ["https://example.test/profile"],
+        None,
+    )
+
+    assert discovered == ("https://example.test/profile", "html_body", "<>")
+
+
+def test_post_worker_uses_discovered_sink_context_for_generation_and_follow_up() -> None:
+    post_form = PostFormTarget(
+        action_url="https://example.test/submit",
+        source_page_url="https://example.test/form",
+        param_names=["q"],
+        csrf_field=None,
+        hidden_defaults={},
+    )
+    probe_result = ProbeResult(
+        param_name="q",
+        original_value="x",
+        reflections=[
+            ReflectionContext(context_type="html_body", surviving_chars=frozenset({"<", ">"})),
+        ],
+    )
+    sink_reflection = ReflectionContext(
+        context_type="js_string_dq",
+        surviving_chars=frozenset({'"', ";"}),
+    )
+
+    local_calls: list[str] = []
+    sink_urls: list[str | None] = []
+    results: list[WorkerResult] = []
+
+    class FakeExecutor:
+        def __init__(self, auth_headers=None) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            pass
+
+        def fire_post(self, **kwargs):
+            sink_urls.append(kwargs.get("sink_url"))
+            return SimpleNamespace(
+                confirmed=kwargs["payload"] == "ai-js",
+                method="dialog",
+                detail="alert fired",
+                transform_name=kwargs["transform_name"],
+                payload=kwargs["payload"],
+                fired_url=kwargs["action_url"],
+                discovered_sink_url="",
+            )
+
+    def _local_payloads(**kwargs):
+        local_calls.append(kwargs["probe_result"].reflections[0].context_type)
+        return ["ai-js"]
+
+    with (
+        patch("ai_xss_generator.probe.probe_post_form", return_value=[probe_result]),
+        patch("ai_xss_generator.parser.parse_target", return_value=_fake_context(post_form.source_page_url)),
+        patch("ai_xss_generator.active.executor.ActiveExecutor", FakeExecutor),
+        patch(
+            "ai_xss_generator.active.worker._autodiscover_post_sink_context",
+            return_value=("https://example.test/profile", sink_reflection, _fake_context("https://example.test/profile")),
+        ),
+        patch(
+            "ai_xss_generator.active.transforms.all_variants_for_probe",
+            return_value=[("q", "js_string_dq", [TransformVariant("raw", "fallback-js")])],
+        ),
+        patch("ai_xss_generator.active.worker._get_local_payloads", side_effect=_local_payloads),
+        patch("ai_xss_generator.active.worker._get_cloud_payloads", return_value=[]),
+    ):
+        _run_post(
+            post_form=post_form,
+            rate=25.0,
+            waf_hint=None,
+            model="qwen3.5",
+            cloud_model="anthropic/claude-3-5-sonnet",
+            use_cloud=True,
+            timeout_seconds=30,
+            dedup_registry={},
+            dedup_lock=threading.Lock(),
+            findings_lock=threading.Lock(),
+            start_time=time.monotonic(),
+            put_result=results.append,
+            auth_headers=None,
+            crawled_pages=["https://example.test/profile"],
+            sink_url=None,
+            ai_backend="api",
+            cli_tool="claude",
+            cli_model=None,
+        )
+
+    assert local_calls == ["js_string_dq"]
+    assert sink_urls == ["https://example.test/profile"]
+    assert results and results[0].status == "confirmed"
+    assert results[0].confirmed_findings[0].source == "local_model"
 
 
 def test_cli_backend_gets_extended_worker_budget() -> None:

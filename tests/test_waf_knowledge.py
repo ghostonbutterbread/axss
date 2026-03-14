@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from ai_xss_generator.models import _prompt_for_context
+from ai_xss_generator.models import _cloud_prompt_for_context
 from ai_xss_generator.types import ParsedContext
 from ai_xss_generator.waf_knowledge import analyze_waf_source, attach_waf_knowledge
 
@@ -83,8 +83,8 @@ def test_prompt_includes_waf_knowledge_section_when_attached(tmp_path) -> None:
     enriched = attach_waf_knowledge(context, profile)
 
     assert enriched is not None
-    prompt = _prompt_for_context(enriched)
-    assert "WAF SOURCE KNOWLEDGE" in prompt
-    assert "EFFECTIVE CONSTRAINTS" in prompt
+    prompt = _cloud_prompt_for_context(enriched)
+    assert "PLANNING ENVELOPE" in prompt
     assert profile.engine_name in prompt
+    assert "waf_prior" in prompt
     assert "preferred_strategies" in prompt

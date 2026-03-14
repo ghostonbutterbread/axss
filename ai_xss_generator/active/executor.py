@@ -71,6 +71,7 @@ class ExecutionResult:
     actual_url: str = ""
     query_preserved: bool | None = None
     fragment_preserved: bool | None = None
+    discovered_sink_url: str = ""
 
 
 @dataclass(slots=True)
@@ -482,6 +483,7 @@ class ActiveExecutor:
         actual_url = ""
         query_preserved: bool | None = None
         fragment_preserved: bool | None = None
+        discovered_sink_url = ""
         # Guard: only count execution events that happen AFTER the payload is
         # submitted.  Without this, console.log() calls on the form page itself
         # (e.g. analytics scripts) would fire _on_console and give a false positive
@@ -538,6 +540,36 @@ class ActiveExecutor:
 
             page.on("request", _on_request)
 
+            def _on_response(response):
+                nonlocal discovered_sink_url
+                if not payload_submitted or discovered_sink_url:
+                    return
+                try:
+                    status = int(getattr(response, "status", 0) or 0)
+                except Exception:
+                    return
+                if status < 300 or status >= 400:
+                    return
+                try:
+                    headers = response.headers or {}
+                except Exception:
+                    headers = {}
+                location = headers.get("location") or headers.get("Location") or ""
+                if not location:
+                    return
+                try:
+                    request = getattr(response, "request", None)
+                    is_navigation = bool(getattr(request, "is_navigation_request", lambda: False)())
+                    resource_type = str(getattr(request, "resource_type", "") or "").strip().lower()
+                    if resource_type and resource_type != "document" and not is_navigation:
+                        return
+                except Exception:
+                    pass
+                base_url = str(getattr(response, "url", "") or action_url)
+                discovered_sink_url = urllib.parse.urljoin(base_url, location)
+
+            page.on("response", _on_response)
+
             # Step 1: Load the form page (server fills in CSRF token automatically)
             ok, phases, nav_exc = goto_with_edge_recovery(
                 page,
@@ -579,6 +611,7 @@ class ActiveExecutor:
                     actual_url=actual_url,
                     query_preserved=query_preserved,
                     fragment_preserved=fragment_preserved,
+                    discovered_sink_url=discovered_sink_url,
                 )
 
             # Step 3: Submit the form — try submit button first, fall back to JS submit
@@ -660,6 +693,7 @@ class ActiveExecutor:
                 actual_url=actual_url,
                 query_preserved=query_preserved,
                 fragment_preserved=fragment_preserved,
+                discovered_sink_url=discovered_sink_url,
             )
         finally:
             try:
@@ -683,6 +717,7 @@ class ActiveExecutor:
             actual_url=actual_url,
             query_preserved=query_preserved,
             fragment_preserved=fragment_preserved,
+            discovered_sink_url=discovered_sink_url,
         )
 
     def fire_upload(

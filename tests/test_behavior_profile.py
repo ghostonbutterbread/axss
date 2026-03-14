@@ -8,7 +8,7 @@ from ai_xss_generator.behavior import (
     extract_behavior_profile,
 )
 from ai_xss_generator.lessons import LESSON_TYPE_BEHAVIOR, build_behavior_lessons
-from ai_xss_generator.models import _cloud_prompt_for_context, _prompt_for_context
+from ai_xss_generator.models import _cloud_prompt_for_context
 from ai_xss_generator.probe import (
     ProbeResult,
     ReflectionContext,
@@ -76,9 +76,11 @@ def test_attach_behavior_profile_makes_prompt_include_behavior_section() -> None
     extracted = extract_behavior_profile(enriched)
     assert extracted["waf_name"] == "cloudflare"
 
-    prompt = _prompt_for_context(enriched)
-    assert "TARGET BEHAVIOR PROFILE" in prompt
+    prompt = _cloud_prompt_for_context(enriched)
+    assert "CONTEXT ENVELOPE" in prompt
+    assert "PLANNING ENVELOPE" in prompt
     assert '"browser_required": true' in prompt
+    assert '"waf_hint": "cloudflare"' in prompt
 
 
 def test_dom_cloud_prompt_includes_behavior_profile_section() -> None:

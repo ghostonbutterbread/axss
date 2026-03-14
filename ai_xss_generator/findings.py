@@ -260,35 +260,6 @@ def relevant_findings(
     scored.sort(key=lambda x: -x[0])
     return [f for _, f in scored[:limit]]
 
-
-# ---------------------------------------------------------------------------
-# Prompt formatting
-# ---------------------------------------------------------------------------
-
-def findings_prompt_section(findings: list[Finding]) -> str:
-    if not findings:
-        return ""
-    lines = [
-        "Curated findings for similar filter/sink contexts "
-        "(study the bypass TECHNIQUE — do NOT copy verbatim, adapt to this target):"
-    ]
-    for f in findings:
-        lines.append(
-            f"  sink={f.sink_type}  context={f.context_type}  "
-            f"surviving_chars={f.surviving_chars!r}  bypass_family={f.bypass_family}"
-        )
-        if f.waf_name or f.delivery_mode or f.frameworks:
-            lines.append(
-                f"  delivery={f.delivery_mode or '-'}  waf={f.waf_name or '-'}  "
-                f"frameworks={','.join(f.frameworks) or '-'}"
-            )
-        lines.append(f"  payload: {f.payload}")
-        if f.explanation:
-            lines.append(f"  why_it_works: {f.explanation}")
-        lines.append("")
-    return "\n".join(lines)
-
-
 # ---------------------------------------------------------------------------
 # Bypass family inference
 # ---------------------------------------------------------------------------

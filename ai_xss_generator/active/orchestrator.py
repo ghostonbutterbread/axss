@@ -67,6 +67,7 @@ class ActiveScanConfig:
     cli_tool: str = "claude"      # "claude" | "codex" (when ai_backend="cli")
     cli_model: str | None = None  # model passed to CLI (None = CLI default)
     cloud_attempts: int = 1       # recursive cloud reasoning rounds per context
+    deep: bool = False
     waf_source: str | None = None # local path to open-source WAF/filter code for planning hints
     keep_searching: bool = False
     extreme: bool = False
@@ -360,6 +361,7 @@ def run_active_scan(
                     "cli_tool": config.cli_tool,
                     "cli_model": config.cli_model,
                     "cloud_attempts": config.cloud_attempts,
+                    "deep": config.deep,
                 }
                 while len(active_procs) < n_workers:
                     try:

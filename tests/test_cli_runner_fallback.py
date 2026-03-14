@@ -150,7 +150,14 @@ def test_generate_with_cli_labels_payloads_with_actual_fallback_tool() -> None:
 
     with patch(
         "ai_xss_generator.cli_runner.generate_via_cli_with_tool",
-        return_value=('{"payloads":[{"payload":"<img src=x onerror=alert(1)>"}]}', "codex"),
+        return_value=(
+            '{"payloads":['
+            '{"payload":"<img src=x onerror=alert(1)>","title":"img","test_vector":"?q=<img src=x onerror=alert(1)>","bypass_family":"event-handler"},'
+            '{"payload":"<svg onload=alert(1)>","title":"svg","test_vector":"?q=<svg onload=alert(1)>","bypass_family":"svg"},'
+            '{"payload":"<details open ontoggle=alert(1)>","title":"details","test_vector":"?q=<details open ontoggle=alert(1)>","bypass_family":"event-handler"}'
+            ']}',
+            "codex",
+        ),
     ):
         payloads, actual_tool = _generate_with_cli(
             context=context,
@@ -159,7 +166,7 @@ def test_generate_with_cli_labels_payloads_with_actual_fallback_tool() -> None:
         )
 
     assert actual_tool == "codex"
-    assert len(payloads) == 1
+    assert len(payloads) == 3
     assert payloads[0].source == "cli:codex"
 
 

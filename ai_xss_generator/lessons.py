@@ -46,40 +46,6 @@ class Lesson:
     confidence: float = 0.0
     metadata: dict[str, Any] = field(default_factory=dict)
 
-
-# ---------------------------------------------------------------------------
-# Prompt formatting
-# ---------------------------------------------------------------------------
-
-def lessons_prompt_section(lessons: list[Lesson]) -> str:
-    if not lessons:
-        return ""
-    lines = [
-        "Active probe observations for this target "
-        "(use as reasoning context — these reflect what this target actually does):"
-    ]
-    for lesson in lessons:
-        lines.append(
-            f"  type={lesson.lesson_type}  title={lesson.title}  "
-            f"context={lesson.context_type or '-'}  sink={lesson.sink_type or '-'}  "
-            f"delivery={lesson.delivery_mode or '-'}"
-        )
-        lines.append(f"  summary: {lesson.summary}")
-        if lesson.surviving_chars or lesson.blocked_chars:
-            lines.append(
-                f"  filter: surviving={lesson.surviving_chars or '-'} "
-                f"blocked={lesson.blocked_chars or '-'}"
-            )
-        if lesson.frameworks or lesson.waf_name or lesson.auth_required:
-            lines.append(
-                f"  landscape: frameworks={','.join(lesson.frameworks) or '-'}  "
-                f"waf={lesson.waf_name or '-'}  "
-                f"auth_required={'yes' if lesson.auth_required else 'no'}"
-            )
-        lines.append("")
-    return "\n".join(lines)
-
-
 # ---------------------------------------------------------------------------
 # Builder helpers
 # ---------------------------------------------------------------------------

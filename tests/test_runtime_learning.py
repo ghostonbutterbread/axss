@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -46,10 +47,11 @@ def test_get_local_payloads_forwards_local_timeout_to_generator():
 
 def test_dom_local_payloads_forwards_local_timeout_to_generator():
     context = ParsedContext(source="https://example.test/#x", source_type="url")
-    captured: dict[str, int] = {}
+    captured: dict[str, object] = {}
 
     def _fake_generate_payloads(**kwargs):
         captured["timeout"] = kwargs["local_timeout_seconds"]
+        captured["reference_payloads"] = kwargs["reference_payloads"]
         return [], "ollama"
 
     with (
@@ -64,6 +66,42 @@ def test_dom_local_payloads_forwards_local_timeout_to_generator():
         )
 
     assert captured["timeout"] == 23
+    assert captured["reference_payloads"]
+    assert any(item["payload"] == "<img src=x onerror=alert(1)>" for item in captured["reference_payloads"])
+
+
+def test_dom_cloud_payloads_forward_sink_reference_payloads_to_generator():
+    context = ParsedContext(
+        source="https://example.test/#x",
+        source_type="url",
+        notes=[
+            '[dom:TAINT] {"code_location": "bundle.js:42", "sink": "document.write", "source_name": "hash", "source_type": "fragment"}'
+        ],
+        dom_sinks=[],
+    )
+    captured: dict[str, object] = {}
+
+    def _fake_generate_cloud_payloads(**kwargs):
+        captured["reference_payloads"] = kwargs["reference_payloads"]
+        return [], "openrouter"
+
+    with (
+        patch("ai_xss_generator.learning.build_memory_profile", return_value={}),
+        patch("ai_xss_generator.models.generate_cloud_payloads", side_effect=_fake_generate_cloud_payloads),
+    ):
+        from ai_xss_generator.active.worker import _get_dom_cloud_payloads
+
+        _get_dom_cloud_payloads(
+            context=context,
+            cloud_model="anthropic/claude-3-5-sonnet",
+            waf=None,
+            ekey="dom-key",
+            dedup_registry={},
+            dedup_lock=threading.Lock(),
+        )
+
+    assert captured["reference_payloads"]
+    assert any(item["payload"] == "<img src=x onerror=alert(1)>" for item in captured["reference_payloads"])
 
 
 def test_compact_dom_prompt_uses_sink_specific_profile():
@@ -80,6 +118,34 @@ def test_compact_dom_prompt_uses_sink_specific_profile():
     assert "Sink profile: document_write" in prompt
     assert "URL-attribute breakout" in prompt
     assert "Produce 3-6 payloads only." in prompt
+
+
+def test_compact_dom_prompt_includes_success_and_seed_sections() -> None:
+    context = ParsedContext(
+        source="https://example.test/#x",
+        source_type="url",
+        notes=[
+            '[dom:TAINT] {"code_location": "bundle.js:42", "sink": "innerHTML", "source_name": "hash", "source_type": "fragment"}'
+        ],
+    )
+    lessons = [
+        SimpleNamespace(
+            lesson_type="execution_feedback",
+            title="attempt 1",
+            summary="confirmed execution",
+            metadata={
+                "execution_confirmed": True,
+                "payload": "<img src=x onerror=alert(1)>",
+                "bypass_family": "event-handler-injection",
+            },
+        )
+    ]
+
+    prompt = _compact_dom_prompt_for_local(context, past_lessons=lessons)
+
+    assert "PAYLOADS THAT EXECUTED - generate similar techniques but NOT identical:" in prompt
+    assert "SEED PAYLOADS (mutate, do not copy):" in prompt
+    assert '"payload": "<img src=x onerror=alert(1)>"' in prompt
 
 
 def test_cloud_prompt_uses_compact_seeded_shape_for_simple_dom_sinks():

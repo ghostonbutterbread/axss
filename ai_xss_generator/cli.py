@@ -455,6 +455,16 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--deep",
+        action="store_true",
+        default=False,
+        help=(
+            "--deep  Run full phased AI generation on every attempt "
+            "(scout -> contextual -> research). By default axss stays fast-first "
+            "and only escalates into deeper prompting after scout attempts fail."
+        ),
+    )
+    parser.add_argument(
         "--extreme",
         action="store_true",
         default=False,
@@ -538,16 +548,6 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
             "--resume  Automatically resume a previous interrupted or paused scan "
             "for the same target without prompting. If no prior session exists, "
             "starts a new scan."
-        ),
-    )
-    parser.add_argument(
-        "--no-resume",
-        action="store_true",
-        default=False,
-        help=(
-            "--no-resume  Explicit no-op: start fresh (the default). "
-            "Sessions are still created for future --resume use, but no prior "
-            "session is loaded. Useful to make intent clear in scripts."
         ),
     )
     parser.add_argument(
@@ -781,6 +781,7 @@ def _build_result(
     ai_backend: str = "api",
     cli_tool: str = "claude",
     cli_model: str | None = None,
+    deep: bool = False,
 ) -> GenerationResult:
     payloads, engine, used_fallback, resolved_model = generate_payloads(
         context=context,
@@ -794,6 +795,7 @@ def _build_result(
         ai_backend=ai_backend,
         cli_tool=cli_tool,
         cli_model=cli_model,
+        deep=deep,
     )
     return GenerationResult(
         engine=engine,
@@ -1170,6 +1172,8 @@ def _run_active_scan(
         info("Active scan profile: extreme")
     if getattr(args, "research", False):
         info("Active scan profile: research")
+    if getattr(args, "deep", False):
+        info("AI phase mode: deep")
     if getattr(args, "keep_searching", False):
         info("Post-confirmation mode: keep searching for distinct variants")
     if getattr(args, "waf_source", None):
@@ -1210,6 +1214,7 @@ def _run_active_scan(
         cli_tool=ai_config.cli_tool,
         cli_model=ai_config.cli_model,
         cloud_attempts=getattr(args, "attempts", 1),
+        deep=getattr(args, "deep", False),
         waf_source=getattr(args, "waf_source", None),
         keep_searching=getattr(args, "keep_searching", False),
         extreme=getattr(args, "extreme", False),
@@ -1228,6 +1233,7 @@ def _run_active_scan(
         f"rate={args.rate:g} req/s | workers={scan_config.workers} | "
         f"model={scan_config.model} | waf={waf or 'none'} | "
         f"cloud_attempts={scan_config.cloud_attempts}"
+        + (" | deep=true" if getattr(args, "deep", False) else "")
         + (" | profile=extreme" if getattr(args, "extreme", False) else "")
         + (" | profile=research" if getattr(args, "research", False) else "")
         + (" | keep_searching=true" if getattr(args, "keep_searching", False) else "")
@@ -1262,7 +1268,6 @@ def _resolve_session(
     checkpointed, but never auto-resume a prior one.
 
     --resume: look for an existing in-progress/paused session and resume it.
-    --no-resume: same as the default (explicit opt-out, kept for clarity).
     """
     from ai_xss_generator.session import (
         compute_seed_hash,
@@ -1306,7 +1311,7 @@ def _resolve_session(
         else:
             info("--resume: no prior session found for this target — starting fresh.")
 
-    # Default path (and --no-resume): create a new session for this run.
+    # Default path: create a new session for this run.
     config_summary = (
         f"target={urls[0] if urls else '?'} | "
         f"rate={rate:g} req/s | "
@@ -1734,6 +1739,7 @@ def main(argv: list[str] | None = None) -> int:
                 ai_backend=ai_backend,
                 cli_tool=cli_tool,
                 cli_model=cli_model,
+                deep=getattr(args, "deep", False),
             )
             for context in contexts
         ]
@@ -1754,6 +1760,7 @@ def main(argv: list[str] | None = None) -> int:
                 ai_backend=ai_backend,
                 cli_tool=cli_tool,
                 cli_model=cli_model,
+                deep=getattr(args, "deep", False),
             )
 
         success(f"Done. {sum(len(r.payloads) for r in results)} total payloads ranked.")
@@ -1874,6 +1881,7 @@ def main(argv: list[str] | None = None) -> int:
         ai_backend=ai_backend,
         cli_tool=cli_tool,
         cli_model=cli_model,
+        deep=getattr(args, "deep", False),
     )
 
     # Apply threshold filter to final payloads
