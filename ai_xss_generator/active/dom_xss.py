@@ -15,11 +15,17 @@ payload inventory for execution attempts.
 Sources tested:
   - URL query parameters (each individually replaced with the canary)
   - URL fragment (location.hash)
+  - window.name             (set via init script before page JS runs)
+  - localStorage values     (hook Storage.prototype.getItem to return canary)
+  - sessionStorage values   (hook Storage.prototype.getItem to return canary)
+  - document.referrer       (inject canary into Referer HTTP header)
 
 Sinks hooked:
   - innerHTML, outerHTML, insertAdjacentHTML
   - eval, Function, setTimeout (string form), setInterval (string form)
   - document.write, document.writeln
+  - window.open, location.assign, location.replace
+  - HTMLScriptElement.prototype.src
 """
 from __future__ import annotations
 
@@ -82,6 +88,12 @@ _SINK_PAYLOADS: dict[str, list[str]] = {
     "Function":           ["alert(1)", "alert`1`"],
     "setTimeout":         ["alert(1)", "alert`1`"],
     "setInterval":        ["alert(1)", "alert`1`"],
+    # Navigation sinks — javascript: URIs execute JS in the current origin context
+    "window.open":        ["javascript:alert(1)", "javascript:alert`1`"],
+    "location.assign":    ["javascript:alert(1)", "javascript:alert`1`"],
+    "location.replace":   ["javascript:alert(1)", "javascript:alert`1`"],
+    # Script src — external script load from attacker-controlled URL
+    "script.src":         ["javascript:alert(1)", "data:application/javascript,alert(1)"],
 }
 _DEFAULT_PAYLOADS = ["<img src=x onerror=alert(1)>", "<svg onload=alert(1)>"]
 
@@ -181,6 +193,69 @@ _HOOK_JS_TEMPLATE = r"""(function() {
             return _origSI.apply(window, arguments);
         };
     } catch(e) {}
+
+    // window.open — record url argument
+    try {
+        var _origOpen = window.open;
+        window.open = function(url) {
+            _record('window.open', url);
+            return _origOpen.apply(window, arguments);
+        };
+    } catch(e) {}
+
+    // location.assign / location.replace — navigation sinks
+    try {
+        var _origAssign = window.location.assign.bind(window.location);
+        window.location.assign = function(url) {
+            _record('location.assign', url);
+            return _origAssign(url);
+        };
+    } catch(e) {}
+    try {
+        var _origReplace = window.location.replace.bind(window.location);
+        window.location.replace = function(url) {
+            _record('location.replace', url);
+            return _origReplace(url);
+        };
+    } catch(e) {}
+
+    // HTMLScriptElement.prototype.src — script load from attacker-controlled URL
+    try {
+        var _scriptDesc = Object.getOwnPropertyDescriptor(HTMLScriptElement.prototype, 'src');
+        if (_scriptDesc && _scriptDesc.set) {
+            Object.defineProperty(HTMLScriptElement.prototype, 'src', {
+                set: function(v) { _record('script.src', v); _scriptDesc.set.call(this, v); },
+                get: _scriptDesc.get, configurable: true
+            });
+        }
+    } catch(e) {}
+})();"""
+
+
+# Source-injection snippets — appended to hook JS when probing non-URL sources.
+# __CANARY__ is replaced at build time with repr(canary).
+_WINDOW_NAME_SNIPPET = "(function() { try { window.name = __CANARY__; } catch(e) {} })();"
+
+# Hook localStorage/sessionStorage.getItem to return canary for every key access.
+# Only activates for the storage object the snippet targets (ls vs ss).
+_LS_HOOK_SNIPPET = r"""(function() {
+    try {
+        var _origLSGet = window.localStorage.getItem.bind(window.localStorage);
+        window.localStorage.getItem = function(key) {
+            var v = _origLSGet(key);
+            return (v !== null) ? (v + __CANARY__) : __CANARY__;
+        };
+    } catch(e) {}
+})();"""
+
+_SS_HOOK_SNIPPET = r"""(function() {
+    try {
+        var _origSSGet = window.sessionStorage.getItem.bind(window.sessionStorage);
+        window.sessionStorage.getItem = function(key) {
+            var v = _origSSGet(key);
+            return (v !== null) ? (v + __CANARY__) : __CANARY__;
+        };
+    } catch(e) {}
 })();"""
 
 
@@ -217,20 +292,42 @@ def _make_canary() -> str:
     return "axss_" + os.urandom(4).hex()
 
 
-def _build_hook_js(canary: str) -> str:
-    return _HOOK_JS_TEMPLATE.replace("__CANARY__", repr(canary))
+def _build_hook_js(
+    canary: str,
+    inject_window_name: bool = False,
+    inject_local_storage: bool = False,
+    inject_session_storage: bool = False,
+) -> str:
+    base = _HOOK_JS_TEMPLATE.replace("__CANARY__", repr(canary))
+    extras: list[str] = []
+    if inject_window_name:
+        extras.append(_WINDOW_NAME_SNIPPET.replace("__CANARY__", repr(canary)))
+    if inject_local_storage:
+        extras.append(_LS_HOOK_SNIPPET.replace("__CANARY__", repr(canary)))
+    if inject_session_storage:
+        extras.append(_SS_HOOK_SNIPPET.replace("__CANARY__", repr(canary)))
+    if extras:
+        return base + "\n" + "\n".join(extras)
+    return base
 
 
 def _inject_source(url: str, source_type: str, source_name: str, value: str) -> str:
-    """Return *url* with *value* placed in the specified attacker-controlled source."""
+    """Return *url* with *value* placed in the specified attacker-controlled source.
+
+    For non-URL sources (window_name, local_storage, session_storage, referrer)
+    the URL is returned unchanged — injection happens via init script or HTTP headers
+    set up by the caller.
+    """
     parsed = urllib.parse.urlparse(url)
     if source_type == "fragment":
         return urllib.parse.urlunparse(parsed._replace(fragment=value))
-    # query_param: replace the target param, preserve all others
-    params = dict(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True))
-    params[source_name] = value
-    new_query = urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
-    return urllib.parse.urlunparse(parsed._replace(query=new_query))
+    if source_type == "query_param":
+        params = dict(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True))
+        params[source_name] = value
+        new_query = urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
+        return urllib.parse.urlunparse(parsed._replace(query=new_query))
+    # Non-URL sources: injection handled externally, return URL unchanged
+    return url
 
 
 def fallback_payloads_for_sink(sink: str) -> list[str]:
@@ -331,24 +428,37 @@ def discover_dom_taint_paths(
 ) -> list[DomTaintHit]:
     """Return tainted DOM source → sink paths discovered via runtime sink hooking.
 
-    For each attacker-controllable source (query params + URL fragment):
+    For each attacker-controllable source (query params, URL fragment, window.name,
+    localStorage, sessionStorage, document.referrer):
       1. Create a fresh browser context with the sink-hook init script loaded.
       2. Navigate with the canary value injected into that source.
       3. Wait for SPA stabilization (catches Angular's async rendering).
       4. Inspect window.__axss_dom_hits for any sink that received the canary.
+
+    Source injection strategies:
+      - query_param / fragment : canary injected into the URL
+      - window_name            : init script sets window.name = canary before page JS runs
+      - local_storage          : Storage.prototype.getItem hooked to return canary
+      - session_storage        : Storage.prototype.getItem hooked to return canary
+      - referrer               : canary embedded in Referer HTTP header
     """
     hits_out: list[DomTaintHit] = []
     canary = _make_canary()
-    hook_js = _build_hook_js(canary)
     _auth = auth_headers or {}
-    extra_headers = {**_auth, "Accept": "text/html,application/xhtml+xml"}
 
     parsed = urllib.parse.urlparse(url)
     raw_params = dict(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True))
 
-    # Each query param + the URL fragment are independent sources
+    # URL-injectable sources
     sources: list[tuple[str, str]] = [("query_param", k) for k in raw_params]
     sources.append(("fragment", "hash"))
+    # Non-URL sources: injection handled via init script / request headers
+    sources += [
+        ("window_name",     "window.name"),
+        ("local_storage",   "localStorage"),
+        ("session_storage", "sessionStorage"),
+        ("referrer",        "document.referrer"),
+    ]
 
     _debug(f"DOM XSS scan: {url}  canary={canary}  sources={[s[1] for s in sources]}")
 
@@ -356,11 +466,32 @@ def discover_dom_taint_paths(
     seen: set[tuple[str, str]] = set()
 
     for source_type, source_name in sources:
+        # Build URL (unchanged for non-URL sources)
         canary_url = _inject_source(url, source_type, source_name, canary)
+
+        # Build appropriate hook JS for this source
+        hook_js = _build_hook_js(
+            canary,
+            inject_window_name=(source_type == "window_name"),
+            inject_local_storage=(source_type == "local_storage"),
+            inject_session_storage=(source_type == "session_storage"),
+        )
+
+        # Build HTTP headers — add Referer canary for "referrer" source
+        if source_type == "referrer":
+            # Embed canary in referrer URL so document.referrer contains it
+            ctx_headers = {
+                **_auth,
+                "Accept": "text/html,application/xhtml+xml",
+                "Referer": f"https://{canary}.axss-ref.example.com/",
+            }
+        else:
+            ctx_headers = {**_auth, "Accept": "text/html,application/xhtml+xml"}
+
         _debug(f"  probing source={source_type}/{source_name}  url={canary_url}")
         ctx = browser.new_context(
             ignore_https_errors=True,
-            extra_http_headers=extra_headers,
+            extra_http_headers=ctx_headers,
         )
         try:
             page = ctx.new_page()

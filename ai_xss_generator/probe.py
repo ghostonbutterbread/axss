@@ -1013,6 +1013,7 @@ def _probe_param(
     auth_headers: dict[str, str] | None = None,
     rate_limiter: "_RateLimiter | None" = None,
     sink_url: str | None = None,
+    crawled_pages: list[str] | None = None,
 ) -> ProbeResult:
     """Send two probe requests for one parameter and return a ProbeResult."""
     probe_seed = _probe_seed_for_param(param_name, canary, original_value)
@@ -1093,6 +1094,48 @@ def _probe_param(
                     )
             except Exception as _exc:
                 log.debug("probe_url: sink_url check failed for %s: %s", sink_url, _exc)
+
+        # Crawled-page sweep for GET-based stored XSS.
+        # After the GET request the canary may be stored server-side; check
+        # each crawled page (session cookies carry the storage context).
+        # Priority: explicit sink_url already checked above; this sweeps the
+        # crawl boundary for anything the user hasn't manually specified.
+        if crawled_pages:
+            _sweep_pages = [p for p in crawled_pages if p != sink_url][:30]
+            for _fu in _sweep_pages:
+                try:
+                    _wait()
+                    _fu_resp = _session_get(session, _fu, {"headers": {"User-Agent": next(ua_cycle)}})
+                    _fu_html = _resp_html(_fu_resp)
+                    _fu_refs = _find_reflections(_fu_html, canary)
+                    if _fu_refs:
+                        _char_url = _rebuild_url(url, {**all_params, param_name: probe_seed.char_probe_value})
+                        _wait()
+                        _session_get(session, _char_url, {"headers": {"User-Agent": next(ua_cycle)}})
+                        _wait()
+                        _fu_resp2 = _session_get(session, _fu, {"headers": {"User-Agent": next(ua_cycle)}})
+                        _surviving = _analyze_char_survival(_resp_html(_fu_resp2), canary)
+                        if _reflection_transform(_fu_html, canary) == "upper":
+                            _surviving = _surviving.union(frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZ"))
+                        log.debug(
+                            "probe_url: stored canary found in crawled page %s for param %s",
+                            _fu, param_name,
+                        )
+                        return ProbeResult(
+                            param_name=param_name,
+                            original_value=original_value,
+                            reflection_transform=_reflection_transform(_fu_html, canary),
+                            discovery_style="stored_get",
+                            probe_mode=probe_plan.mode,
+                            tested_chars=probe_plan.chars,
+                            reflections=[
+                                _clone_reflection_context(ctx, surviving_chars=_surviving)
+                                for ctx in _fu_refs
+                            ],
+                        )
+                except Exception as _exc:
+                    log.debug("probe_url: crawled-page sweep error for %s: %s", _fu, _exc)
+
         return ProbeResult(
             param_name=param_name,
             original_value=original_value,
@@ -1233,6 +1276,7 @@ def probe_url(
     on_result: Callable[[ProbeResult], None] | None = None,
     auth_headers: dict[str, str] | None = None,
     sink_url: str | None = None,
+    crawled_pages: list[str] | None = None,
 ) -> list[ProbeResult]:
     """Probe all query parameters of *url* for XSS reflection contexts.
 
@@ -1422,6 +1466,7 @@ def probe_url(
                     auth_headers=auth_headers,
                     rate_limiter=rl,
                     sink_url=sink_url,
+                    crawled_pages=crawled_pages,
                 )
 
         n_workers = min(len(flat_params), _PROBE_MAX_WORKERS)

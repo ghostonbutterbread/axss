@@ -855,6 +855,7 @@ def run_worker(
     findings_lock: Any,
     auth_headers: dict[str, str] | None = None,
     sink_url: str | None = None,
+    crawled_pages: list[str] | None = None,
     ai_backend: str = "api",
     cli_tool: str = "claude",
     cli_model: str | None = None,
@@ -895,6 +896,7 @@ def run_worker(
             put_result=_put_result,
             auth_headers=auth_headers,
             sink_url=sink_url,
+            crawled_pages=crawled_pages,
             ai_backend=ai_backend,
             cli_tool=cli_tool,
             cli_model=cli_model,
@@ -928,6 +930,7 @@ def _run(
     put_result: Any,
     auth_headers: dict[str, str] | None = None,
     sink_url: str | None = None,
+    crawled_pages: list[str] | None = None,
     ai_backend: str = "api",
     cli_tool: str = "claude",
     cli_model: str | None = None,
@@ -1002,7 +1005,10 @@ def _run(
         log.debug("Pre-fetch of %s failed (parse_target will re-fetch): %s", url, _exc)
 
     # ── Step 3: Probe all params for reflection + char survival ──────────────
-    probe_results = probe_url(url, rate=rate, waf=waf_hint, auth_headers=auth_headers, sink_url=sink_url)
+    probe_results = probe_url(
+        url, rate=rate, waf=waf_hint, auth_headers=auth_headers,
+        sink_url=sink_url, crawled_pages=crawled_pages,
+    )
 
     injectable = [r for r in probe_results if r.is_injectable]
     reflected  = [r for r in probe_results if r.is_reflected]
@@ -2368,6 +2374,7 @@ def run_dom_worker(
     cli_model: str | None = None,
     cloud_attempts: int = 1,
     deep: bool = False,
+    fast: bool = False,
     waf_source: str | None = None,
     keep_searching: bool = False,
     extreme: bool = False,
@@ -2402,6 +2409,7 @@ def run_dom_worker(
             cli_model=cli_model,
             cloud_attempts=cloud_attempts,
             deep=deep,
+            fast=fast,
             waf_source=waf_source,
             keep_searching=keep_searching,
             extreme=extreme,
@@ -2429,6 +2437,7 @@ def _run_dom(
     cli_model: str | None = None,
     cloud_attempts: int = 1,
     deep: bool = False,
+    fast: bool = False,
     waf_source: str | None = None,
     keep_searching: bool = False,
     extreme: bool = False,
@@ -2581,7 +2590,8 @@ def _run_dom(
                 ai_engine = ""
                 ai_note = ""
                 local_stage = None
-                local_done = not escalation_policy.use_local
+                # fast mode: bypass local model entirely — cloud fires immediately
+                local_done = (not escalation_policy.use_local) or fast
                 local_payloads: list[str] = []
                 local_payloads_tried = False
                 cloud_stage = None
