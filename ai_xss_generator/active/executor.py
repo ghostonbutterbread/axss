@@ -16,12 +16,43 @@ import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any
 
+import threading
+
 from ai_xss_generator.browser_nav import goto_with_edge_recovery, same_origin_root
 from ai_xss_generator.active.console_signals import (
     console_init_script,
     is_execution_console_text,
     strip_execution_console_text,
 )
+from ai_xss_generator.stealth import (
+    stealth_context_kwargs,
+    stealth_init_script,
+    stealth_launch_args,
+)
+from ai_xss_generator.session_guard import _LOGIN_PATH_RE
+
+# Per-process auth-redirect warning state (fires at most once per worker process).
+_AUTH_REDIRECT_WARNED = False
+_AUTH_REDIRECT_LOCK = threading.Lock()
+
+
+def _check_auth_redirect(original_url: str, final_url: str) -> None:
+    """Warn once per process when Playwright navigation lands on a login page."""
+    global _AUTH_REDIRECT_WARNED
+    if not final_url or final_url == original_url:
+        return
+    if not _LOGIN_PATH_RE.search(urllib.parse.urlparse(final_url).path):
+        return
+    with _AUTH_REDIRECT_LOCK:
+        if _AUTH_REDIRECT_WARNED:
+            return
+        _AUTH_REDIRECT_WARNED = True
+    log.warning(
+        "AUTH: navigation to %s ended at login page %s — "
+        "session may have expired. Re-run with fresh --header / --cookies credentials.",
+        original_url,
+        final_url,
+    )
 
 log = logging.getLogger(__name__)
 
@@ -200,6 +231,7 @@ class ActiveExecutor:
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
+                *stealth_launch_args(),
             ],
         )
         self._started = True
@@ -280,11 +312,12 @@ class ActiveExecutor:
         extra_headers = {**self._auth_headers, "Accept": "text/html,application/xhtml+xml"}
         context = self._browser.new_context(
             ignore_https_errors=True,
-            # Block fonts/images/media for speed — we only care about JS execution
             extra_http_headers=extra_headers,
+            **stealth_context_kwargs(),
         )
         try:
             page = context.new_page()
+            page.add_init_script(stealth_init_script())
             page.add_init_script(console_init_script())
 
             # Block heavy resources to keep navigation fast
@@ -359,6 +392,7 @@ class ActiveExecutor:
                 log.debug("Navigation error for %s after %s: %s", fired_url, phases, nav_exc)
             _record_navigation_phases(edge_signals, phases)
             actual_url = page.url or fired_url
+            _check_auth_redirect(fired_url, actual_url)
             query_preserved, fragment_preserved = _delivery_preservation(fired_url, actual_url)
             if query_preserved is False:
                 _append_unique_signal(edge_signals, "query_rewritten")
@@ -494,9 +528,11 @@ class ActiveExecutor:
         context = self._browser.new_context(
             ignore_https_errors=True,
             extra_http_headers=extra_headers,
+            **stealth_context_kwargs(),
         )
         try:
             page = context.new_page()
+            page.add_init_script(stealth_init_script())
             page.add_init_script(console_init_script())
 
             page.route(
@@ -632,6 +668,7 @@ class ActiveExecutor:
                 except Exception:
                     pass
                 actual_url = page.url or source_page_url
+                _check_auth_redirect(source_page_url, actual_url)
                 query_preserved, fragment_preserved = _post_delivery_preservation(actual_url, plan.param_overrides)
                 if query_preserved is False:
                     _append_unique_signal(edge_signals, "post_payload_not_visible_in_url")
@@ -752,9 +789,11 @@ class ActiveExecutor:
         context = self._browser.new_context(
             ignore_https_errors=True,
             extra_http_headers=extra_headers,
+            **stealth_context_kwargs(),
         )
         try:
             page = context.new_page()
+            page.add_init_script(stealth_init_script())
             page.add_init_script(console_init_script())
 
             page.route(

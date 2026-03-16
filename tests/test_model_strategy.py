@@ -456,7 +456,7 @@ def test_contextual_prompt_includes_strategy_hint_in_planning_envelope() -> None
         strategy_hint="Reflection likely lands in a passive URL sink, so pivot toward quote closure or same-tag handler injection.",
     )
 
-    assert '"strategy_hint": "Reflection likely lands in a passive URL sink, so pivot toward quote closure or same-tag handler injection."' in prompt
+    assert "Reflection likely lands in a passive URL sink, so pivot toward quote closure or same-tag handler injection." in prompt
 
 
 def test_scout_prompt_uses_reference_payloads_as_seed_examples() -> None:
@@ -552,7 +552,7 @@ def test_reflected_prompt_envelope_includes_reflected_subcontext() -> None:
 
     prompt = _prompt_for_generation_phase(enriched, "contextual")
 
-    assert '"reflected_subcontext": {' in prompt
+    assert "REFLECTION STRUCTURE:" in prompt
     assert '"tag_name": "a"' in prompt
     assert '"attr_name": "href"' in prompt
     assert '"quote_style": "double"' in prompt

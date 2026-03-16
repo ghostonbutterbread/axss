@@ -23,6 +23,7 @@ from html.parser import HTMLParser
 from typing import Callable
 
 from ai_xss_generator.probe import _TRACKING_PARAM_BLOCKLIST
+from ai_xss_generator.scope import ScopeConfig, is_in_scope
 from ai_xss_generator.types import PostFormTarget, UploadTarget
 
 log = logging.getLogger(__name__)
@@ -230,6 +231,7 @@ def crawl(
     waf: str | None = None,
     auth_headers: dict[str, str] | None = None,
     on_progress: Callable[[int, int, int], None] | None = None,
+    scope: ScopeConfig | None = None,
 ) -> CrawlResult:
     """BFS-crawl from *start_url* and return a CrawlResult with:
       - get_urls:   deduplicated URLs that have at least one non-tracking GET param.
@@ -326,7 +328,12 @@ def crawl(
             if current_depth < depth:
                 for href in raw_links:
                     resolved = _resolve(href, final_url)
-                    if resolved and _same_origin(resolved, origin):
+                    if not resolved:
+                        continue
+                    if scope is not None and not is_in_scope(resolved, scope):
+                        log.debug("Crawl: out-of-scope, skipping %s", resolved)
+                        continue
+                    if _same_origin(resolved, origin):
                         next_level.append(resolved)
 
             # Convert raw POST form dicts to PostFormTarget objects (all depths)

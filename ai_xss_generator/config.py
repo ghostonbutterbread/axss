@@ -53,6 +53,50 @@ def _strip_json_comments(text: str) -> str:
     return "".join(out)
 
 
+def migrate_config() -> str:
+    """Rewrite *CONFIG_PATH* as clean JSON (strips any JSONC comments).
+
+    Returns a human-readable status message describing what was done.
+    Safe to call even when the file does not exist yet — in that case a
+    minimal default config is written so external tools can parse it.
+    """
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+    if not CONFIG_PATH.exists():
+        default: dict[str, Any] = {
+            "local_model": DEFAULT_MODEL,
+            "enable_remote_escalation": True,
+            "ai_backend": "cli",
+            "cli_tool": "claude",
+            "cli_model": None,
+            "cloud_model": "anthropic/claude-3-5-sonnet",
+        }
+        CONFIG_PATH.write_text(json.dumps(default, indent=2), encoding="utf-8")
+        return f"Created default config at {CONFIG_PATH}"
+
+    raw = CONFIG_PATH.read_text(encoding="utf-8")
+    stripped = _strip_json_comments(raw)
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError as exc:
+        return f"Config parse error after stripping comments: {exc} — file not modified"
+
+    clean = json.dumps(parsed, indent=2, ensure_ascii=False)
+    if clean == json.dumps(json.loads(raw), indent=2, ensure_ascii=False) if _is_valid_json(raw) else None:
+        return f"{CONFIG_PATH} is already valid JSON — no changes needed"
+
+    CONFIG_PATH.write_text(clean, encoding="utf-8")
+    return f"Migrated {CONFIG_PATH} to valid JSON (JSONC comments removed)"
+
+
+def _is_valid_json(text: str) -> bool:
+    try:
+        json.loads(text)
+        return True
+    except json.JSONDecodeError:
+        return False
+
+
 def load_api_key(name: str) -> str:
     """Return *name* from ~/.axss/keys, or "" if not present.
 

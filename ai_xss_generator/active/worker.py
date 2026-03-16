@@ -134,6 +134,8 @@ class ConfirmedFinding:
     ai_engine: str = ""
     ai_note: str = ""
     bypass_family: str = ""
+    csp_note: str = ""
+    """Non-empty when a CSP was detected on the target that may block execution."""
 
 
 @dataclass
@@ -237,6 +239,82 @@ def _reflected_payload_count(results: list[Any], fallback: int) -> int:
             continue
         reflected += 1
     return reflected or fallback
+
+
+@dataclass
+class _DeepEscalationPlan:
+    """Result of a deep escalation pass — cloud plan + contextual notes.
+
+    Used as the shared return type from _build_deep_escalation_plan() so all
+    four scan paths (GET, POST, DOM, upload) get consistent escalation behaviour
+    without duplicating strategy-hint + cloud-call logic.
+    """
+    cloud_plan: "CloudPayloadPlan"
+    strategy_hint: str
+    cloud_model_rounds_used: int = 1  # always 1 per call
+
+
+def _build_deep_escalation_plan(
+    *,
+    url: str,
+    probe_result: Any,
+    delivery_mode: str,
+    context: Any,
+    cloud_model: str,
+    waf_hint: str | None,
+    ekey: str,
+    dedup_registry: Any,
+    dedup_lock: Any,
+    auth_headers: dict[str, str],
+    ai_backend: str,
+    cli_tool: str,
+    cli_model: str | None,
+    session_lessons: list[Any],
+    feedback_lessons: list[Any] | None,
+    phase_profile: str,
+    fast_generated_count: int,
+    fast_reflected_count: int,
+) -> "_DeepEscalationPlan":
+    """Build a deep (contextual + research) escalation cloud plan.
+
+    This is the single source of truth for the post-scout escalation pass that
+    runs across all scan paths (GET, POST, DOM, upload) when fast scout rounds
+    fail to confirm execution.  Centralising it here means strategy-hint logic,
+    prompt phasing, and future CSP/WAF context enrichment only need to change
+    in one place.
+    """
+    strategy_hint = _analyze_fast_failure_strategy(
+        context=context,
+        cloud_model=cloud_model,
+        waf_hint=waf_hint,
+        generated_count=fast_generated_count,
+        reflected_count=fast_reflected_count or fast_generated_count,
+        ai_backend=ai_backend,
+        cli_tool=cli_tool,
+        cli_model=cli_model,
+        phase_profile=phase_profile,
+    )
+    cloud_plan = _coerce_cloud_plan(_get_cloud_payloads(
+        url=url,
+        probe_result=probe_result,
+        cloud_model=cloud_model,
+        waf=waf_hint,
+        ekey=ekey,
+        dedup_registry=dedup_registry,
+        dedup_lock=dedup_lock,
+        base_context=context,
+        auth_headers=auth_headers,
+        ai_backend=ai_backend,
+        cli_tool=cli_tool,
+        cli_model=cli_model,
+        delivery_mode=delivery_mode,
+        session_lessons=session_lessons,
+        feedback_lessons=feedback_lessons,
+        phase_profile=phase_profile,
+        phases=("contextual", "research"),
+        strategy_hint=strategy_hint,
+    ))
+    return _DeepEscalationPlan(cloud_plan=cloud_plan, strategy_hint=strategy_hint)
 
 
 def _analyze_fast_failure_strategy(
@@ -1005,6 +1083,9 @@ def _run(
                 cloud_plan = CloudPayloadPlan()
                 context_done = False
                 context_variant_keys: set[str] = set()
+                # AI-tried payloads for this context — non-confirmed ones graduate
+                # to tier-1 (survived) in the seed pool after the context loop ends.
+                _ai_tried_payloads: list[tuple[str, str]] = []  # (payload, source)
 
                 def _record_context_finding(finding: ConfirmedFinding) -> bool:
                     key = _finding_variant_key(finding)
@@ -1012,6 +1093,20 @@ def _run(
                         return False
                     context_variant_keys.add(key)
                     confirmed_findings.append(finding)
+                    # Tier-2 promotion: confirmed execution → highest-signal seed
+                    try:
+                        from ai_xss_generator.seed_pool import SeedPool
+                        from ai_xss_generator.findings import infer_bypass_family as _ibf
+                        SeedPool().add_confirmed(
+                            finding.payload,
+                            finding.context_type,
+                            waf=finding.waf or "",
+                            bypass_family=finding.bypass_family or _ibf(finding.payload, []),
+                            surviving_chars=finding.surviving_chars,
+                            source=finding.source,
+                        )
+                    except Exception:
+                        pass
                     return True
 
                 # Ask the local model first using the enriched target context.
@@ -1039,15 +1134,17 @@ def _run(
                         if _timed_out():
                             break
                         total_transforms_tried += 1
+                        _lp_text = _payload_text(lp)
                         result = executor.fire(
                             url=url,
                             param_name=param_name,
-                            payload=_payload_text(lp),
+                            payload=_lp_text,
                             all_params=flat_params,
                             transform_name="local_model",
                             sink_url=sink_url,
                             payload_candidate=lp,
                         )
+                        _ai_tried_payloads.append((_lp_text, "local_model"))
                         if result.confirmed:
                             finding = _make_finding(
                                 url=url,
@@ -1120,15 +1217,17 @@ def _run(
                             if _timed_out():
                                 break
                             total_transforms_tried += 1
+                            _cp_text = _payload_text(cp)
                             result = executor.fire(
                                 url=url,
                                 param_name=param_name,
-                                payload=_payload_text(cp),
+                                payload=_cp_text,
                                 all_params=flat_params,
                                 transform_name="cloud_model",
                                 sink_url=sink_url,
                                 payload_candidate=cp,
                             )
+                            _ai_tried_payloads.append((_cp_text, "cloud_model"))
                             if result.confirmed:
                                 finding = _make_finding(
                                     url=url,
@@ -1170,38 +1269,28 @@ def _run(
                             break
 
                     if not context_done and not deep and not _timed_out() and fast_generated_count > 0:
-                        strategy_hint = _analyze_fast_failure_strategy(
+                        _esc = _build_deep_escalation_plan(
+                            url=url,
+                            probe_result=context_probe_result,
+                            delivery_mode="get",
                             context=_cached_context,
                             cloud_model=cloud_model,
                             waf_hint=waf_hint,
-                            generated_count=fast_generated_count,
-                            reflected_count=fast_reflected_count or fast_generated_count,
-                            ai_backend=ai_backend,
-                            cli_tool=cli_tool,
-                            cli_model=cli_model,
-                            phase_profile=phase_profile,
-                        )
-                        cloud_model_rounds += 1
-                        cloud_plan = _coerce_cloud_plan(_get_cloud_payloads(
-                            url=url,
-                            probe_result=context_probe_result,
-                            cloud_model=cloud_model,
-                            waf=waf_hint,
                             ekey=ekey,
                             dedup_registry=dedup_registry,
                             dedup_lock=dedup_lock,
-                            base_context=_cached_context,
                             auth_headers=auth_headers,
                             ai_backend=ai_backend,
                             cli_tool=cli_tool,
                             cli_model=cli_model,
-                            delivery_mode="get",
                             session_lessons=session_lessons,
                             feedback_lessons=cloud_feedback_lessons,
                             phase_profile=phase_profile,
-                            phases=("contextual", "research"),
-                            strategy_hint=strategy_hint,
-                        ))
+                            fast_generated_count=fast_generated_count,
+                            fast_reflected_count=fast_reflected_count,
+                        )
+                        cloud_model_rounds += _esc.cloud_model_rounds_used
+                        cloud_plan = _esc.cloud_plan
                         cloud_payloads, _ = _unique_new_payloads(
                             cloud_plan.payloads,
                             seen_cloud_payloads,
@@ -1310,6 +1399,34 @@ def _run(
                             if _record_context_finding(finding) and len(context_variant_keys) >= context_hit_cap:
                                 context_done = True
                                 break
+
+                # Tier-1 promotion: AI-tried payloads at a reflective context
+                # that didn't confirm execution graduate to "survived" seeds.
+                # This means future scans get real-target-tested payloads as seeds
+                # even before any execution is confirmed (solves cold-start).
+                _has_reflection = bool(getattr(context_probe_result, "reflections", None))
+                if _has_reflection and _ai_tried_payloads:
+                    _confirmed_texts = {f.payload for f in confirmed_findings}
+                    _surviving = "".join(sorted(
+                        c for ctx in context_probe_result.reflections
+                        for c in ctx.surviving_chars
+                    ))
+                    try:
+                        from ai_xss_generator.seed_pool import SeedPool
+                        from ai_xss_generator.findings import infer_bypass_family as _ibf
+                        _pool = SeedPool()
+                        for _p_text, _p_src in _ai_tried_payloads:
+                            if _p_text and _p_text not in _confirmed_texts:
+                                _pool.add_survived(
+                                    _p_text,
+                                    context_type,
+                                    waf=waf_hint or "",
+                                    bypass_family=_ibf(_p_text, []),
+                                    surviving_chars=_surviving,
+                                    source=_p_src,
+                                )
+                    except Exception:
+                        pass
 
         if not confirmed_findings and not _timed_out():
             for attempt in coordinated_attempts:
@@ -2566,7 +2683,7 @@ def _run_dom(
                     time.sleep(0.05)
 
                 if not confirmed and not deep and use_cloud and not _timed_out() and fast_generated_count > 0:
-                    strategy_hint = _analyze_fast_failure_strategy(
+                    _dom_strategy_hint = _analyze_fast_failure_strategy(
                         context=dom_context,
                         cloud_model=cloud_model,
                         waf_hint=waf_hint,
@@ -2579,6 +2696,7 @@ def _run_dom(
                     )
                     cloud_model_rounds += 1
                     cloud_escalated = True
+                    # DOM escalation uses _get_dom_cloud_payloads (different from GET/POST paths)
                     cloud_plan = _coerce_cloud_plan(_get_dom_cloud_payloads(
                         context=dom_context,
                         cloud_model=cloud_model,
@@ -2593,7 +2711,7 @@ def _run_dom(
                         feedback_lessons=cloud_feedback_lessons,
                         phase_profile=phase_profile,
                         phases=("contextual", "research"),
-                        strategy_hint=strategy_hint,
+                        strategy_hint=_dom_strategy_hint,
                     ))
                     cloud_payloads, _ = _unique_new_payloads(
                         cloud_plan.payloads,
@@ -3282,6 +3400,7 @@ def _run_post(
                 cloud_plan = CloudPayloadPlan()
                 context_done = False
                 context_variant_keys: set[str] = set()
+                _ai_tried_payloads: list[tuple[str, str]] = []  # (payload, source)
 
                 def _record_context_finding(finding: ConfirmedFinding) -> bool:
                     key = _finding_variant_key(finding)
@@ -3289,6 +3408,20 @@ def _run_post(
                         return False
                     context_variant_keys.add(key)
                     confirmed_findings.append(finding)
+                    # Tier-2 promotion: confirmed execution → highest-signal seed
+                    try:
+                        from ai_xss_generator.seed_pool import SeedPool
+                        from ai_xss_generator.findings import infer_bypass_family as _ibf
+                        SeedPool().add_confirmed(
+                            finding.payload,
+                            finding.context_type,
+                            waf=finding.waf or "",
+                            bypass_family=finding.bypass_family or _ibf(finding.payload, []),
+                            surviving_chars=finding.surviving_chars,
+                            source=finding.source,
+                        )
+                    except Exception:
+                        pass
                     return True
 
                 if escalation_policy.use_local and not context_done and not _timed_out():
@@ -3443,38 +3576,28 @@ def _run_post(
                             break
 
                     if not context_done and not deep and not _timed_out() and fast_generated_count > 0:
-                        strategy_hint = _analyze_fast_failure_strategy(
+                        _esc = _build_deep_escalation_plan(
+                            url=post_form.source_page_url,
+                            probe_result=context_probe_result,
+                            delivery_mode="post",
                             context=generation_context,
                             cloud_model=cloud_model,
                             waf_hint=waf_hint,
-                            generated_count=fast_generated_count,
-                            reflected_count=fast_reflected_count or fast_generated_count,
-                            ai_backend=ai_backend,
-                            cli_tool=cli_tool,
-                            cli_model=cli_model,
-                            phase_profile=phase_profile,
-                        )
-                        cloud_model_rounds += 1
-                        cloud_plan = _coerce_cloud_plan(_get_cloud_payloads(
-                            url=post_form.source_page_url,
-                            probe_result=context_probe_result,
-                            cloud_model=cloud_model,
-                            waf=waf_hint,
                             ekey=ekey,
                             dedup_registry=dedup_registry,
                             dedup_lock=dedup_lock,
-                            base_context=generation_context,
                             auth_headers=auth_headers,
                             ai_backend=ai_backend,
                             cli_tool=cli_tool,
                             cli_model=cli_model,
-                            delivery_mode="post",
                             session_lessons=post_session_lessons,
                             feedback_lessons=cloud_feedback_lessons,
                             phase_profile=phase_profile,
-                            phases=("contextual", "research"),
-                            strategy_hint=strategy_hint,
-                        ))
+                            fast_generated_count=fast_generated_count,
+                            fast_reflected_count=fast_reflected_count,
+                        )
+                        cloud_model_rounds += _esc.cloud_model_rounds_used
+                        cloud_plan = _esc.cloud_plan
                         cloud_payloads, _ = _unique_new_payloads(
                             cloud_plan.payloads,
                             seen_cloud_payloads,

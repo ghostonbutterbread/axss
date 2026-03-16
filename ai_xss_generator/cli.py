@@ -263,6 +263,14 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
         help="--json-out PATH (always write the full JSON result), e.g. -j result.json",
     )
     parser.add_argument(
+        "--sarif",
+        metavar="PATH",
+        help=(
+            "--sarif PATH  Write a SARIF 2.1.0 report alongside the standard report. "
+            "Compatible with GitHub Advanced Security, DefectDojo, and most security pipelines."
+        ),
+    )
+    parser.add_argument(
         "-r",
         "--rate",
         metavar="N",
@@ -506,6 +514,42 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--scope-domain",
+        metavar="DOMAIN",
+        action="append",
+        dest="scope_domains",
+        help=(
+            "--scope-domain DOMAIN  Restrict crawling and scanning to this domain/pattern. "
+            "Repeat for multiple domains. Supports wildcards: *.example.com. "
+            "Prefix with ! to exclude: !staging.example.com. "
+            "By default scope is auto-derived from the seed URL."
+        ),
+    )
+    parser.add_argument(
+        "--scope-h1",
+        metavar="HANDLE",
+        help=(
+            "--scope-h1 HANDLE  Pull in-scope domains from a HackerOne program. "
+            "Requires H1_API_USERNAME and H1_API_TOKEN (env vars or ~/.axss/keys)."
+        ),
+    )
+    parser.add_argument(
+        "--scope-bugcrowd",
+        metavar="SLUG",
+        help=(
+            "--scope-bugcrowd SLUG  Pull in-scope domains from a Bugcrowd program. "
+            "Requires BUGCROWD_API_KEY (env var or ~/.axss/keys)."
+        ),
+    )
+    parser.add_argument(
+        "--scope-intigriti",
+        metavar="HANDLE",
+        help=(
+            "--scope-intigriti HANDLE  Pull in-scope domains from an Intigriti program. "
+            "Requires INTIGRITI_API_TOKEN (env var or ~/.axss/keys)."
+        ),
+    )
+    parser.add_argument(
         "--browser-crawl",
         action="store_true",
         default=False,
@@ -579,6 +623,30 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
         help=(
             "--cli-model MODEL  Model passed to the CLI tool (e.g. claude-opus-4-6). "
             "Omit to use the CLI tool's default model."
+        ),
+    )
+
+    # ── Dry-run / session guard ───────────────────────────────────────────────
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        help=(
+            "--dry-run  Crawl and discover attack surface without firing any payloads. "
+            "Prints discovered GET endpoints (with params), POST forms, and upload targets, "
+            "then exits. No Playwright browser is launched. Useful for scoping an engagement "
+            "before committing to a full active scan."
+        ),
+    )
+    parser.add_argument(
+        "--session-check-url",
+        metavar="URL",
+        default=None,
+        help=(
+            "--session-check-url URL  Before scanning, probe URL with the provided auth "
+            "credentials to verify the session is still valid. Emits a warning (and aborts "
+            "by default) if the response is 401/403 or redirects to a login page. "
+            "Useful for long scans where cookie expiry is a concern."
         ),
     )
 
@@ -1031,6 +1099,45 @@ def _run_active_scan(
         else:
             info("No WAF fingerprint detected.")
 
+    # ── Scope resolution ──────────────────────────────────────────────────────
+    _scan_scope = None
+    try:
+        from ai_xss_generator.scope import (
+            scope_from_h1, scope_from_bugcrowd, scope_from_intigriti,
+            scope_from_manual, scope_from_url,
+        )
+        _scope_h1 = getattr(args, "scope_h1", None)
+        _scope_bc = getattr(args, "scope_bugcrowd", None)
+        _scope_iti = getattr(args, "scope_intigriti", None)
+        _scope_domains = getattr(args, "scope_domains", None) or []
+
+        if _scope_h1:
+            step(f"Fetching scope from HackerOne program: {_scope_h1}")
+            _scan_scope = scope_from_h1(_scope_h1)
+            success(
+                f"H1 scope loaded: {len(_scan_scope.allowed_patterns)} allowed, "
+                f"{len(_scan_scope.excluded_patterns)} excluded"
+            )
+        elif _scope_bc:
+            step(f"Fetching scope from Bugcrowd program: {_scope_bc}")
+            _scan_scope = scope_from_bugcrowd(_scope_bc)
+            success(f"Bugcrowd scope loaded: {len(_scan_scope.allowed_patterns)} targets")
+        elif _scope_iti:
+            step(f"Fetching scope from Intigriti program: {_scope_iti}")
+            _scan_scope = scope_from_intigriti(_scope_iti)
+            success(
+                f"Intigriti scope loaded: {len(_scan_scope.allowed_patterns)} allowed, "
+                f"{len(_scan_scope.excluded_patterns)} excluded"
+            )
+        elif _scope_domains:
+            _scan_scope = scope_from_manual(_scope_domains)
+            info(f"Manual scope: {', '.join(_scan_scope.allowed_patterns[:5])}")
+        elif urls:
+            _scan_scope = scope_from_url(urls[0])
+            info(f"Auto scope from seed URL: {', '.join(_scan_scope.allowed_patterns)}")
+    except Exception as _scope_err:
+        warn(f"Scope resolution failed: {_scope_err} — proceeding without scope enforcement")
+
     # Crawl to discover testable endpoints — only for single-URL mode.
     # When --urls is given the user already knows what they want to test.
     crawl_depth = getattr(args, "depth", 2)
@@ -1099,6 +1206,7 @@ def _run_active_scan(
                 waf=waf,
                 auth_headers=auth_headers,
                 on_progress=_crawl_progress,
+                scope=_scan_scope,
             )
         finally:
             clear_status_bar()
@@ -1163,6 +1271,10 @@ def _run_active_scan(
             waf = crawl_result.detected_waf
             success(f"WAF detected: {waf_label(waf)}")
 
+    # ── Dry-run: print attack surface and exit ────────────────────────────────
+    if getattr(args, "dry_run", False):
+        return _print_dry_run_surface(urls, post_forms, upload_targets)
+
     sink_url = getattr(args, "sink_url", None)
     if sink_url:
         info(f"Sink URL: {sink_url} (checking this page after each injection)")
@@ -1221,6 +1333,19 @@ def _run_active_scan(
         research=getattr(args, "research", False),
     )
 
+    # ── Pre-scan session validity check ──────────────────────────────────────
+    _session_check_url = getattr(args, "session_check_url", None)
+    if _session_check_url and auth_headers:
+        from ai_xss_generator.session_guard import SessionGuard, SessionExpiredWarning
+        _guard = SessionGuard(session_check_url=_session_check_url)
+        try:
+            step(f"Checking session against {_session_check_url}...")
+            _guard.pre_scan_check(auth_headers)
+            success("Session check passed — credentials appear valid.")
+        except SessionExpiredWarning as _session_exc:
+            warn(str(_session_exc))
+            warn("Continuing anyway — pass --no-session-check to suppress this check.")
+
     results = run_active_scan(
         urls, scan_config,
         post_forms=post_forms,
@@ -1248,6 +1373,65 @@ def _run_active_scan(
     success(f"Report written to: {report_path}")
     success(f"HTML report written to: {Path(report_path).with_suffix('.html')}")
 
+    sarif_out = getattr(args, "sarif", None)
+    if sarif_out:
+        try:
+            from ai_xss_generator.sarif import write_sarif
+            sarif_path = Path(sarif_out)
+            write_sarif(results, sarif_path)
+            success(f"SARIF report written to: {sarif_path}")
+        except Exception as _sarif_err:
+            warn(f"SARIF write failed: {_sarif_err}")
+
+    return 0
+
+
+def _print_dry_run_surface(
+    urls: list[str],
+    post_forms: list,
+    upload_targets: list,
+) -> int:
+    """Print discovered attack surface and exit without firing any payloads."""
+    import urllib.parse as _up
+
+    info("DRY-RUN mode — no payloads will be fired.\n")
+
+    if urls:
+        info(f"GET endpoints ({len(urls)} with testable query parameters):")
+        for u in urls:
+            parsed = _up.urlparse(u)
+            params = list(_up.parse_qs(parsed.query).keys())
+            param_str = ", ".join(params) if params else "(no query params)"
+            print(f"  {u}  [{param_str}]")
+        print()
+
+    if post_forms:
+        info(f"POST forms ({len(post_forms)}):")
+        for form in post_forms:
+            action = getattr(form, "action_url", "") or getattr(form, "action", "") or "-"
+            fields = getattr(form, "field_names", None) or getattr(form, "param_names", [])
+            field_str = ", ".join(fields) if fields else "(unknown fields)"
+            print(f"  {action}  [{field_str}]")
+        print()
+
+    if upload_targets:
+        info(f"Upload targets ({len(upload_targets)}):")
+        for t in upload_targets:
+            action = getattr(t, "action_url", "") or "-"
+            file_fields = getattr(t, "file_field_names", [])
+            print(f"  {action}  [file fields: {', '.join(file_fields) or 'unknown'}]")
+        print()
+
+    total = len(urls) + len(post_forms) + len(upload_targets)
+    if total == 0:
+        warn("No testable attack surface discovered. Try --browser-crawl for SPA targets.")
+    else:
+        success(
+            f"Dry-run complete: {len(urls)} GET endpoint(s), "
+            f"{len(post_forms)} POST form(s), "
+            f"{len(upload_targets)} upload target(s) discovered."
+        )
+        info("Remove --dry-run to start the active scan.")
     return 0
 
 
@@ -1344,6 +1528,11 @@ def main(argv: list[str] | None = None) -> int:
     if argv and argv[0] == "ai":
         from ai_xss_generator.ai_capabilities import handle_ai_command
         return handle_ai_command(argv[1:])
+    if argv and argv[0] == "setup":
+        from ai_xss_generator.config import migrate_config
+        msg = migrate_config()
+        print(msg)
+        return 0
 
     config = load_config()
     parser = build_parser(config.default_model)
