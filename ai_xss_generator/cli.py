@@ -514,39 +514,23 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--scope-domain",
-        metavar="DOMAIN",
-        action="append",
-        dest="scope_domains",
+        "--scope",
+        nargs="?",
+        const="auto",
+        default=None,
+        metavar="SPEC",
         help=(
-            "--scope-domain DOMAIN  Restrict crawling and scanning to this domain/pattern. "
-            "Repeat for multiple domains. Supports wildcards: *.example.com. "
-            "Prefix with ! to exclude: !staging.example.com. "
-            "By default scope is auto-derived from the seed URL."
-        ),
-    )
-    parser.add_argument(
-        "--scope-h1",
-        metavar="HANDLE",
-        help=(
-            "--scope-h1 HANDLE  Pull in-scope domains from a HackerOne program. "
-            "Requires H1_API_USERNAME and H1_API_TOKEN (env vars or ~/.axss/keys)."
-        ),
-    )
-    parser.add_argument(
-        "--scope-bugcrowd",
-        metavar="SLUG",
-        help=(
-            "--scope-bugcrowd SLUG  Pull in-scope domains from a Bugcrowd program. "
-            "Requires BUGCROWD_API_KEY (env var or ~/.axss/keys)."
-        ),
-    )
-    parser.add_argument(
-        "--scope-intigriti",
-        metavar="HANDLE",
-        help=(
-            "--scope-intigriti HANDLE  Pull in-scope domains from an Intigriti program. "
-            "Requires INTIGRITI_API_TOKEN (env var or ~/.axss/keys)."
+            "--scope [SPEC]  Control crawl/scan scope. Without SPEC, auto-derives scope "
+            "from the seed URL. SPEC can be:\n"
+            "  h1:HANDLE / hackerone:HANDLE  — pull scope from HackerOne API "
+            "(needs H1_API_USERNAME + H1_API_TOKEN)\n"
+            "  bc:SLUG / bugcrowd:SLUG       — pull scope from Bugcrowd API "
+            "(needs BUGCROWD_API_KEY)\n"
+            "  ig:HANDLE / intigriti:HANDLE  — pull scope from Intigriti API "
+            "(needs INTIGRITI_API_TOKEN)\n"
+            "  https://...                   — fetch page, LLM-parse scope "
+            "(needs OPENROUTER_API_KEY or OPENAI_API_KEY)\n"
+            "  domain.com,*.other.com        — manual comma-separated domain list"
         ),
     )
     parser.add_argument(
@@ -1102,39 +1086,31 @@ def _run_active_scan(
     # ── Scope resolution ──────────────────────────────────────────────────────
     _scan_scope = None
     try:
-        from ai_xss_generator.scope import (
-            scope_from_h1, scope_from_bugcrowd, scope_from_intigriti,
-            scope_from_manual, scope_from_url,
-        )
-        _scope_h1 = getattr(args, "scope_h1", None)
-        _scope_bc = getattr(args, "scope_bugcrowd", None)
-        _scope_iti = getattr(args, "scope_intigriti", None)
-        _scope_domains = getattr(args, "scope_domains", None) or []
+        from ai_xss_generator.scope import resolve_scope
 
-        if _scope_h1:
-            step(f"Fetching scope from HackerOne program: {_scope_h1}")
-            _scan_scope = scope_from_h1(_scope_h1)
+        _scope_arg = getattr(args, "scope", None)
+        # Default: auto-derive from seed URL (same behaviour as before)
+        if _scope_arg is None:
+            _scope_arg = "auto"
+
+        _source_label = _scope_arg if _scope_arg != "auto" else "seed URL"
+        step(f"Resolving scope: {_source_label}")
+        _scan_scope = resolve_scope(_scope_arg, urls)
+
+        _src = _scan_scope.source
+        _allowed = len(_scan_scope.allowed_patterns)
+        _excluded = len(_scan_scope.excluded_patterns)
+        if _src == "auto":
+            info(f"Auto scope ({len(_scan_scope.allowed_patterns) // 2} domain(s)): "
+                 f"{', '.join(p for p in _scan_scope.allowed_patterns if not p.startswith('*'))}")
+        elif _src == "page":
             success(
-                f"H1 scope loaded: {len(_scan_scope.allowed_patterns)} allowed, "
-                f"{len(_scan_scope.excluded_patterns)} excluded"
+                f"Page scope loaded: {_allowed} in-scope, {_excluded} out-of-scope"
             )
-        elif _scope_bc:
-            step(f"Fetching scope from Bugcrowd program: {_scope_bc}")
-            _scan_scope = scope_from_bugcrowd(_scope_bc)
-            success(f"Bugcrowd scope loaded: {len(_scan_scope.allowed_patterns)} targets")
-        elif _scope_iti:
-            step(f"Fetching scope from Intigriti program: {_scope_iti}")
-            _scan_scope = scope_from_intigriti(_scope_iti)
+        else:
             success(
-                f"Intigriti scope loaded: {len(_scan_scope.allowed_patterns)} allowed, "
-                f"{len(_scan_scope.excluded_patterns)} excluded"
+                f"{_src.upper()} scope loaded: {_allowed} allowed, {_excluded} excluded"
             )
-        elif _scope_domains:
-            _scan_scope = scope_from_manual(_scope_domains)
-            info(f"Manual scope: {', '.join(_scan_scope.allowed_patterns[:5])}")
-        elif urls:
-            _scan_scope = scope_from_url(urls[0])
-            info(f"Auto scope from seed URL: {', '.join(_scan_scope.allowed_patterns)}")
     except Exception as _scope_err:
         warn(f"Scope resolution failed: {_scope_err} — proceeding without scope enforcement")
 
