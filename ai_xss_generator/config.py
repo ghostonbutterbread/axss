@@ -154,6 +154,13 @@ class AppConfig:
     xss_reasoning_model: str | None = None
     generation_role: AIRoleConfig = field(default_factory=AIRoleConfig)
     reasoning_role: AIRoleConfig = field(default_factory=AIRoleConfig)
+    # Deep mode: reasoning model for strategy analysis before payload generation.
+    # Defaults to the same cloud_model. Can be set to a stronger reasoning model
+    # (e.g. "openai/o3-mini", "anthropic/claude-opus-4") in advanced config.
+    deep_model: str = ""
+    # Max injection points to apply deep reasoning to (0 = unlimited).
+    # Points are ranked by local triage score; only the top N get --deep treatment.
+    deep_limit: int = 0
 
 
 @dataclass(frozen=True)
@@ -169,6 +176,8 @@ class ResolvedAIConfig:
     xss_reasoning_model: str = "claude"
     generation_role: AIRoleConfig = field(default_factory=AIRoleConfig)
     reasoning_role: AIRoleConfig = field(default_factory=AIRoleConfig)
+    deep_model: str = ""
+    deep_limit: int = 0
 
 
 def _sanitize_backend(value: Any, default: str = "api") -> str:
@@ -292,6 +301,16 @@ def load_config() -> AppConfig:
     xss_generation_model = generation_role.tool
     xss_reasoning_model = reasoning_role.tool
 
+    deep_model = raw.get("deep_model", "")
+    if not isinstance(deep_model, str):
+        deep_model = ""
+
+    deep_limit_raw = raw.get("deep_limit", 0)
+    try:
+        deep_limit = max(0, int(deep_limit_raw))
+    except (TypeError, ValueError):
+        deep_limit = 0
+
     return AppConfig(
         default_model=default_model.strip(),
         use_cloud=use_cloud,
@@ -304,6 +323,8 @@ def load_config() -> AppConfig:
         xss_reasoning_model=xss_reasoning_model,
         generation_role=generation_role,
         reasoning_role=reasoning_role,
+        deep_model=deep_model.strip(),
+        deep_limit=deep_limit,
     )
 
 
@@ -403,6 +424,18 @@ def resolve_ai_config(
         fallback_models=resolved_reasoning_role.fallback_models,
     )
 
+    # deep_model: CLI arg > config file > fallback to cloud_model
+    resolved_deep_model = (
+        getattr(args, "deep_model", None)
+        or config.deep_model
+        or resolved_cloud_model.strip()
+    )
+    resolved_deep_limit = (
+        getattr(args, "deep_limit", None)
+        if args is not None and getattr(args, "deep_limit", None) is not None
+        else config.deep_limit
+    )
+
     return ResolvedAIConfig(
         model=resolved_model.strip(),
         use_cloud=resolved_use_cloud,
@@ -415,4 +448,6 @@ def resolve_ai_config(
         xss_reasoning_model=resolved_reasoning_model,
         generation_role=generation_role,
         reasoning_role=reasoning_role,
+        deep_model=resolved_deep_model,
+        deep_limit=resolved_deep_limit,
     )

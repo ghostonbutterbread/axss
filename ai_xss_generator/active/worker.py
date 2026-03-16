@@ -179,6 +179,78 @@ class WorkerResult:
     escalation_reasons: list[str] = field(default_factory=list)
 
 
+@dataclass
+class LocalTriageResult:
+    """Verdict returned by the local model triage gate.
+
+    The local model's sole job is to classify whether a reflected injection
+    point is worth cloud API spend — NOT to generate payloads.
+    """
+    score: int          # 1-10, higher = more XSS potential
+    should_escalate: bool
+    reason: str         # one-sentence justification
+    context_notes: str  # hints forwarded to the cloud payload generator
+
+
+def _triage_with_local_model(
+    probe_result: Any,
+    model: str,
+    waf: str | None,
+    delivery_mode: str = "get",
+    fast_mode: bool = False,
+) -> LocalTriageResult:
+    """Run the local Ollama triage gate on a probe result.
+
+    In --fast mode this is bypassed and always returns should_escalate=True
+    so the cloud model runs unconditionally (current legacy behaviour).
+    """
+    if fast_mode:
+        return LocalTriageResult(
+            score=5, should_escalate=True,
+            reason="fast mode — triage skipped", context_notes="",
+        )
+
+    # Build a concise reflection snippet from surviving char data
+    reflections = getattr(probe_result, "reflections", [])
+    surviving_chars = ""
+    snippet = ""
+    if reflections:
+        chars: set[str] = set()
+        for r in reflections:
+            chars.update(getattr(r, "surviving_chars", set()))
+        surviving_chars = " ".join(sorted(chars)) if chars else "unknown"
+        snippet = getattr(reflections[0], "raw_context", "") or ""
+        if len(snippet) > 400:
+            snippet = snippet[:400] + "…"
+
+    context_type = getattr(probe_result, "context_type", "") or ""
+    param_name = getattr(probe_result, "param_name", "?")
+
+    try:
+        from ai_xss_generator.models import triage_probe_result
+        result = triage_probe_result(
+            param_name=param_name,
+            context_type=context_type,
+            surviving_chars=surviving_chars,
+            reflection_snippet=snippet,
+            waf=waf,
+            delivery_mode=delivery_mode,
+            model=model,
+        )
+        return LocalTriageResult(
+            score=result["score"],
+            should_escalate=result["should_escalate"],
+            reason=result["reason"],
+            context_notes=result["context_notes"],
+        )
+    except Exception as exc:
+        log.debug("Triage gate error: %s — defaulting to escalate", exc)
+        return LocalTriageResult(
+            score=5, should_escalate=True,
+            reason=f"triage error: {exc}", context_notes="",
+        )
+
+
 def _append_reason(reasons: list[str], note: str) -> None:
     cleaned = note.strip()
     if cleaned and cleaned not in reasons:
@@ -788,6 +860,7 @@ def run_worker(
     cli_model: str | None = None,
     cloud_attempts: int = 1,
     deep: bool = False,
+    fast: bool = False,
     waf_source: str | None = None,
     keep_searching: bool = False,
     extreme: bool = False,
@@ -827,6 +900,7 @@ def run_worker(
             cli_model=cli_model,
             cloud_attempts=cloud_attempts,
             deep=deep,
+            fast=fast,
             waf_source=waf_source,
             keep_searching=keep_searching,
             extreme=extreme,
@@ -859,6 +933,7 @@ def _run(
     cli_model: str | None = None,
     cloud_attempts: int = 1,
     deep: bool = False,
+    fast: bool = False,
     waf_source: str | None = None,
     keep_searching: bool = False,
     extreme: bool = False,
@@ -1109,60 +1184,31 @@ def _run(
                         pass
                     return True
 
-                # Ask the local model first using the enriched target context.
-                # Only AI-origin payloads are returned here; heuristic payloads
-                # still exist in generate_payloads() but stay out of active
-                # execution so deterministic fallback remains explicit.
+                # Local model triage gate — decides whether this injection point
+                # is worth cloud API spend. It does NOT generate payloads.
+                # In --fast mode triage is skipped and cloud always runs.
+                _triage_approved = True  # default when local model unavailable
                 if escalation_policy.use_local and not context_done and not _timed_out():
                     local_model_rounds += 1
-                    local_payloads = _get_local_payloads(
-                        url=url,
+                    _triage = _triage_with_local_model(
                         probe_result=context_probe_result,
                         model=model,
                         waf=waf_hint,
-                        base_context=_cached_context,
-                        auth_headers=auth_headers,
                         delivery_mode="get",
-                        session_lessons=session_lessons,
-                        local_timeout_seconds=min(
-                            local_model_timeout_seconds,
-                            escalation_policy.local_timeout_seconds,
-                        ),
+                        fast_mode=fast,
                     )
-
-                    for lp in local_payloads:
-                        if _timed_out():
-                            break
-                        total_transforms_tried += 1
-                        _lp_text = _payload_text(lp)
-                        result = executor.fire(
-                            url=url,
-                            param_name=param_name,
-                            payload=_lp_text,
-                            all_params=flat_params,
-                            transform_name="local_model",
-                            sink_url=sink_url,
-                            payload_candidate=lp,
+                    _triage_approved = _triage.should_escalate
+                    _append_reason(escalation_reasons, f"[triage score={_triage.score}] {_triage.reason}")
+                    if _triage.context_notes:
+                        _append_reason(escalation_reasons, _triage.context_notes)
+                    if not _triage_approved:
+                        log.debug(
+                            "Triage gate: skipping cloud for %s param=%s (score=%d): %s",
+                            url, param_name, _triage.score, _triage.reason,
                         )
-                        _ai_tried_payloads.append((_lp_text, "local_model"))
-                        if result.confirmed:
-                            finding = _make_finding(
-                                url=url,
-                                probe_result=context_probe_result,
-                                context_type=context_type,
-                                result=result,
-                                waf=waf_hint,
-                                source="local_model",
-                                cloud_escalated=False,
-                                ai_note=escalation_policy.note,
-                            )
-                            if _record_context_finding(finding) and len(context_variant_keys) >= context_hit_cap:
-                                context_done = True
-                                break
 
-                # If the local model misses, try the cloud model before giving
-                # up on dynamic reasoning for this reflection context.
-                if not context_done and use_cloud and not _timed_out():
+                # Cloud model generates payloads — gated by local triage verdict.
+                if not context_done and _triage_approved and use_cloud and not _timed_out():
                     # Each unique (endpoint + param + waf + char profile + context)
                     # combination gets exactly one cloud call.
                     surviving_chars = frozenset().union(
@@ -3110,6 +3156,7 @@ def run_post_worker(
     cli_model: str | None = None,
     cloud_attempts: int = 1,
     deep: bool = False,
+    fast: bool = False,
     waf_source: str | None = None,
     keep_searching: bool = False,
     extreme: bool = False,
@@ -3144,6 +3191,7 @@ def run_post_worker(
             cli_model=cli_model,
             cloud_attempts=cloud_attempts,
             deep=deep,
+            fast=fast,
             waf_source=waf_source,
             keep_searching=keep_searching,
             extreme=extreme,
@@ -3178,6 +3226,7 @@ def _run_post(
     cli_model: str | None = None,
     cloud_attempts: int = 1,
     deep: bool = False,
+    fast: bool = False,
     waf_source: str | None = None,
     keep_searching: bool = False,
     extreme: bool = False,
@@ -3424,54 +3473,28 @@ def _run_post(
                         pass
                     return True
 
+                # Local model triage gate for POST params — mirrors GET behaviour.
+                _triage_approved = True
                 if escalation_policy.use_local and not context_done and not _timed_out():
                     local_model_rounds += 1
-                    local_payloads = _get_local_payloads(
-                        url=post_form.source_page_url,
+                    _triage = _triage_with_local_model(
                         probe_result=context_probe_result,
                         model=model,
                         waf=waf_hint,
-                        base_context=generation_context,
-                        auth_headers=auth_headers,
                         delivery_mode="post",
-                        session_lessons=post_session_lessons,
-                        local_timeout_seconds=min(
-                            local_model_timeout_seconds,
-                            escalation_policy.local_timeout_seconds,
-                        ),
+                        fast_mode=fast,
                     )
-
-                    for lp in local_payloads:
-                        if _timed_out():
-                            break
-                        total_transforms_tried += 1
-                        result = executor.fire_post(
-                            source_page_url=post_form.source_page_url,
-                            action_url=post_form.action_url,
-                            param_name=param_name,
-                            payload=_payload_text(lp),
-                            all_param_names=post_form.param_names,
-                            csrf_field=post_form.csrf_field,
-                            transform_name="local_model",
-                            sink_url=effective_sink_url,
-                            payload_candidate=lp,
+                    _triage_approved = _triage.should_escalate
+                    _append_reason(escalation_reasons, f"[triage score={_triage.score}] {_triage.reason}")
+                    if _triage.context_notes:
+                        _append_reason(escalation_reasons, _triage.context_notes)
+                    if not _triage_approved:
+                        log.debug(
+                            "Triage gate: skipping cloud for POST %s param=%s (score=%d): %s",
+                            post_form.action_url, param_name, _triage.score, _triage.reason,
                         )
-                        if result.confirmed:
-                            finding = _make_finding(
-                                url=post_form.action_url,
-                                probe_result=context_probe_result,
-                                context_type=context_type,
-                                result=result,
-                                waf=waf_hint,
-                                source="local_model",
-                                cloud_escalated=False,
-                                ai_note=escalation_policy.note,
-                            )
-                            if _record_context_finding(finding) and len(context_variant_keys) >= context_hit_cap:
-                                context_done = True
-                                break
 
-                if not context_done and use_cloud and not _timed_out():
+                if not context_done and _triage_approved and use_cloud and not _timed_out():
                     surviving_chars = frozenset().union(
                         *(ctx.surviving_chars for ctx in context_probe_result.reflections)
                     )
@@ -3534,6 +3557,7 @@ def _run_post(
                                 transform_name="cloud_model",
                                 sink_url=effective_sink_url,
                                 payload_candidate=cp,
+                                extra_sink_urls=crawled_pages or [],
                             )
                             if result.confirmed:
                                 finding = _make_finding(
@@ -3616,6 +3640,7 @@ def _run_post(
                                 transform_name="cloud_model",
                                 sink_url=effective_sink_url,
                                 payload_candidate=cp,
+                                extra_sink_urls=crawled_pages or [],
                             )
                             if result.confirmed:
                                 finding = _make_finding(
@@ -3659,6 +3684,7 @@ def _run_post(
                             transform_name="waf_payload",
                             sink_url=effective_sink_url,
                             payload_candidate=wp,
+                            extra_sink_urls=crawled_pages or [],
                         )
                         if result.confirmed:
                             finding = _make_finding(
@@ -3691,6 +3717,7 @@ def _run_post(
                             csrf_field=post_form.csrf_field,
                             transform_name=variant.transform_name,
                             sink_url=effective_sink_url,
+                            extra_sink_urls=crawled_pages or [],
                         )
 
                         if result.confirmed:

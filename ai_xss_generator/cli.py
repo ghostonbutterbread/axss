@@ -463,13 +463,46 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--fast",
+        action="store_true",
+        default=False,
+        help=(
+            "--fast  Skip local model triage and run cloud Gen XSS directly on every "
+            "reflection context. Faster per-target but spends cloud API budget without "
+            "intelligent gating. Default (no flag) uses the local model to triage first."
+        ),
+    )
+    parser.add_argument(
         "--deep",
         action="store_true",
         default=False,
         help=(
-            "--deep  Run full phased AI generation on every attempt "
-            "(scout -> contextual -> research). By default axss stays fast-first "
-            "and only escalates into deeper prompting after scout attempts fail."
+            "--deep  Engage reasoning model strategy analysis before cloud Gen XSS. "
+            "The reasoning model analyses each triage-approved injection point and "
+            "produces a strategy brief that guides payload generation. Slower but "
+            "produces highly targeted payloads for hard targets. Pairs with scan-type "
+            "flags (e.g. --deep --stored) to scope where reasoning is applied."
+        ),
+    )
+    parser.add_argument(
+        "--deep-model",
+        metavar="MODEL",
+        default=None,
+        help=(
+            "--deep-model MODEL  Override the reasoning model used in --deep mode. "
+            "Defaults to the configured cloud_model. "
+            "Examples: openai/o3-mini  anthropic/claude-opus-4"
+        ),
+    )
+    parser.add_argument(
+        "--deep-limit",
+        metavar="N",
+        type=int,
+        default=None,
+        help=(
+            "--deep-limit N  Cap deep reasoning to the top N injection points ranked by "
+            "local triage score. Keeps --deep affordable on large target lists. "
+            "0 = unlimited (default)."
         ),
     )
     parser.add_argument(
@@ -1303,6 +1336,7 @@ def _run_active_scan(
         cli_model=ai_config.cli_model,
         cloud_attempts=getattr(args, "attempts", 1),
         deep=getattr(args, "deep", False),
+        fast=getattr(args, "fast", False),
         waf_source=getattr(args, "waf_source", None),
         keep_searching=getattr(args, "keep_searching", False),
         extreme=getattr(args, "extreme", False),

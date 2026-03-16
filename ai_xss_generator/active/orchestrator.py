@@ -68,6 +68,7 @@ class ActiveScanConfig:
     cli_model: str | None = None  # model passed to CLI (None = CLI default)
     cloud_attempts: int = 1       # recursive cloud reasoning rounds per context
     deep: bool = False
+    fast: bool = False            # skip local triage, run cloud Gen XSS directly
     waf_source: str | None = None # local path to open-source WAF/filter code for planning hints
     keep_searching: bool = False
     extreme: bool = False
@@ -387,6 +388,8 @@ def run_active_scan(
                                 "findings_lock": findings_lock,
                                 "auth_headers": config.auth_headers,
                                 "sink_url": config.sink_url,
+                                "deep": config.deep,
+                                "fast": config.fast,
                                 "waf_source": config.waf_source,
                                 "keep_searching": config.keep_searching,
                                 "extreme": config.extreme,
@@ -454,6 +457,8 @@ def run_active_scan(
                                 "auth_headers": config.auth_headers,
                                 "crawled_pages": crawled_pages_list,
                                 "sink_url": config.sink_url,
+                                "deep": config.deep,
+                                "fast": config.fast,
                                 "waf_source": config.waf_source,
                                 "keep_searching": config.keep_searching,
                                 "extreme": config.extreme,

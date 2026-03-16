@@ -486,6 +486,7 @@ class ActiveExecutor:
         sink_url: str | None = None,
         payload_overrides: dict[str, str] | None = None,
         payload_candidate: Any = None,
+        extra_sink_urls: list[str] | None = None,
     ) -> "ExecutionResult":
         """Navigate to *source_page_url*, fill *param_name* with *payload*, submit the form.
 
@@ -681,18 +682,21 @@ class ActiveExecutor:
 
             # Step 4: Navigate to follow-up pages to catch session-stored XSS.
             # After the form POST, the payload may be stored server-side and
-            # reflected (unescaped) on a subsequent page — most commonly the
-            # origin root or the source form page.  Navigate to both so the
-            # existing dialog/console/network hooks can detect execution there.
+            # reflected (unescaped) on a subsequent page.  Priority order:
+            #   1. manual --sink-url (highest confidence)
+            #   2. redirect destination detected from POST response
+            #   3. source form page
+            #   4. origin root
+            #   5. crawled_pages passed in as extra_sink_urls (capped at 20)
             if not confirmed:
-                import urllib.parse as _up
-                _pp = _up.urlparse(source_page_url)
                 _origin_root = same_origin_root(source_page_url)
+                _extras = list(extra_sink_urls or [])[:20]
                 # sink_url (manually specified) is first — highest priority
                 _follow_ups = list(dict.fromkeys(
-                    list(plan.follow_up_urls)
-                    + ([sink_url] if sink_url else [])
+                    ([sink_url] if sink_url else [])
+                    + list(plan.follow_up_urls)
                     + [source_page_url, _origin_root]
+                    + _extras
                 ))
                 follow_up_attempted = bool(_follow_ups)
                 for _fu in _follow_ups:

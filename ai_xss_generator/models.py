@@ -1878,6 +1878,86 @@ def _generate_dom_local_with_ollama(
     return _normalize_payloads(data.get("payloads", []), source="ollama"), resolved_model
 
 
+def triage_probe_result(
+    *,
+    param_name: str,
+    context_type: str,
+    surviving_chars: str,
+    reflection_snippet: str,
+    waf: str | None,
+    delivery_mode: str,
+    model: str,
+    request_timeout_seconds: int = 25,
+) -> dict:
+    """Ask the local Ollama model to triage a probe result.
+
+    The local model's job is NOT to generate payloads — it's to classify
+    whether this injection point is worth spending cloud API budget on.
+
+    Returns a dict:
+      score: int (1-10, 10 = highest XSS potential)
+      should_escalate: bool
+      reason: str  (brief justification)
+      context_notes: str  (hints to pass to the cloud payload generator)
+    """
+    ready, resolved_model, reason_msg = _ensure_ollama_model(model)
+    if not ready:
+        # Unavailable → safe fallback: let cloud decide
+        return {
+            "score": 5,
+            "should_escalate": True,
+            "reason": f"Local model unavailable: {reason_msg}",
+            "context_notes": "",
+        }
+
+    waf_line = f"WAF detected: {waf}" if waf else "No WAF detected"
+    prompt = (
+        "You are a security analyst triaging web parameter injection points for XSS.\n"
+        "Analyze the probe result below and decide if it is worth spending cloud AI budget on.\n\n"
+        f"Parameter: {param_name}\n"
+        f"Delivery: {delivery_mode}\n"
+        f"Injection context: {context_type}\n"
+        f"Surviving chars (passed the filter unmodified): {surviving_chars or 'unknown'}\n"
+        f"Reflection snippet (how input appeared in the response):\n{reflection_snippet or '(not available)'}\n"
+        f"{waf_line}\n\n"
+        "Scoring guide:\n"
+        "  9-10 = Script/JS context with unfiltered quotes/parens, or unencoded attr with event handler potential\n"
+        "  7-8  = HTML context with surviving angle-brackets or attr context with one quote type surviving\n"
+        "  5-6  = Partial filter, some hope with obfuscation or encoding tricks\n"
+        "  3-4  = Heavy encoding/stripping but maybe a niche vector exists\n"
+        "  1-2  = Fully sanitised, no viable XSS path\n\n"
+        "Return ONLY valid JSON, no markdown:\n"
+        '{"score": <1-10>, "should_escalate": <true|false>, '
+        '"reason": "<one sentence>", "context_notes": "<hints for payload generator>"}'
+    )
+
+    try:
+        response = requests.post(
+            f"{OLLAMA_BASE_URL}/api/generate",
+            json={"model": resolved_model, "prompt": prompt, "stream": False},
+            timeout=max(1, request_timeout_seconds),
+        )
+        response.raise_for_status()
+        raw = response.json().get("response", "")
+        data = _extract_json_blob(raw)
+        if not isinstance(data, dict):
+            raise ValueError("non-dict response")
+        return {
+            "score": max(1, min(10, int(data.get("score", 5)))),
+            "should_escalate": bool(data.get("should_escalate", True)),
+            "reason": str(data.get("reason", "")),
+            "context_notes": str(data.get("context_notes", "")),
+        }
+    except Exception as exc:
+        log.debug("Local triage error for param=%s: %s — defaulting to escalate", param_name, exc)
+        return {
+            "score": 5,
+            "should_escalate": True,
+            "reason": f"Triage parse error: {exc}",
+            "context_notes": "",
+        }
+
+
 # ---------------------------------------------------------------------------
 # OpenAI-compatible generation (OpenAI + OpenRouter share the same function)
 # ---------------------------------------------------------------------------
