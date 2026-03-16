@@ -606,11 +606,15 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
         metavar="URL",
         default=None,
         help=(
-            "--blind-callback URL  Enable blind XSS detection. Every injection point "
-            "also receives OOB payloads that call back to URL when executed. "
-            "Use your own Burp Collaborator, Interactsh, xsshunter, or any server "
-            "you control. A blind_tokens.json manifest is saved alongside the report "
-            "mapping tokens back to their injection points."
+            "--blind-callback URL  Enable blind XSS detection (OFF by default — "
+            "this flag is required to activate it). After the main scan, every "
+            "injection point receives OOB payloads that call back to URL when "
+            "executed in a browser. Without this flag, no blind XSS payloads are "
+            "sent and no token manifest is written. "
+            "URL must be a server you control: Interactsh (oast.pro), "
+            "Burp Collaborator, xsshunter, webhook.site, or your own endpoint. "
+            "A blind_tokens.json manifest is saved alongside the report mapping "
+            "each token back to its injection point."
         ),
     )
     parser.add_argument(
@@ -621,7 +625,8 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
             "--poll-blind FILE  Poll a previously saved blind_tokens.json for "
             "any callbacks that have fired since the scan. Prints confirmed tokens "
             "with their originating injection points. Requires --blind-callback "
-            "to point to an endpoint that supports GET /poll?t=TOKEN."
+            "to point to an Interactsh-compatible endpoint that supports "
+            "GET /poll?t=TOKEN."
         ),
     )
     parser.add_argument(

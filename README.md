@@ -7,6 +7,7 @@ AI-assisted XSS scanning for authorized testing. `axss` crawls a target, probes 
 - Reflected XSS: GET parameter discovery, probing, payload generation, browser confirmation
 - Stored XSS: POST form submission, sink auto-discovery, sink-context override before generation
 - DOM XSS: runtime source->sink discovery with AI-generated payloads and static fallbacks
+- Blind XSS: OOB token injection for payloads that execute out-of-band (admin panels, logs, emails) — **requires `--blind-callback URL`**; disabled by default
 - Fast-by-default generation: compact scout prompts first, deeper phased prompts only when needed
 
 ## Setup
@@ -79,6 +80,7 @@ active scan
 - `--deep` restores full phased generation on every attempt.
 - Stored XSS no longer depends on `--sink-url`; redirects and crawled-page canary sweeps are used automatically when possible.
 - DOM XSS is AI-first. Static sink payloads are now seeds and fallbacks, not the primary strategy.
+- Blind XSS is **off by default**. It only runs when `--blind-callback URL` is explicitly provided. Without it, no OOB payloads are sent and no token manifest is written.
 
 ## Useful commands
 
@@ -94,6 +96,14 @@ axss -u "https://target.tld" --active --resume
 
 # Scan a SPA with browser crawl
 axss -u "https://target.tld" --active --browser-crawl
+
+# Blind XSS — requires an OOB callback URL you control
+# (Interactsh, Burp Collaborator, webhook.site, or your own server)
+axss -u "https://target.tld" --active --blind-callback "https://abc123.oast.pro"
+
+# Check which blind tokens have fired since the scan
+axss --poll-blind ~/.axss/reports/<report-dir>/blind_tokens.json \
+     --blind-callback "https://abc123.oast.pro"
 ```
 
 ## Notes
