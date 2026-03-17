@@ -189,7 +189,8 @@ def get_sitemap(
     if data is None:
         return None
     if not _is_fresh(data.get("cached_at", 0.0), ttl):
-        log.debug("scan cache: sitemap stale for %s", seed_url)
+        log.debug("scan cache: sitemap stale for %s — removing", seed_url)
+        path.unlink(missing_ok=True)
         return None
     try:
         result = _deserialize_sitemap(data)
@@ -306,7 +307,8 @@ def get_probe(
     if data is None:
         return None
     if not _is_fresh(data.get("cached_at", 0.0), ttl):
-        log.debug("scan cache: probe stale for %s", url)
+        log.debug("scan cache: probe stale for %s — removing", url)
+        path.unlink(missing_ok=True)
         return None
     try:
         results = _deserialize_probe(data)
@@ -332,3 +334,30 @@ def put_probe(
     path = _probe_path(url, param_names)
     _write_json_atomic(path, _serialize_probe(probe_results))
     log.debug("scan cache: probe written for %s → %s", url, path.name)
+
+
+# ── Sweep ─────────────────────────────────────────────────────────────────────
+
+def cache_sweep(ttl: int = DEFAULT_SCAN_TTL) -> int:
+    """Delete all expired scan-artifact cache files under SCAN_CACHE_DIR.
+
+    Returns the number of files removed.  Safe to call at the start of every
+    scan — it only touches files whose ``cached_at`` timestamp is older than
+    *ttl* seconds.  Files that cannot be parsed are also removed (they are
+    corrupt and would never be used).
+    """
+    if not SCAN_CACHE_DIR.exists():
+        return 0
+    removed = 0
+    for path in SCAN_CACHE_DIR.rglob("*.json"):
+        data = _read_json_safe(path)
+        expired = data is None or not _is_fresh(data.get("cached_at", 0.0), ttl)
+        if expired:
+            try:
+                path.unlink(missing_ok=True)
+                removed += 1
+                log.debug("scan cache: swept expired file %s", path.name)
+            except OSError as exc:
+                log.debug("scan cache: could not remove %s: %s", path, exc)
+    log.info("scan cache: sweep complete — %d expired file(s) removed", removed)
+    return removed

@@ -1297,7 +1297,8 @@ def _run_active_scan(
         else:
             info("Upload discovery found no multipart forms on the provided seed URLs.")
     elif args.url and not no_crawl:
-        from ai_xss_generator.cache import get_sitemap, put_sitemap, sitemap_age_minutes
+        from ai_xss_generator.cache import get_sitemap, put_sitemap, sitemap_age_minutes, cache_sweep
+        cache_sweep()  # evict expired artifacts before starting
         _scope_spec = getattr(args, "scope", None) or "auto"
         _fresh = getattr(args, "fresh", False)
         _cached_crawl = None if _fresh else get_sitemap(urls[0], _scope_spec)
