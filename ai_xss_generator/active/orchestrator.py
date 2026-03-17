@@ -73,6 +73,7 @@ class ActiveScanConfig:
     deep: bool = False
     fast: bool = False            # skip local triage, run cloud Gen XSS directly
     obliterate: bool = False      # fast + deep: skip probe, 3-phase broad-spectrum generation
+    fresh: bool = False           # ignore all caches, re-collect from scratch
     blind_callback: str | None = None  # OOB callback URL for blind XSS payloads
     waf_source: str | None = None # local path to open-source WAF/filter code for planning hints
     keep_searching: bool = False
@@ -397,6 +398,7 @@ def run_active_scan(
                                 "deep": config.deep,
                                 "fast": config.fast,
                                 "obliterate": config.obliterate,
+                                "fresh": config.fresh,
                                 "waf_source": config.waf_source,
                                 "keep_searching": config.keep_searching,
                                 "extreme": config.extreme,
@@ -469,6 +471,7 @@ def run_active_scan(
                                 "deep": config.deep,
                                 "fast": config.fast,
                                 "obliterate": config.obliterate,
+                                "fresh": config.fresh,
                                 "waf_source": config.waf_source,
                                 "keep_searching": config.keep_searching,
                                 "extreme": config.extreme,

@@ -506,6 +506,15 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--fresh",
+        action="store_true",
+        default=False,
+        help=(
+            "--fresh  Ignore any cached sitemap or probe results and re-collect from scratch. "
+            "By default axss reuses crawl/probe data cached within the last 24 hours."
+        ),
+    )
+    parser.add_argument(
         "--obliterate",
         action="store_true",
         default=False,
@@ -1288,7 +1297,25 @@ def _run_active_scan(
         else:
             info("Upload discovery found no multipart forms on the provided seed URLs.")
     elif args.url and not no_crawl:
-        crawl_result = _crawl_seed(urls[0])
+        from ai_xss_generator.cache import get_sitemap, put_sitemap, sitemap_age_minutes
+        _scope_spec = getattr(args, "scope", None) or "auto"
+        _fresh = getattr(args, "fresh", False)
+        _cached_crawl = None if _fresh else get_sitemap(urls[0], _scope_spec)
+        if _cached_crawl is not None:
+            crawl_result = _cached_crawl
+            _age_min = sitemap_age_minutes(urls[0], _scope_spec) or 0
+            step(
+                f"Sitemap cache hit — skipping crawl "
+                f"({len(crawl_result.get_urls)} URL(s), "
+                f"{len(crawl_result.post_forms)} form(s), "
+                f"~{_age_min}m old). Use --fresh to re-crawl."
+            )
+        else:
+            crawl_result = _crawl_seed(urls[0])
+            try:
+                put_sitemap(urls[0], _scope_spec, crawl_result)
+            except Exception:
+                pass  # cache write failure is non-fatal
 
         post_forms = crawl_result.post_forms
         upload_targets = getattr(crawl_result, "upload_targets", [])
@@ -1379,6 +1406,7 @@ def _run_active_scan(
         deep=getattr(args, "deep", False),
         fast=getattr(args, "fast", False),
         obliterate=getattr(args, "obliterate", False),
+        fresh=getattr(args, "fresh", False),
         waf_source=getattr(args, "waf_source", None),
         keep_searching=getattr(args, "keep_searching", False),
         extreme=getattr(args, "extreme", False),

@@ -863,6 +863,7 @@ def run_worker(
     deep: bool = False,
     fast: bool = False,
     obliterate: bool = False,
+    fresh: bool = False,
     waf_source: str | None = None,
     keep_searching: bool = False,
     extreme: bool = False,
@@ -905,6 +906,7 @@ def run_worker(
             deep=deep,
             fast=fast,
             obliterate=obliterate,
+            fresh=fresh,
             waf_source=waf_source,
             keep_searching=keep_searching,
             extreme=extreme,
@@ -940,6 +942,7 @@ def _run(
     deep: bool = False,
     fast: bool = False,
     obliterate: bool = False,
+    fresh: bool = False,
     waf_source: str | None = None,
     keep_searching: bool = False,
     extreme: bool = False,
@@ -987,16 +990,26 @@ def _run(
     target_disposition: Any = None
 
     if fast or obliterate:
-        # Fast/obliterate mode: synthesise a ProbeResult for every testable param
-        # using the omni context — no network probing, all params assumed injectable.
+        # Fast/obliterate mode: check probe cache first — if we have real probe
+        # data from a prior scan we use it instead of the synthetic fast_omni
+        # broad-spectrum fallback, giving targeted context at no extra cost.
+        from ai_xss_generator.cache import get_probe
         from ai_xss_generator.probe import make_fast_probe_result
-        for _pn, _pv in flat_params.items():
-            if _pn.lower() not in testable_params:
-                continue
-            _synth = make_fast_probe_result(_pn, _pv)
-            probe_results.append(_synth)
-        injectable = list(probe_results)
-        reflected = list(probe_results)
+        _cached_probe = None if fresh else get_probe(url, list(flat_params.keys()))
+        if _cached_probe is not None:
+            probe_results = _cached_probe
+            injectable = [r for r in probe_results if r.is_injectable]
+            reflected  = [r for r in probe_results if r.is_reflected]
+            log.info(
+                "Probe cache hit for %s — using real context, skipping network probe", url
+            )
+        else:
+            for _pn, _pv in flat_params.items():
+                if _pn.lower() not in testable_params:
+                    continue
+                probe_results.append(make_fast_probe_result(_pn, _pv))
+            injectable = list(probe_results)
+            reflected = list(probe_results)
     else:
         # Normal mode: pre-fetch for clean context, then probe.
         try:
@@ -1032,6 +1045,13 @@ def _run(
         injectable = [r for r in probe_results if r.is_injectable]
         reflected  = [r for r in probe_results if r.is_reflected]
         coordinated_attempts = _coordinated_split_attempts(reflected)
+
+        # Cache probe results for reuse by future fast/deep/obliterate scans.
+        try:
+            from ai_xss_generator.cache import put_probe
+            put_probe(url, list(flat_params.keys()), probe_results)
+        except Exception:
+            pass
 
     # ── Step 4: Parse target HTML once — reused by local/cloud model helpers ─
     from ai_xss_generator.parser import parse_target as _parse_target
@@ -3332,6 +3352,7 @@ def run_post_worker(
     deep: bool = False,
     fast: bool = False,
     obliterate: bool = False,
+    fresh: bool = False,
     waf_source: str | None = None,
     keep_searching: bool = False,
     extreme: bool = False,
@@ -3368,6 +3389,7 @@ def run_post_worker(
             deep=deep,
             fast=fast,
             obliterate=obliterate,
+            fresh=fresh,
             waf_source=waf_source,
             keep_searching=keep_searching,
             extreme=extreme,
@@ -3404,6 +3426,7 @@ def _run_post(
     deep: bool = False,
     fast: bool = False,
     obliterate: bool = False,
+    fresh: bool = False,
     waf_source: str | None = None,
     keep_searching: bool = False,
     extreme: bool = False,
@@ -3451,13 +3474,25 @@ def _run_post(
     effective_sink_url = sink_url
 
     if fast or obliterate:
-        # Fast/obliterate mode: synthesise a ProbeResult for every param — no network probing.
+        # Fast/obliterate mode: check probe cache first — real context from a
+        # prior scan beats the synthetic fast_omni broad-spectrum fallback.
+        from ai_xss_generator.cache import get_probe
         from ai_xss_generator.probe import make_fast_probe_result
-        probe_results = [
-            make_fast_probe_result(pn, "") for pn in post_form.param_names
-        ]
-        injectable = list(probe_results)
-        reflected = list(probe_results)
+        _cached_probe = None if fresh else get_probe(post_form.action_url, post_form.param_names)
+        if _cached_probe is not None:
+            probe_results = _cached_probe
+            injectable = [r for r in probe_results if r.is_injectable]
+            reflected  = [r for r in probe_results if r.is_reflected]
+            log.info(
+                "Probe cache hit for POST %s — using real context, skipping network probe",
+                post_form.action_url,
+            )
+        else:
+            probe_results = [
+                make_fast_probe_result(pn, "") for pn in post_form.param_names
+            ]
+            injectable = list(probe_results)
+            reflected = list(probe_results)
     else:
         # Normal mode: probe all params for reflection.
         probe_results = probe_post_form(
@@ -3474,6 +3509,13 @@ def _run_post(
         )
         injectable = [r for r in probe_results if r.is_injectable]
         reflected = [r for r in probe_results if r.is_reflected]
+
+        # Cache probe results for reuse by future fast/deep/obliterate scans.
+        try:
+            from ai_xss_generator.cache import put_probe
+            put_probe(post_form.action_url, post_form.param_names, probe_results)
+        except Exception:
+            pass
 
     # Start Playwright executor
     executor = ActiveExecutor(auth_headers=auth_headers)
