@@ -1203,6 +1203,38 @@ def _probe_param(
         except Exception as _href_exc:
             log.debug("_probe_param: href follow-up failed for %s: %s", param_name, _href_exc)
 
+    # ── HTML tag survival follow-up ───────────────────────────────────────────
+    # Raw `<` may be encoded in text context (e.g. sanitizer encodes &lt;) but
+    # whole HTML tags like <img src=x> can still pass through the filter.
+    # This is different from raw char survival — test a full tag structure.
+    # If <img src=x> survives, the AI can attempt filter-bypass payloads
+    # (event handler obfuscation, alternative tags, mXSS, etc.).
+    already_injectable2 = any(ctx.is_exploitable for ctx in final_reflections)
+    if has_html_body and not already_injectable2:
+        try:
+            _tag_test_payload = f"<img src={canary}>"
+            _tag_test_url = _rebuild_url(url, {**all_params, param_name: _tag_test_payload})
+            _wait()
+            _tag_resp = _session_get(session, _tag_test_url, req_kwargs)
+            _tag_html = _resp_html(_tag_resp)
+            # Check if <img was preserved (tag injection possible even if raw < isn't)
+            if "<img" in _tag_html.lower() and canary.lower() in _tag_html.lower():
+                final_reflections.append(
+                    ReflectionContext(
+                        context_type="html_body",
+                        surviving_chars=frozenset("<>\"'"),
+                        snippet=f"HTML tag injection confirmed (<img> passes filter)",
+                        evidence_confidence=0.88,
+                    )
+                )
+                log.info(
+                    "_probe_param: html_tag_injectable confirmed for param %s at %s "
+                    "(raw < encoded but <img> passes filter)",
+                    param_name, url,
+                )
+        except Exception as _tag_exc:
+            log.debug("_probe_param: html tag follow-up failed for %s: %s", param_name, _tag_exc)
+
     return ProbeResult(
         param_name=param_name,
         original_value=original_value,
@@ -1926,6 +1958,8 @@ def enrich_context(context: ParsedContext, probe_results: list[ProbeResult]) -> 
                 "snippet": _truncate_context_fragment(ctx.snippet, limit=180, tail=False),
                 "explanation": ctx.subcontext_explanation,
                 "confidence": round(ctx.evidence_confidence, 2) if ctx.evidence_confidence else 0.0,
+                "surviving_chars": sorted(ctx.surviving_chars),
+                "is_injectable": ctx.is_exploitable,
             }
             extra_notes.append("[probe:SUBCONTEXT] " + json.dumps(subcontext_payload, ensure_ascii=True))
 

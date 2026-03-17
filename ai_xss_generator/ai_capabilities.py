@@ -486,6 +486,14 @@ def recommended_timeout_seconds(tool: str, role: str, fallback: int) -> int:
 
 
 def _phase_timeout_with_profile(base: int, phase: str, profile: str, *, api: bool = False) -> int:
+    normalized = (profile or "normal").strip().lower()
+
+    # fast_omni: single broad-spectrum generation call — never halve like scout.
+    # The prompt is larger than a normal scout call so it needs the full base timeout.
+    if normalized == "fast_omni":
+        phase_timeout = max(120 if api else 90, base)
+        return max(phase_timeout, min(300 if api else 240, phase_timeout))
+
     if phase == "scout":
         phase_timeout = max(20 if api else 15, min(base, max(20 if api else 15, base // 2)))
     elif phase == "contextual":
@@ -495,7 +503,6 @@ def _phase_timeout_with_profile(base: int, phase: str, profile: str, *, api: boo
     else:
         phase_timeout = base
 
-    normalized = (profile or "normal").strip().lower()
     if normalized == "extreme":
         multiplier = {"scout": 1.0, "contextual": 1.5, "research": 2.0}.get(phase, 1.0)
         cap = 360 if api else 300

@@ -403,6 +403,28 @@ class ActiveExecutor:
                     if mode not in {"preflight", "follow_up"}:
                         _append_unique(executed_modes, mode)
 
+            # --- Click injected javascript: links / formaction buttons ---
+            # Payloads like <a href="javascript:alert(1)"> or
+            # <button formaction="javascript:alert(1)"> require a click to fire.
+            # After navigation, scan for such elements and click each one.
+            if not confirmed:
+                try:
+                    js_elements = page.locator(
+                        'a[href^="javascript:"], button[formaction^="javascript:"], '
+                        'input[formaction^="javascript:"]'
+                    )
+                    js_count = js_elements.count()
+                    for i in range(min(js_count, 5)):
+                        if confirmed:
+                            break
+                        try:
+                            js_elements.nth(i).click(timeout=2000, force=True)
+                            page.wait_for_timeout(300)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
             # --sink-url: navigate to the user-specified render page to catch
             # GET-based stored XSS where the payload shows up elsewhere.
             follow_ups = list(dict.fromkeys(

