@@ -3232,6 +3232,7 @@ def _get_fast_omni_payloads(
     cli_tool: str = "claude",
     cli_model: str | None = None,
     session_lessons: list[Any] | None = None,
+    delivery_mode: str = "get",
 ) -> CloudPayloadPlan:
     """Generate payloads in fast omni mode (no probe was run).
 
@@ -3258,7 +3259,7 @@ def _get_fast_omni_payloads(
         memory_profile = build_memory_profile(
             context=base_context,
             waf_name=waf,
-            delivery_mode="get",
+            delivery_mode=delivery_mode,
         )
         payloads, engine = generate_cloud_payloads(
             context=base_context,
@@ -3418,23 +3419,6 @@ def _run_post(
         put_result(WorkerResult(url=post_form.action_url, status="no_params", waf=waf_hint))
         return
 
-    # Probe all params for reflection
-    probe_results = probe_post_form(
-        action_url=post_form.action_url,
-        source_page_url=post_form.source_page_url,
-        param_names=post_form.param_names,
-        csrf_field=post_form.csrf_field,
-        hidden_defaults=post_form.hidden_defaults,
-        rate=rate,
-        waf=waf_hint,
-        auth_headers=auth_headers,
-        crawled_pages=crawled_pages,
-        sink_url=sink_url,
-    )
-
-    injectable = [r for r in probe_results if r.is_injectable]
-    reflected = [r for r in probe_results if r.is_reflected]
-
     _cached_context: Any = None
     try:
         _cached_context = _parse_target(
@@ -3452,6 +3436,31 @@ def _run_post(
     generation_context = _cached_context
     effective_sink_url = sink_url
 
+    if fast:
+        # Fast mode: synthesise a ProbeResult for every param — no network probing.
+        from ai_xss_generator.probe import make_fast_probe_result
+        probe_results = [
+            make_fast_probe_result(pn, "") for pn in post_form.param_names
+        ]
+        injectable = list(probe_results)
+        reflected = list(probe_results)
+    else:
+        # Normal mode: probe all params for reflection.
+        probe_results = probe_post_form(
+            action_url=post_form.action_url,
+            source_page_url=post_form.source_page_url,
+            param_names=post_form.param_names,
+            csrf_field=post_form.csrf_field,
+            hidden_defaults=post_form.hidden_defaults,
+            rate=rate,
+            waf=waf_hint,
+            auth_headers=auth_headers,
+            crawled_pages=crawled_pages,
+            sink_url=sink_url,
+        )
+        injectable = [r for r in probe_results if r.is_injectable]
+        reflected = [r for r in probe_results if r.is_reflected]
+
     # Start Playwright executor
     executor = ActiveExecutor(auth_headers=auth_headers)
     try:
@@ -3466,7 +3475,7 @@ def _run_post(
     post_session_lessons: list[Any] = []
     target_disposition: Any = None
     try:
-        if not _timed_out():
+        if not fast and not _timed_out():
             discovered_sink_url, sink_reflection, parsed_sink_context = _autodiscover_post_sink_context(
                 executor=executor,
                 post_form=post_form,
@@ -3491,54 +3500,55 @@ def _run_post(
                     parsed_sink_context = attach_waf_knowledge(parsed_sink_context, analyze_waf_source(waf_source))
                 generation_context = parsed_sink_context
 
-        from ai_xss_generator.behavior import (
-            attach_behavior_profile,
-            build_target_behavior_profile,
-            classify_target_disposition,
-        )
-        from ai_xss_generator.learning import build_memory_profile
-        from ai_xss_generator.lessons import (
-            build_behavior_lessons,
-            build_mapping_lessons,
-            build_probe_lessons,
-        )
+        if not fast:
+            from ai_xss_generator.behavior import (
+                attach_behavior_profile,
+                build_target_behavior_profile,
+                classify_target_disposition,
+            )
+            from ai_xss_generator.learning import build_memory_profile
+            from ai_xss_generator.lessons import (
+                build_behavior_lessons,
+                build_mapping_lessons,
+                build_probe_lessons,
+            )
 
-        behavior_profile = build_target_behavior_profile(
-            url=post_form.action_url,
-            delivery_mode="post",
-            waf_name=waf_hint,
-            auth_required=bool(auth_headers),
-            context=generation_context,
-            probe_results=probe_results,
-        )
-        generation_context = attach_behavior_profile(generation_context, behavior_profile)
-        target_disposition = classify_target_disposition(
-            generation_context,
-            delivery_mode="post",
-            reflected_params=len(reflected),
-            injectable_params=len(injectable),
-        )
-
-        memory_profile = build_memory_profile(
-            context=generation_context,
-            waf_name=waf_hint,
-            delivery_mode="post",
-            target_host=urllib.parse.urlparse(post_form.action_url).netloc,
-        )
-        if auth_headers:
-            memory_profile["auth_required"] = True
-        post_session_lessons.extend(build_behavior_lessons(behavior_profile))
-        if generation_context is not None:
-            post_session_lessons.extend(build_mapping_lessons(
-                generation_context,
-                memory_profile=memory_profile,
-            ))
-        if reflected:
-            post_session_lessons.extend(build_probe_lessons(
-                reflected,
-                memory_profile=memory_profile,
+            behavior_profile = build_target_behavior_profile(
+                url=post_form.action_url,
                 delivery_mode="post",
-            ))
+                waf_name=waf_hint,
+                auth_required=bool(auth_headers),
+                context=generation_context,
+                probe_results=probe_results,
+            )
+            generation_context = attach_behavior_profile(generation_context, behavior_profile)
+            target_disposition = classify_target_disposition(
+                generation_context,
+                delivery_mode="post",
+                reflected_params=len(reflected),
+                injectable_params=len(injectable),
+            )
+
+            memory_profile = build_memory_profile(
+                context=generation_context,
+                waf_name=waf_hint,
+                delivery_mode="post",
+                target_host=urllib.parse.urlparse(post_form.action_url).netloc,
+            )
+            if auth_headers:
+                memory_profile["auth_required"] = True
+            post_session_lessons.extend(build_behavior_lessons(behavior_profile))
+            if generation_context is not None:
+                post_session_lessons.extend(build_mapping_lessons(
+                    generation_context,
+                    memory_profile=memory_profile,
+                ))
+            if reflected:
+                post_session_lessons.extend(build_probe_lessons(
+                    reflected,
+                    memory_profile=memory_profile,
+                    delivery_mode="post",
+                ))
     except Exception as exc:
         log.debug("POST lesson build failed for %s: %s", post_form.action_url, exc)
 
@@ -3636,8 +3646,9 @@ def _run_post(
                     return True
 
                 # Local model triage gate for POST params — mirrors GET behaviour.
+                # fast_omni skips triage (no probe data, cloud always runs).
                 _triage_approved = True
-                if escalation_policy.use_local and not context_done and not _timed_out():
+                if context_type != "fast_omni" and escalation_policy.use_local and not context_done and not _timed_out():
                     local_model_rounds += 1
                     _triage = _triage_with_local_model(
                         probe_result=context_probe_result,
@@ -3672,6 +3683,67 @@ def _run_post(
                     seen_cloud_payloads: set[str] = set()
                     fast_generated_count = 0
                     fast_reflected_count = 0
+
+                    # fast_omni: single broad-spectrum cloud call, no feedback loop.
+                    if context_type == "fast_omni":
+                        cloud_escalated = True
+                        cloud_model_rounds += 1
+                        cloud_plan = _coerce_cloud_plan(_get_fast_omni_payloads(
+                            url=post_form.source_page_url,
+                            param_name=param_name,
+                            cloud_model=cloud_model,
+                            waf=waf_hint,
+                            ekey=ekey,
+                            dedup_registry=dedup_registry,
+                            dedup_lock=dedup_lock,
+                            base_context=generation_context,
+                            auth_headers=auth_headers,
+                            ai_backend=ai_backend,
+                            cli_tool=cli_tool,
+                            cli_model=cli_model,
+                            session_lessons=post_session_lessons,
+                            delivery_mode="post",
+                        ))
+                        cloud_payloads, _ = _unique_new_payloads(cloud_plan.payloads, seen_cloud_payloads)
+                        fast_generated_count += len(cloud_payloads)
+                        for cp in cloud_payloads:
+                            if _timed_out():
+                                break
+                            total_transforms_tried += 1
+                            _cp_text = _payload_text(cp)
+                            result = executor.fire_post(
+                                source_page_url=post_form.source_page_url,
+                                action_url=post_form.action_url,
+                                param_name=param_name,
+                                payload=_cp_text,
+                                all_param_names=post_form.param_names,
+                                csrf_field=post_form.csrf_field,
+                                transform_name="cloud_model",
+                                sink_url=effective_sink_url,
+                                payload_candidate=cp,
+                                extra_sink_urls=crawled_pages or [],
+                            )
+                            _ai_tried_payloads.append((_cp_text, "cloud_model"))
+                            if result.confirmed:
+                                finding = _make_finding(
+                                    url=post_form.action_url,
+                                    probe_result=context_probe_result,
+                                    context_type=context_type,
+                                    result=result,
+                                    waf=waf_hint,
+                                    source="cloud_model",
+                                    cloud_escalated=True,
+                                    ai_engine=cloud_plan.engine,
+                                    ai_note=_merge_ai_notes(
+                                        escalation_policy.note,
+                                        cloud_plan.note,
+                                    ),
+                                )
+                                _record_context_finding(finding)
+                                if len(context_variant_keys) >= context_hit_cap:
+                                    context_done = True
+                                    break
+                        continue  # next (param_name, context_type, variants) tuple
 
                     for attempt_number in range(1, attempt_limit + 1):
                         if _timed_out():
