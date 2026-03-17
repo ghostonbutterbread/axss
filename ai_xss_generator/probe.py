@@ -220,6 +220,8 @@ class ReflectionContext:
             return "-" in sc or "<" in sc
         if ct == "json_value":
             return '"' in sc
+        if ct == "fast_omni":
+            return True  # synthetic omni context — always exploitable
         return bool(sc)
 
     @property
@@ -1162,6 +1164,45 @@ def _probe_param(
     except Exception:
         surviving = frozenset()
 
+    final_reflections = [
+        _clone_reflection_context(ctx, surviving_chars=surviving)
+        for ctx in reflections
+    ]
+
+    # ── href/formaction follow-up ─────────────────────────────────────────────
+    # When we have an html_body reflection but < is blocked (so is_injectable
+    # would be False), check whether a javascript: URI survives in href/formaction.
+    # This turns a "soft dead" into an injectable html_attr_url context.
+    has_html_body = any(ctx.context_type == "html_body" for ctx in final_reflections)
+    already_injectable = any(ctx.is_exploitable for ctx in final_reflections)
+    if has_html_body and not already_injectable:
+        try:
+            rate_val = 1.0 / delay if delay > 0 else 25.0
+            _confirmed_attr = _probe_href_injectable(
+                url=url,
+                param_name=param_name,
+                original_value=original_value,
+                canary=canary,
+                rate=rate_val,
+                auth_headers=auth_headers,
+            )
+            if _confirmed_attr:
+                final_reflections.append(
+                    ReflectionContext(
+                        context_type="html_attr_url",
+                        attr_name=_confirmed_attr,
+                        surviving_chars=frozenset("<>\"'"),
+                        snippet=f"{_confirmed_attr}=javascript: URI injection confirmed",
+                        evidence_confidence=0.92,
+                    )
+                )
+                log.info(
+                    "_probe_param: html_attr_url (%s=javascript:) confirmed for param %s at %s",
+                    _confirmed_attr, param_name, url,
+                )
+        except Exception as _href_exc:
+            log.debug("_probe_param: href follow-up failed for %s: %s", param_name, _href_exc)
+
     return ProbeResult(
         param_name=param_name,
         original_value=original_value,
@@ -1169,10 +1210,7 @@ def _probe_param(
         discovery_style=probe_seed.style,
         probe_mode=probe_plan.mode,
         tested_chars=probe_plan.chars,
-        reflections=[
-            _clone_reflection_context(ctx, surviving_chars=surviving)
-            for ctx in reflections
-        ],
+        reflections=final_reflections,
     )
 
 
@@ -1766,6 +1804,86 @@ def probe_post_form(
                 on_result(result)
 
     return results
+
+
+def _probe_href_injectable(
+    url: str,
+    param_name: str,
+    original_value: str,
+    canary: str,
+    rate: float,
+    auth_headers: dict[str, str] | None,
+) -> str | None:
+    """Follow-up probe: check whether a javascript: URI survives into href/formaction.
+
+    Injects ``<a href="javascript:{canary}">x</a>`` and
+    ``<button formaction="javascript:{canary}">x</button>`` as the param value
+    and checks the HTTP response for literal href/formaction URI reflection.
+
+    Returns the attribute name ("href" or "formaction") if confirmed, else None.
+    """
+    parsed = urllib.parse.urlparse(url)
+    raw_params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+    flat_params = {k: v[0] for k, v in raw_params.items()}
+
+    ua_list = _load_rotation_values(os.environ.get("AXSS_USER_AGENTS")) or [
+        "axss/0.1 (+authorized security testing; scrapling)"
+    ]
+    merged_headers: dict[str, str] = {**(auth_headers or {}), "User-Agent": ua_list[0]}
+    req_kwargs: dict[str, Any] = {"headers": merged_headers}
+
+    delay = max(0.0, 1.0 / rate) if rate > 0 else 0.0
+
+    def _wait() -> None:
+        if delay > 0:
+            time.sleep(delay)
+
+    probes = [
+        ("href", f'<a href="javascript:{canary}">x</a>'),
+        ("formaction", f'<button formaction="javascript:{canary}">x</button>'),
+    ]
+
+    try:
+        with FetcherSession(impersonate="chrome", stealthy_headers=True, timeout=20,
+                            follow_redirects=True, retries=1) as session:
+            for attr_name, inject_value in probes:
+                _wait()
+                try:
+                    test_url = _rebuild_url(url, {**flat_params, param_name: inject_value})
+                    resp = _session_get(session, test_url, req_kwargs)
+                    html = _resp_html(resp)
+                    # Case-insensitive check for the attribute name, case-sensitive for canary value
+                    pattern = re.compile(
+                        rf'(?i){re.escape(attr_name)}\s*=\s*["\']?javascript:{re.escape(canary)}',
+                    )
+                    if pattern.search(html):
+                        log.debug(
+                            "_probe_href_injectable: confirmed %s=javascript: for param %s at %s",
+                            attr_name, param_name, url,
+                        )
+                        return attr_name
+                except Exception as exc:
+                    log.debug("_probe_href_injectable: request failed for %s: %s", attr_name, exc)
+    except Exception as exc:
+        log.debug("_probe_href_injectable: session setup failed: %s", exc)
+
+    return None
+
+
+def make_fast_probe_result(param_name: str, original_value: str) -> "ProbeResult":
+    """Synthetic probe result for fast (no-probe) mode. Covers all contexts."""
+    ctx = ReflectionContext(
+        context_type="fast_omni",
+        surviving_chars=frozenset("<>\"'`=;/()"),  # assume everything survives
+        snippet="[fast mode — no probe]",
+        evidence_confidence=0.5,
+    )
+    return ProbeResult(
+        param_name=param_name,
+        original_value=original_value,
+        reflections=[ctx],
+        probe_mode="fast_omni",
+    )
 
 
 def enrich_context(context: ParsedContext, probe_results: list[ProbeResult]) -> ParsedContext:

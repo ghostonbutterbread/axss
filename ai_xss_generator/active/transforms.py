@@ -279,6 +279,13 @@ def all_variants_for_probe(probe_result: "ProbeResult") -> list[tuple[str, str, 
     _TRANSFORM_BASE_CAP = 5
 
     out: list[tuple[str, str, list[TransformVariant]]] = []
+
+    # fast_omni synthetic context — return a single empty-variants tuple so the
+    # caller can bypass the transform layer and go straight to cloud generation.
+    if any(ctx.context_type == "fast_omni" for ctx in probe_result.reflections):
+        out.append((probe_result.param_name, "fast_omni", []))
+        return out
+
     base_payloads = payloads_for_probe_result(probe_result)
 
     for ctx in probe_result.reflections:

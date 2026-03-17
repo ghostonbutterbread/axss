@@ -2570,6 +2570,28 @@ def generate_cloud_payloads(
             auth_required=bool(memory_profile.get("auth_required", False)),
         )
 
+    # Fast omni mode: augment strategy_hint with broad-spectrum instructions so
+    # the model covers all injection contexts without probe context to guide it.
+    if phase_profile == "fast_omni":
+        _fast_omni_note = (
+            "FAST OMNI MODE: No probe was run on this target. Generate a broad-spectrum payload set "
+            "covering ALL common injection contexts:\n"
+            "- HTML body: <script>, <img onerror>, <svg onload>, <details ontoggle>\n"
+            "- HTML attributes (href, src, action, formaction): javascript: URI payloads — "
+            '<a href="javascript:alert(document.cookie)">, '
+            '<button formaction="javascript:alert(document.cookie)">\n'
+            "- Attribute event handlers: onload, onerror, onfocus (quoted and unquoted)\n"
+            "- JS string breakout: single quote, double quote, template literal contexts\n"
+            "- Filter bypass patterns: HTML entities, case variation, unusual whitespace, "
+            "mXSS (mutation XSS) patterns\n"
+            "- Navigation sinks: location.href, location.assign, window.open\n"
+            "Include at least 2 payloads per context class. Payloads must target alert(document.cookie)."
+        )
+        strategy_hint = (
+            _fast_omni_note if not strategy_hint
+            else f"{_fast_omni_note}\n\nAdditional context: {strategy_hint}"
+        )
+
     payloads, engine = _try_cloud(
         context=context,
         cloud_model=cloud_model,

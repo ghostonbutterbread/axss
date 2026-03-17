@@ -969,50 +969,66 @@ def _run(
     # Early exit if every param is a known tracking/analytics param — probe_url
     # would filter them all and return [], leading to a misleading "no_reflection"
     # status. Catch it here so the status and log message are accurate.
-    from ai_xss_generator.probe import _TRACKING_PARAM_BLOCKLIST, probe_url
+    from ai_xss_generator.probe import _TRACKING_PARAM_BLOCKLIST
     testable_params = {k for k in flat_params if k.lower() not in _TRACKING_PARAM_BLOCKLIST}
     if not testable_params:
         put_result(WorkerResult(url=url, status="no_params", waf=waf_hint))
         return
 
-    # ── Step 2: Pre-fetch URL cleanly — used for AI context (avoids a redundant
-    # network round-trip in parse_target later). The probe requests use modified
-    # URLs (canary injected), so this clean fetch is the only time we see the
-    # real page content.
+    # ── Steps 2-3: Pre-fetch + probe (skipped in fast mode) ──────────────────
     _prefetched_html: str | None = None
-    try:
-        from ai_xss_generator.probe import _BROWSER_REQUIRED_WAFS, fetch_html_with_browser
-        if waf_hint is not None and waf_hint.lower() in _BROWSER_REQUIRED_WAFS:
-            _prefetched_html = fetch_html_with_browser(
-                url,
-                auth_headers=auth_headers,
-                user_agent="axss/0.1 (+authorized security testing; playwright-prefetch)",
-            )
-        else:
-            from scrapling.fetchers import FetcherSession as _FS
-            with _FS(impersonate="chrome", stealthy_headers=True, timeout=20,
-                     follow_redirects=True, retries=1) as _fs:
-                _clean_resp = _fs.get(
+    probe_results: list[Any] = []
+    injectable: list[Any] = []
+    reflected: list[Any] = []
+    coordinated_attempts: list[Any] = []
+    target_disposition: Any = None
+
+    if fast:
+        # Fast mode: synthesise a ProbeResult for every testable param using the
+        # omni context — no network probing, all params assumed injectable.
+        from ai_xss_generator.probe import make_fast_probe_result
+        for _pn, _pv in flat_params.items():
+            if _pn.lower() not in testable_params:
+                continue
+            _synth = make_fast_probe_result(_pn, _pv)
+            probe_results.append(_synth)
+        injectable = list(probe_results)
+        reflected = list(probe_results)
+    else:
+        # Normal mode: pre-fetch for clean context, then probe.
+        try:
+            from ai_xss_generator.probe import _BROWSER_REQUIRED_WAFS, fetch_html_with_browser
+            if waf_hint is not None and waf_hint.lower() in _BROWSER_REQUIRED_WAFS:
+                _prefetched_html = fetch_html_with_browser(
                     url,
-                    headers={**(auth_headers or {}),
-                             "User-Agent": "axss/0.1 (+authorized security testing; scrapling)"},
+                    auth_headers=auth_headers,
+                    user_agent="axss/0.1 (+authorized security testing; playwright-prefetch)",
                 )
-                _prefetched_html = _clean_resp.text or (
-                    _clean_resp.body.decode("utf-8", errors="replace")
-                    if _clean_resp.body else None
-                )
-    except Exception as _exc:
-        log.debug("Pre-fetch of %s failed (parse_target will re-fetch): %s", url, _exc)
+            else:
+                from scrapling.fetchers import FetcherSession as _FS
+                with _FS(impersonate="chrome", stealthy_headers=True, timeout=20,
+                         follow_redirects=True, retries=1) as _fs:
+                    _clean_resp = _fs.get(
+                        url,
+                        headers={**(auth_headers or {}),
+                                 "User-Agent": "axss/0.1 (+authorized security testing; scrapling)"},
+                    )
+                    _prefetched_html = _clean_resp.text or (
+                        _clean_resp.body.decode("utf-8", errors="replace")
+                        if _clean_resp.body else None
+                    )
+        except Exception as _exc:
+            log.debug("Pre-fetch of %s failed (parse_target will re-fetch): %s", url, _exc)
 
-    # ── Step 3: Probe all params for reflection + char survival ──────────────
-    probe_results = probe_url(
-        url, rate=rate, waf=waf_hint, auth_headers=auth_headers,
-        sink_url=sink_url, crawled_pages=crawled_pages,
-    )
+        from ai_xss_generator.probe import probe_url
+        probe_results = probe_url(
+            url, rate=rate, waf=waf_hint, auth_headers=auth_headers,
+            sink_url=sink_url, crawled_pages=crawled_pages,
+        )
 
-    injectable = [r for r in probe_results if r.is_injectable]
-    reflected  = [r for r in probe_results if r.is_reflected]
-    coordinated_attempts = _coordinated_split_attempts(reflected)
+        injectable = [r for r in probe_results if r.is_injectable]
+        reflected  = [r for r in probe_results if r.is_reflected]
+        coordinated_attempts = _coordinated_split_attempts(reflected)
 
     # ── Step 4: Parse target HTML once — reused by local/cloud model helpers ─
     from ai_xss_generator.parser import parse_target as _parse_target
@@ -1029,90 +1045,91 @@ def _run(
         log.debug("Pre-parse of %s failed (will retry per-param): %s", url, exc)
 
     session_lessons: list[Any] = []
-    target_disposition: Any = None
-    try:
-        from ai_xss_generator.behavior import (
-            attach_behavior_profile,
-            build_target_behavior_profile,
-            classify_target_disposition,
-        )
-        from ai_xss_generator.learning import build_memory_profile
-        from ai_xss_generator.lessons import (
-            build_behavior_lessons,
-            build_mapping_lessons,
-            build_probe_lessons,
-        )
+    if not fast:
+        # Behavior/disposition/lessons block — skipped in fast mode.
+        try:
+            from ai_xss_generator.behavior import (
+                attach_behavior_profile,
+                build_target_behavior_profile,
+                classify_target_disposition,
+            )
+            from ai_xss_generator.learning import build_memory_profile
+            from ai_xss_generator.lessons import (
+                build_behavior_lessons,
+                build_mapping_lessons,
+                build_probe_lessons,
+            )
 
-        behavior_profile = build_target_behavior_profile(
-            url=url,
-            delivery_mode="get",
-            waf_name=waf_hint,
-            auth_required=bool(auth_headers),
-            context=_cached_context,
-            probe_results=probe_results,
-        )
-        _cached_context = attach_behavior_profile(_cached_context, behavior_profile)
-        target_disposition = classify_target_disposition(
-            _cached_context,
-            delivery_mode="get",
-            reflected_params=len(reflected),
-            injectable_params=len(injectable),
-            coordinated_attempts=len(coordinated_attempts),
-        )
-
-        memory_profile = build_memory_profile(
-            context=_cached_context,
-            waf_name=waf_hint,
-            delivery_mode="get",
-            target_host=parsed.netloc,
-        )
-        if auth_headers:
-            memory_profile["auth_required"] = True
-        session_lessons.extend(build_behavior_lessons(behavior_profile))
-        if _cached_context is not None:
-            session_lessons.extend(build_mapping_lessons(
-                _cached_context,
-                memory_profile=memory_profile,
-            ))
-        if reflected:
-            session_lessons.extend(build_probe_lessons(
-                reflected,
-                memory_profile=memory_profile,
+            behavior_profile = build_target_behavior_profile(
+                url=url,
                 delivery_mode="get",
+                waf_name=waf_hint,
+                auth_required=bool(auth_headers),
+                context=_cached_context,
+                probe_results=probe_results,
+            )
+            _cached_context = attach_behavior_profile(_cached_context, behavior_profile)
+            target_disposition = classify_target_disposition(
+                _cached_context,
+                delivery_mode="get",
+                reflected_params=len(reflected),
+                injectable_params=len(injectable),
+                coordinated_attempts=len(coordinated_attempts),
+            )
+
+            memory_profile = build_memory_profile(
+                context=_cached_context,
+                waf_name=waf_hint,
+                delivery_mode="get",
+                target_host=parsed.netloc,
+            )
+            if auth_headers:
+                memory_profile["auth_required"] = True
+            session_lessons.extend(build_behavior_lessons(behavior_profile))
+            if _cached_context is not None:
+                session_lessons.extend(build_mapping_lessons(
+                    _cached_context,
+                    memory_profile=memory_profile,
+                ))
+            if reflected:
+                session_lessons.extend(build_probe_lessons(
+                    reflected,
+                    memory_profile=memory_profile,
+                    delivery_mode="get",
+                ))
+        except Exception as exc:
+            log.debug("Session lesson build failed for %s: %s", url, exc)
+
+        if not reflected:
+            put_result(WorkerResult(
+                url=url,
+                status="no_reflection",
+                waf=waf_hint,
+                params_tested=len(flat_params),
+                dead_target=True,
+                dead_reason=(
+                    getattr(target_disposition, "reason", "")
+                    or "No reflection was confirmed during bounded discovery."
+                ),
+                target_tier=getattr(target_disposition, "tier", "hard_dead"),
             ))
-    except Exception as exc:
-        log.debug("Session lesson build failed for %s: %s", url, exc)
+            return
 
-    if not reflected:
-        put_result(WorkerResult(
-            url=url,
-            status="no_reflection",
-            waf=waf_hint,
-            params_tested=len(flat_params),
-            dead_target=True,
-            dead_reason=(
-                getattr(target_disposition, "reason", "")
-                or "No reflection was confirmed during bounded discovery."
-            ),
-            target_tier=getattr(target_disposition, "tier", "hard_dead"),
-        ))
-        return
-
-    if not injectable and not coordinated_attempts:
-        put_result(WorkerResult(
-            url=url,
-            status="no_reflection",
-            waf=waf_hint,
-            params_tested=len(flat_params),
-            params_reflected=len(reflected),
-            dead_target=True,
-            dead_reason=(
-                getattr(target_disposition, "reason", "")
-                or "Reflection exists, but no executable context was confirmed."
-            ),
-            target_tier=getattr(target_disposition, "tier", "soft_dead"),
-        ))
-        return
+        if not injectable and not coordinated_attempts:
+            put_result(WorkerResult(
+                url=url,
+                status="no_reflection",
+                waf=waf_hint,
+                params_tested=len(flat_params),
+                params_reflected=len(reflected),
+                dead_target=True,
+                dead_reason=(
+                    getattr(target_disposition, "reason", "")
+                    or "Reflection exists, but no executable context was confirmed."
+                ),
+                target_tier=getattr(target_disposition, "tier", "soft_dead"),
+            ))
+            return
 
     # ── Step 5: Start Playwright executor (shared for all payload attempts) ──
     from ai_xss_generator.active.executor import ActiveExecutor
@@ -1192,9 +1209,9 @@ def _run(
 
                 # Local model triage gate — decides whether this injection point
                 # is worth cloud API spend. It does NOT generate payloads.
-                # In --fast mode triage is skipped and cloud always runs.
+                # In --fast mode or fast_omni context, triage is skipped and cloud always runs.
                 _triage_approved = True  # default when local model unavailable
-                if escalation_policy.use_local and not context_done and not _timed_out():
+                if context_type != "fast_omni" and escalation_policy.use_local and not context_done and not _timed_out():
                     local_model_rounds += 1
                     _triage = _triage_with_local_model(
                         probe_result=context_probe_result,
@@ -1232,6 +1249,65 @@ def _run(
                     seen_cloud_payloads: set[str] = set()
                     fast_generated_count = 0
                     fast_reflected_count = 0
+
+                    # fast_omni: single cloud call with broad-spectrum prompt,
+                    # no feedback loop, no deep escalation.
+                    if context_type == "fast_omni":
+                        cloud_escalated = True
+                        cloud_model_rounds += 1
+                        cloud_plan = _coerce_cloud_plan(_get_fast_omni_payloads(
+                            url=url,
+                            param_name=param_name,
+                            cloud_model=cloud_model,
+                            waf=waf_hint,
+                            ekey=ekey,
+                            dedup_registry=dedup_registry,
+                            dedup_lock=dedup_lock,
+                            base_context=_cached_context,
+                            auth_headers=auth_headers,
+                            ai_backend=ai_backend,
+                            cli_tool=cli_tool,
+                            cli_model=cli_model,
+                            session_lessons=session_lessons,
+                        ))
+                        cloud_payloads, _ = _unique_new_payloads(cloud_plan.payloads, seen_cloud_payloads)
+                        fast_generated_count += len(cloud_payloads)
+                        for cp in cloud_payloads:
+                            if _timed_out():
+                                break
+                            total_transforms_tried += 1
+                            _cp_text = _payload_text(cp)
+                            result = executor.fire(
+                                url=url,
+                                param_name=param_name,
+                                payload=_cp_text,
+                                all_params=flat_params,
+                                transform_name="cloud_model",
+                                sink_url=sink_url,
+                                payload_candidate=cp,
+                            )
+                            _ai_tried_payloads.append((_cp_text, "cloud_model"))
+                            if result.confirmed:
+                                finding = _make_finding(
+                                    url=url,
+                                    probe_result=context_probe_result,
+                                    context_type=context_type,
+                                    result=result,
+                                    waf=waf_hint,
+                                    source="cloud_model",
+                                    cloud_escalated=True,
+                                    ai_engine=cloud_plan.engine,
+                                    ai_note=_merge_ai_notes(
+                                        escalation_policy.note,
+                                        cloud_plan.note,
+                                    ),
+                                )
+                                _record_context_finding(finding)
+                                if len(context_variant_keys) >= context_hit_cap:
+                                    context_done = True
+                                    break
+                        # Skip the normal attempt loop for fast_omni
+                        continue  # next (param_name, context_type, variants) tuple
 
                     for attempt_number in range(1, attempt_limit + 1):
                         if _timed_out():
@@ -3138,6 +3214,82 @@ def _get_cloud_payloads(
                 "engine": result_plan.engine,
                 "note": result_plan.note,
             }
+
+    return result_plan
+
+
+def _get_fast_omni_payloads(
+    url: str,
+    param_name: str,
+    cloud_model: str,
+    waf: str | None,
+    ekey: str,
+    dedup_registry: DictProxy,
+    dedup_lock: Any,
+    base_context: Any = None,
+    auth_headers: dict[str, str] | None = None,
+    ai_backend: str = "api",
+    cli_tool: str = "claude",
+    cli_model: str | None = None,
+    session_lessons: list[Any] | None = None,
+) -> CloudPayloadPlan:
+    """Generate payloads in fast omni mode (no probe was run).
+
+    Passes ``phase_profile="fast_omni"`` to ``generate_cloud_payloads`` so the
+    prompt is augmented with broad-spectrum multi-context instructions.
+    No probe_result enrichment is performed — base_context is passed directly.
+    """
+    use_dedup = True
+    with dedup_lock:
+        if ekey in dedup_registry:
+            log.debug("Dedup hit — reusing fast_omni cloud result for key %s", ekey[:12])
+            cached = dict(dedup_registry[ekey])
+            return _coerce_cloud_plan(cached)
+
+    try:
+        from ai_xss_generator.models import generate_cloud_payloads
+        from ai_xss_generator.learning import build_memory_profile
+
+        if base_context is None:
+            from ai_xss_generator.parser import parse_target
+            base_context = parse_target(url=url, html_value=None, waf=waf, auth_headers=auth_headers)
+
+        # No probe enrichment — pass base_context directly
+        memory_profile = build_memory_profile(
+            context=base_context,
+            waf_name=waf,
+            delivery_mode="get",
+        )
+        payloads, engine = generate_cloud_payloads(
+            context=base_context,
+            cloud_model=cloud_model,
+            waf=waf,
+            past_lessons=session_lessons,
+            ai_backend=ai_backend,
+            cli_tool=cli_tool,
+            cli_model=cli_model,
+            memory_profile=memory_profile,
+            phase_profile="fast_omni",
+        )
+        result_plan = CloudPayloadPlan(
+            payloads=[p.payload for p in payloads if p.payload],
+            engine=engine,
+            note=_cloud_note_for_engine(
+                ai_backend=ai_backend,
+                requested_cli_tool=cli_tool,
+                engine=engine,
+            ),
+        )
+    except Exception as exc:
+        log.debug("Fast omni cloud escalation failed for %s: %s", url, exc)
+        result_plan = CloudPayloadPlan()
+
+    with dedup_lock:
+        dedup_registry[ekey] = {
+            "payloads": list(result_plan.payloads),
+            "engine": result_plan.engine,
+            "note": result_plan.note,
+        }
 
     return result_plan
 
