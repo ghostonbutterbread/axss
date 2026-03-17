@@ -6,9 +6,11 @@ AI-assisted XSS scanning for authorized testing. `axss` crawls a target, probes 
 
 - Reflected XSS: GET parameter discovery, probing, payload generation, browser confirmation
 - Stored XSS: POST form submission, sink auto-discovery, sink-context override before generation
-- DOM XSS: runtime source->sink discovery with AI-generated payloads and static fallbacks
+- DOM XSS: runtime source→sink discovery with AI-generated payloads and static fallbacks
 - Blind XSS: OOB token injection for payloads that execute out-of-band (admin panels, logs, emails) — **requires `--blind-callback URL`**; disabled by default
+- href/formaction bypass: detects `javascript:` URI injection points (e.g. `<a href="javascript:...">`) and clicks them post-navigation to confirm execution
 - Fast-by-default generation: compact scout prompts first, deeper phased prompts only when needed
+- Scan artifact caching: sitemap and probe results cached 24 h so re-runs reuse prior work
 
 ## Setup
 
@@ -22,20 +24,26 @@ axss --help
 ## Quick start
 
 ```bash
-# Full active scan
+# Full active scan (fast mode by default)
 axss -u "https://target.tld" --active
 
-# Generate payloads only
-axss -u "https://target.tld/search?q=test" --generate
+# Skip probe — broad-spectrum payloads, fastest possible scan
+axss -u "https://target.tld" --active --fast
+
+# Full phased generation on every attempt
+axss -u "https://target.tld" --active --deep
+
+# Maximum coverage: skip probe AND run full 3-phase generation
+axss -u "https://target.tld" --active --obliterate
 
 # Stored XSS only
-axss -u "https://target.tld/account" --stored
+axss -u "https://target.tld" --stored
 
 # DOM XSS only
 axss -u "https://target.tld" --dom
 
-# Force deep phased prompting on every attempt
-axss -u "https://target.tld" --active --deep
+# Ignore all caches, re-collect everything from scratch
+axss -u "https://target.tld" --active --fresh
 ```
 
 ## Visual flow
@@ -43,14 +51,19 @@ axss -u "https://target.tld" --active --deep
 ```text
 active scan
 
-  crawl / enumerate
+  check sitemap cache (~/.axss/cache/<host>/sitemap_*.json)
+  - hit: skip crawl, use cached CrawlResult
+  - miss: crawl / enumerate → write cache
          |
          v
-  probe target behavior
-  - reflection context
-  - surviving chars
-  - DOM taint source -> sink
-  - stored sink discovery
+  check probe cache per URL (~/.axss/cache/<host>/probe_*.json)
+  - hit: skip probe, use real reflection contexts at zero cost
+  - --fast / --obliterate: use cache if present, else synthesize fast_omni
+  - miss: probe target behavior
+    - reflection context + surviving chars
+    - DOM taint source → sink
+    - stored sink discovery
+    → write cache
          |
          v
   build compact AI context
@@ -60,27 +73,37 @@ active scan
          |
          v
   generate payloads
-  - default: fast scout rounds
-  - optional: deeper contextual / research escalation
+  - default: fast scout round, escalate on failure
+  - --deep: full 3-phase (scout → contextual → research) on every attempt
+  - --fast: broad-spectrum single call, no probe context needed
+  - --obliterate: broad-spectrum + full 3-phase (maximum throughput + depth)
          |
          v
   execute in Playwright
+  - click javascript: href/formaction elements post-injection
          |
          v
   confirm execution
-  - dialog
-  - console
-  - network
-  - DOM runtime
+  - dialog / console / network / DOM runtime
 ```
 
-## Current behavior
+## Scan modes
 
-- Default mode is fast-first. Scout prompts run first and deep escalation happens only after scout attempts fail.
-- `--deep` restores full phased generation on every attempt.
-- Stored XSS no longer depends on `--sink-url`; redirects and crawled-page canary sweeps are used automatically when possible.
-- DOM XSS is AI-first. Static sink payloads are now seeds and fallbacks, not the primary strategy.
-- Blind XSS is **off by default**. It only runs when `--blind-callback URL` is explicitly provided. Without it, no OOB payloads are sent and no token manifest is written.
+| Flag | Probe | Phases | Best for |
+|------|-------|--------|----------|
+| *(default)* | full | scout → escalate | general use |
+| `--fast` | skip | 1 broad-spectrum | quick triage, known-clean targets |
+| `--deep` | full | 3 phases always | thorough, hard-to-hit contexts |
+| `--obliterate` | skip | 3 phases broad-spectrum | maximum speed + maximum payload variety |
+
+## Cache behavior
+
+Scan artifacts are stored under `~/.axss/cache/<netloc>/` and expire after **24 hours**.
+
+- **Sitemap cache**: reused when the same seed URL + scope is scanned again — skips full BFS re-crawl.
+- **Probe cache**: reused per URL+params. When a `--fast` or `--obliterate` scan finds a probe cache entry from a prior normal scan, it uses real reflection contexts instead of the synthetic broad-spectrum fallback — better-targeted generation at zero extra network cost.
+- **`--fresh`**: bypass both caches and re-collect everything from scratch.
+- `--urls FILE` mode never writes or reads the sitemap cache (URL list was pre-enumerated by the user).
 
 ## Useful commands
 
@@ -104,6 +127,12 @@ axss -u "https://target.tld" --active --blind-callback "https://abc123.oast.pro"
 # Check which blind tokens have fired since the scan
 axss --poll-blind ~/.axss/reports/<report-dir>/blind_tokens.json \
      --blind-callback "https://abc123.oast.pro"
+
+# Re-scan without re-crawling (probe cache still applies)
+axss -u "https://target.tld" --active --fast
+
+# Force full fresh scan — ignore all cached artifacts
+axss -u "https://target.tld" --active --obliterate --fresh
 ```
 
 ## Notes
@@ -111,5 +140,6 @@ axss --poll-blind ~/.axss/reports/<report-dir>/blind_tokens.json \
 - Use only on systems you are authorized to test.
 - `--sink-url` is still supported as a manual override for stored XSS, but it is no longer required for common same-session sinks.
 - Reports are written under `~/.axss/reports/`.
+- Cache files live under `~/.axss/cache/` — safe to delete manually to free space.
 
 If you're an agent, refer to [AGENT_README.md](AGENT_README.md).
