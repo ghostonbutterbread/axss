@@ -28,7 +28,7 @@ from ai_xss_generator.crawler import (
     _same_origin,
     _testable_params,
 )
-from ai_xss_generator.types import PostFormTarget
+from ai_xss_generator.types import PostFormTarget, UploadTarget
 
 log = logging.getLogger(__name__)
 
@@ -106,7 +106,7 @@ def _extract_links_from_dom(page: object, base_url: str) -> list[str]:  # type: 
 def _extract_forms_from_dom(page: object, base_url: str) -> list[dict]:  # type: ignore[type-arg]
     """Return raw form descriptors extracted from the live DOM.
 
-    Each descriptor is a dict with keys: action, method, fields.
+    Each descriptor is a dict with keys: action, method, enctype, fields.
     fields is a list of [name, type, value] triples.
     """
     try:
@@ -114,6 +114,7 @@ def _extract_forms_from_dom(page: object, base_url: str) -> list[dict]:  # type:
             """() => Array.from(document.querySelectorAll('form')).map(form => ({
                 action: form.getAttribute('action') || '',
                 method: (form.method || 'get').toUpperCase(),
+                enctype: (form.enctype || form.getAttribute('enctype') || '').toLowerCase(),
                 fields: Array.from(
                     form.querySelectorAll('input, textarea, select')
                 ).filter(el => el.name && el.name.trim() !== '')
@@ -130,7 +131,7 @@ def _extract_forms_from_dom(page: object, base_url: str) -> list[dict]:  # type:
         return []
 
 
-_FORM_SKIP_TYPES = frozenset({"submit", "button", "image", "reset", "file"})
+_FORM_SKIP_TYPES = frozenset({"submit", "button", "image", "reset"})
 
 
 def _process_raw_forms(
@@ -138,14 +139,16 @@ def _process_raw_forms(
     final_url: str,
     seen_post_keys: set[str],
     post_forms: list[PostFormTarget],
+    upload_targets: list[UploadTarget],
 ) -> None:
-    """Convert raw form dicts into PostFormTarget objects (in-place)."""
+    """Convert raw form dicts into PostFormTarget / UploadTarget objects."""
     for raw_form in raw_forms:
         method = raw_form.get("method", "GET")
         if method != "POST":
             continue
 
         action = raw_form.get("action", "")
+        enctype = str(raw_form.get("enctype", "") or "").lower()
         fields: list[list[str]] = raw_form.get("fields", [])
 
         abs_action = _resolve(action, final_url) if action else final_url
@@ -155,9 +158,13 @@ def _process_raw_forms(
         csrf_field: str | None = None
         hidden_defaults: dict[str, str] = {}
         param_names: list[str] = []
+        file_field_names: list[str] = []
 
         for field in fields:
             name, ftype, value = field[0], field[1], field[2] if len(field) > 2 else ""
+            if ftype == "file":
+                file_field_names.append(name)
+                continue
             if ftype in _FORM_SKIP_TYPES:
                 continue
             if ftype == "hidden":
@@ -166,6 +173,26 @@ def _process_raw_forms(
                 csrf_field = name
             else:
                 param_names.append(name)
+
+        if file_field_names or "multipart/form-data" in enctype:
+            upload_key = (
+                f"{abs_action}[files:{','.join(sorted(file_field_names))}]"
+                f"[fields:{','.join(sorted(param_names))}]"
+            )
+            if upload_key not in seen_post_keys:
+                seen_post_keys.add(upload_key)
+                upload_targets.append(UploadTarget(
+                    action_url=abs_action,
+                    source_page_url=final_url,
+                    file_field_names=file_field_names or ["file"],
+                    companion_field_names=param_names,
+                    csrf_field=csrf_field,
+                    hidden_defaults=hidden_defaults,
+                ))
+                log.debug(
+                    "Browser crawl — upload form: action=%s files=%s params=%s csrf=%s",
+                    abs_action, file_field_names, param_names, csrf_field,
+                )
 
         if not param_names:
             continue
@@ -222,6 +249,7 @@ def browser_crawl(
     ordered_targets: list[str] = []
     seen_post_keys: set[str] = set()
     post_forms: list[PostFormTarget] = []
+    upload_targets: list[UploadTarget] = []
 
     # Mutable container for network-intercepted URLs (populated from event handler)
     intercepted: list[str] = []
@@ -334,7 +362,13 @@ def browser_crawl(
 
                     # Extract forms from live DOM (always — even at max depth)
                     raw_forms = _extract_forms_from_dom(page, final_url)
-                    _process_raw_forms(raw_forms, final_url, seen_post_keys, post_forms)
+                    _process_raw_forms(
+                        raw_forms,
+                        final_url,
+                        seen_post_keys,
+                        post_forms,
+                        upload_targets,
+                    )
 
                 # Absorb any intercepted XHR/fetch targets discovered on this level
                 for iurl in intercepted:
@@ -358,11 +392,12 @@ def browser_crawl(
                 pass
 
     log.info(
-        "Browser crawl complete: %d page(s) visited | %d GET target(s) | %d POST form(s)",
-        len(visited_pages), len(ordered_targets), len(post_forms),
+        "Browser crawl complete: %d page(s) visited | %d GET target(s) | %d POST form(s) | %d upload form(s)",
+        len(visited_pages), len(ordered_targets), len(post_forms), len(upload_targets),
     )
     return CrawlResult(
         get_urls=ordered_targets,
         post_forms=post_forms,
+        upload_targets=upload_targets,
         visited_urls=all_fetched_urls,
     )

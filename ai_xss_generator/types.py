@@ -17,6 +17,7 @@ class FormField:
 class FormContext:
     action: str
     method: str
+    enctype: str = ""
     fields: list[FormField] = field(default_factory=list)
 
 
@@ -51,8 +52,40 @@ class ParsedContext:
     notes: list[str] = field(default_factory=list)
     parser_plugins: list[str] = field(default_factory=list)
     auth_notes: list[str] = field(default_factory=list)
+    waf_knowledge: dict[str, Any] | None = None
     """Redacted notes about active authentication (e.g. 'Authorization header present').
     Never contains credential values — informational for the LLM prompt only."""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class StrategyProfile:
+    attack_family: str = ""
+    delivery_mode_hint: str = ""
+    encoding_hint: str = ""
+    session_hint: str = ""
+    follow_up_hint: str = ""
+    coordination_hint: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class WafKnowledgeProfile:
+    source_type: str = "local_repo"
+    source_ref: str = ""
+    engine_name: str = ""
+    confidence: float = 0.0
+    normalization: dict[str, Any] = field(default_factory=dict)
+    matching: dict[str, Any] = field(default_factory=dict)
+    likely_pressure_points: list[str] = field(default_factory=list)
+    likely_blind_spots: list[str] = field(default_factory=list)
+    preferred_strategies: list[str] = field(default_factory=list)
+    avoid_strategies: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -67,8 +100,10 @@ class PayloadCandidate:
     tags: list[str] = field(default_factory=list)
     target_sink: str = ""
     framework_hint: str = ""
+    bypass_family: str = ""
     risk_score: int = 0
     source: str = "heuristic"
+    strategy: StrategyProfile | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -93,6 +128,29 @@ class PostFormTarget:
     hidden_defaults: dict[str, str]
     """All hidden field name→value pairs from the form as discovered.
     Used as fallback when a fresh CSRF fetch fails."""
+
+
+@dataclass(slots=True)
+class UploadTarget:
+    """A multipart/form-data upload form discovered during crawling."""
+
+    action_url: str
+    """Absolute URL to submit the upload form to."""
+
+    source_page_url: str
+    """Page where the upload form was found."""
+
+    file_field_names: list[str]
+    """File input names present in the form."""
+
+    companion_field_names: list[str]
+    """Non-file injectable companion fields submitted alongside the file."""
+
+    csrf_field: str | None
+    """Detected CSRF token field, if present."""
+
+    hidden_defaults: dict[str, str]
+    """Hidden field defaults captured from the form."""
 
 
 @dataclass(slots=True)

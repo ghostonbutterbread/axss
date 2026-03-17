@@ -32,8 +32,23 @@ BRIGHT_CYAN = "\033[96m"
 WHITE = "\033[37m"
 
 
+# Global verbosity level — 0=normal, 1=-v, 2=-vv
+# Set once in main() before spawning workers (inherited via fork on Linux).
+VERBOSE_LEVEL: int = 0
+
+
+def set_verbose_level(level: int) -> None:
+    global VERBOSE_LEVEL
+    VERBOSE_LEVEL = level
+
+
 def _tty() -> bool:
     return hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+
+
+def dynamic_ui_enabled() -> bool:
+    """True when status bars and pinned panels are safe to render."""
+    return _tty() and VERBOSE_LEVEL < 2
 
 
 def _c(code: str, text: str) -> str:
@@ -94,6 +109,16 @@ def dim_line(message: str) -> None:
     _after_print()
 
 
+def debug(message: str) -> None:
+    """[.] Trace output — only printed at -vv (VERBOSE_LEVEL >= 2)."""
+    if VERBOSE_LEVEL < 2:
+        return
+    _before_print()
+    prefix = _c(DIM, "[.]") if _tty() else "[.]"
+    print(f"{prefix} {message}", flush=True)
+    _after_print()
+
+
 def risk_color(score: int) -> str:
     """Return ANSI color code based on risk score (only when TTY)."""
     if not _tty():
@@ -134,7 +159,7 @@ def _before_print() -> None:
     """Erase the status bar line so the upcoming print lands cleanly."""
     if _panel_active:
         return  # scroll region keeps panel pinned — nothing to erase
-    if _status_active and _tty():
+    if _status_active and dynamic_ui_enabled():
         sys.stdout.write("\r\033[2K")
         # No explicit flush — the print() call flushes immediately after.
 
@@ -144,7 +169,7 @@ def _after_print() -> None:
     if _panel_active:
         _redraw_panel()
         return
-    if _status_active and _status_text and _tty():
+    if _status_active and _status_text and dynamic_ui_enabled():
         sys.stdout.write(_status_text)
         sys.stdout.flush()
 
@@ -154,7 +179,7 @@ def set_status_bar(text: str) -> None:
     global _status_text, _status_active
     _status_active = True
     _status_text = text
-    if _tty():
+    if dynamic_ui_enabled():
         sys.stdout.write("\r\033[2K" + text)
         sys.stdout.flush()
 
@@ -163,7 +188,7 @@ def update_status_bar(text: str) -> None:
     """Overwrite the status bar text in-place."""
     global _status_text
     _status_text = text
-    if _status_active and _tty():
+    if _status_active and dynamic_ui_enabled():
         sys.stdout.write("\r\033[2K" + text)
         sys.stdout.flush()
 
@@ -171,7 +196,7 @@ def update_status_bar(text: str) -> None:
 def clear_status_bar() -> None:
     """Erase the status bar line and deactivate it."""
     global _status_active, _status_text
-    if _tty() and _status_active:
+    if dynamic_ui_enabled() and _status_active:
         sys.stdout.write("\r\033[2K")
         sys.stdout.flush()
     _status_active = False
@@ -203,7 +228,7 @@ def _term_rows_cols() -> tuple[int, int]:
 
 def _redraw_panel() -> None:
     """Internal: repaint panel rows from _panel_content without updating content."""
-    if not _panel_active or not _tty():
+    if not _panel_active or not dynamic_ui_enabled():
         return
     rows, _ = _term_rows_cols()
     out = ["\033[s"]  # save cursor
@@ -222,7 +247,7 @@ def setup_panel() -> None:
     calls stay within the scroll region and never touch the panel rows.
     """
     global _panel_active, _panel_content
-    if not _tty():
+    if not dynamic_ui_enabled():
         return
     rows, _ = _term_rows_cols()
     scroll_bottom = rows - _PANEL_LINES
@@ -243,7 +268,7 @@ def setup_panel() -> None:
 def update_panel(sep: str, bar: str, workers: str) -> None:
     """Update panel content and repaint.  Call from the orchestrator loop."""
     global _panel_content
-    if not _tty():
+    if not dynamic_ui_enabled():
         return
     _panel_content = [sep, bar, workers]
     _redraw_panel()
@@ -255,7 +280,7 @@ def teardown_panel() -> None:
     Call in the finally block after the active scan loop exits.
     """
     global _panel_active, _panel_content
-    if not _tty() or not _panel_active:
+    if not dynamic_ui_enabled() or not _panel_active:
         _panel_active = False
         return
     rows, _ = _term_rows_cols()

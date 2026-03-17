@@ -20,9 +20,38 @@ SELECTED_MODEL=""
 # CLI tool detection results (set by detect_cli_tools)
 DETECTED_CLI_BACKEND="api"
 DETECTED_CLI_TOOL="claude"
+CONFIG_MODE="basic"
 
 have_cmd() {
   command -v "$1" >/dev/null 2>&1
+}
+
+file_sha256() {
+  local path="$1"
+  if have_cmd sha256sum; then
+    sha256sum "$path" | awk '{print $1}'
+    return 0
+  fi
+  if have_cmd shasum; then
+    shasum -a 256 "$path" | awk '{print $1}'
+    return 0
+  fi
+  if have_cmd openssl; then
+    openssl dgst -sha256 "$path" | awk '{print $NF}'
+    return 0
+  fi
+  return 1
+}
+
+playwright_install_args() {
+  case "$(uname -s 2>/dev/null || echo unknown)" in
+    Linux)
+      echo "chromium --with-deps"
+      ;;
+    *)
+      echo "chromium"
+      ;;
+  esac
 }
 
 # Resolve the system Python 3 executable (python3 > python > error).
@@ -164,6 +193,49 @@ detect_cli_tools() {
   fi
 }
 
+select_config_mode() {
+  if [ -f "$CONFIG_PATH" ]; then
+    CONFIG_MODE="preserve"
+    return 0
+  fi
+
+  if [ ! -t 0 ]; then
+    CONFIG_MODE="basic"
+    echo "No existing config found and setup is non-interactive — defaulting to the basic config."
+    echo "You can switch to the advanced layout later by editing $CONFIG_PATH."
+    return 0
+  fi
+
+  echo
+  echo "Choose an initial AXSS config layout."
+  echo "Basic is simpler and best if you want AXSS working quickly with minimal config."
+  echo "Advanced separates generation and reasoning roles and leaves room for fallbacks."
+  echo "You can change this later by editing $CONFIG_PATH."
+  echo
+  echo "Options:"
+  echo "  1) Basic"
+  echo "  2) Advanced"
+  echo
+
+  while true; do
+    read -r -p "Select config layout [1/2] (default 1): " choice
+    choice="${choice:-1}"
+    case "$choice" in
+      1)
+        CONFIG_MODE="basic"
+        return 0
+        ;;
+      2)
+        CONFIG_MODE="advanced"
+        return 0
+        ;;
+      *)
+        echo "Please enter 1 or 2."
+        ;;
+    esac
+  done
+}
+
 install_ollama_if_needed() {
   if have_cmd ollama; then
     return 0
@@ -205,7 +277,7 @@ pull_selected_model() {
   if ollama pull "$SELECTED_MODEL"; then
     return 0
   fi
-  echo "Warning: unable to pull selected model $SELECTED_MODEL; keeping it as default_model in config" >&2
+  echo "Warning: unable to pull selected model $SELECTED_MODEL; keeping it as local_model in config" >&2
   return 1
 }
 
@@ -213,13 +285,15 @@ init_axss_dir() {
   # 1. Main config dir — private to owner
   mkdir -p "$CONFIG_DIR"
   chmod 700 "$CONFIG_DIR"
+  mkdir -p "$CONFIG_DIR/reports" "$CONFIG_DIR/sessions"
+  chmod 700 "$CONFIG_DIR/reports" "$CONFIG_DIR/sessions"
 
   # 2. config.json — create with defaults on first run; on subsequent runs only
-  #    update default_model + detected CLI backend so user edits to other fields
-  #    (use_cloud, cloud_model, cli_model, etc.) are preserved.
-  "$PYTHON" - "$CONFIG_PATH" "$SELECTED_MODEL" "$DETECTED_CLI_BACKEND" "$DETECTED_CLI_TOOL" <<'PYEOF'
+  #    update the local model recommendation + detected AI defaults so user edits
+  #    to other fields are preserved.
+  "$PYTHON" - "$CONFIG_PATH" "$SELECTED_MODEL" "$DETECTED_CLI_BACKEND" "$DETECTED_CLI_TOOL" "$CONFIG_MODE" <<'PYEOF'
 import json, sys
-path, model, backend, cli_tool = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+path, model, backend, cli_tool, config_mode = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 try:
     with open(path) as f:
         cfg = json.load(f)
@@ -227,22 +301,104 @@ try:
         cfg = {}
 except Exception:
     cfg = {}
-# Always update hardware-detected model recommendation.
-cfg["default_model"] = model
-# Seed auto-detected CLI backend/tool only on first run; preserve user edits after that.
-cfg.setdefault("ai_backend", backend)
-cfg.setdefault("cli_tool", cli_tool)
-# Write defaults for keys the user hasn't set yet.
-cfg.setdefault("use_cloud", True)
-cfg.setdefault("cloud_model", "anthropic/claude-3-5-sonnet")
-cfg.setdefault("cli_model", None)
-try:
-    with open(path, "w") as f:
-        json.dump(cfg, f, indent=2)
-        f.write("\n")
-except Exception as e:
-    print(f"Error: could not write config {path}: {e}", file=sys.stderr)
-    sys.exit(1)
+
+is_new_config = not bool(cfg)
+
+
+def emit_basic_config(config_path: str, *, model: str, backend: str, cli_tool: str) -> None:
+    cloud_model = "anthropic/claude-3-5-sonnet"
+    lines = [
+        "{",
+        '  // Local Ollama model used before any remote escalation.',
+        f'  "local_model": {json.dumps(model)},',
+        "",
+        '  // Uses more than just the local model. Set to false to stay local-only.',
+        '  "enable_remote_escalation": true,',
+        "",
+        '  // Remote AI backend: "cli" for Claude/Codex CLI, "api" for hosted APIs.',
+        f'  "ai_backend": {json.dumps(backend)},',
+        "",
+        '  // CLI tool to use when ai_backend is "cli". Options: "claude" or "codex".',
+        f'  "cli_tool": {json.dumps(cli_tool)},',
+        "",
+        '  // CLI model override when ai_backend is "cli". Use null for the tool default,',
+        '  // or set the exact model string the CLI expects.',
+        '  "cli_model": null,',
+        "",
+        '  // Preferred hosted model when ai_backend is "api". Use the provider/model format,',
+        '  // for example "anthropic/claude-3-5-sonnet" or "openai/gpt-4.1-mini".',
+        f'  "cloud_model": {json.dumps(cloud_model)}',
+        "}",
+        "",
+    ]
+    with open(config_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+
+def emit_advanced_config(config_path: str, *, model: str, backend: str, cli_tool: str) -> None:
+    cloud_model = "anthropic/claude-3-5-sonnet"
+    role_model = None if backend == "cli" else cloud_model
+    role_model_json = "null" if role_model is None else json.dumps(role_model)
+    lines = [
+        "{",
+        '  // Local Ollama model used before any remote escalation.',
+        f'  "local_model": {json.dumps(model)},',
+        "",
+        '  // Uses more than just the local model. Set to false to stay local-only.',
+        '  "enable_remote_escalation": true,',
+        "",
+        '  // Advanced role-based AI routing. generation handles payload creation,',
+        '  // reasoning is reserved for analysis and planning.',
+        '  "ai": {',
+        '    "roles": {',
+        '      "generation": {',
+        '        // "cli" uses Claude/Codex CLI. "api" uses hosted API models.',
+        f'        "backend": {json.dumps(backend)},',
+        '        // For CLI roles use "claude" or "codex". For API roles this stays "api".',
+        f'        "tool": {json.dumps(cli_tool if backend == "cli" else "api")},',
+        '        // CLI roles can use null for the tool default. API roles should use',
+        '        // provider/model strings like "anthropic/claude-3-5-sonnet".',
+        f'        "model": {role_model_json},',
+        '        "fallback_models": []',
+        '      },',
+        '      "reasoning": {',
+        '        "backend": ' + json.dumps(backend) + ',',
+        '        "tool": ' + json.dumps(cli_tool if backend == "cli" else "api") + ',',
+        f'        "model": {role_model_json},',
+        '        "fallback_models": []',
+        '      }',
+        '    }',
+        '  }',
+        "}",
+        "",
+    ]
+    with open(config_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+if is_new_config and config_mode == "advanced":
+    emit_advanced_config(path, model=model, backend=backend, cli_tool=cli_tool)
+elif is_new_config:
+    emit_basic_config(path, model=model, backend=backend, cli_tool=cli_tool)
+else:
+    # Always update hardware-detected local model recommendation.
+    cfg["local_model"] = model
+    if "default_model" in cfg:
+        cfg["default_model"] = model
+    # Seed auto-detected CLI backend/tool only on first run; preserve user edits after that.
+    cfg.setdefault("ai_backend", backend)
+    cfg.setdefault("cli_tool", cli_tool)
+    # Write defaults for keys the user hasn't set yet.
+    cfg.setdefault("enable_remote_escalation", cfg.get("use_cloud", True))
+    cfg.setdefault("use_cloud", cfg.get("enable_remote_escalation", True))
+    cfg.setdefault("cloud_model", "anthropic/claude-3-5-sonnet")
+    cfg.setdefault("cli_model", None)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+            f.write("\n")
+    except Exception as e:
+        print(f"Error: could not write config {path}: {e}", file=sys.stderr)
+        sys.exit(1)
 PYEOF
 
   # 4. keys — created once with strict permissions so the user can add API keys
@@ -271,12 +427,17 @@ KEYS
 }
 
 find_python
+if ! have_cmd git; then
+  echo "Warning: git is not installed; remote --waf-source repository URLs will be unavailable." >&2
+  echo "Install it with your package manager (e.g. apt install git, brew install git)." >&2
+fi
 echo "Detected RAM: $(ram_summary)"
 echo "Detected GPU: $(gpu_summary)"
 select_model_profile
 echo "Selected model profile: $SELECTED_PROFILE ($SELECTED_MODEL)"
 
 detect_cli_tools
+select_config_mode
 install_ollama_if_needed || echo "Warning: continuing without automatic Ollama install." >&2
 if have_cmd ollama; then
   ensure_ollama_ready || true
@@ -300,7 +461,7 @@ fi
 # Only reinstall packages (and playwright browser) when requirements.txt has changed
 # or packages are broken.  The stamp file stores the last successful hash.
 REQS_HASH_FILE="$CONFIG_DIR/.reqs_hash"
-REQS_CURRENT_HASH="$(sha256sum "$ROOT_DIR/requirements.txt" 2>/dev/null | cut -d' ' -f1)"
+REQS_CURRENT_HASH="$(file_sha256 "$ROOT_DIR/requirements.txt" 2>/dev/null || true)"
 if [ -f "$REQS_HASH_FILE" ] && [ "$(cat "$REQS_HASH_FILE" 2>/dev/null)" = "$REQS_CURRENT_HASH" ] \
     && "$VENV_PYTHON" -m pip check >/dev/null 2>&1; then
   echo "Python packages up-to-date (requirements.txt unchanged) — skipping install."
@@ -309,8 +470,10 @@ else
   "$VENV_PYTHON" -m pip install -r "$ROOT_DIR/requirements.txt"
   # Install Playwright browser binaries required by Scrapling's stealth fetcher.
   # Playwright version is pinned in requirements.txt so this only runs when packages change.
+  # `--with-deps` is Linux-specific; keep other platforms on the simpler install path.
+  read -r -a PLAYWRIGHT_ARGS <<< "$(playwright_install_args)"
   _playwright_ok=1
-  if ! "$VENV_PYTHON" -m playwright install chromium --with-deps; then
+  if ! "$VENV_PYTHON" -m playwright install "${PLAYWRIGHT_ARGS[@]}"; then
     echo "Warning: playwright install chromium failed — active scanner (--active) will not work." >&2
     _playwright_ok=0
   fi
@@ -328,5 +491,9 @@ if ! ln -sf "$LAUNCHER" "$BIN_DIR/axss"; then
   echo "Warning: could not link $BIN_DIR/axss in this environment." >&2
 fi
 
-echo "Configured $CONFIG_PATH with default_model=$SELECTED_MODEL"
-echo "Run ./setup.sh then axss --help anywhere"
+if [ "$CONFIG_MODE" = "preserve" ]; then
+  echo "Updated existing config at $CONFIG_PATH with local_model=$SELECTED_MODEL"
+else
+  echo "Configured $CONFIG_PATH with local_model=$SELECTED_MODEL using ${CONFIG_MODE} layout"
+fi
+echo "Setup complete. Run axss --help"

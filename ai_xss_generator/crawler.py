@@ -23,7 +23,8 @@ from html.parser import HTMLParser
 from typing import Callable
 
 from ai_xss_generator.probe import _TRACKING_PARAM_BLOCKLIST
-from ai_xss_generator.types import PostFormTarget
+from ai_xss_generator.scope import ScopeConfig, is_in_scope
+from ai_xss_generator.types import PostFormTarget, UploadTarget
 
 log = logging.getLogger(__name__)
 
@@ -54,6 +55,7 @@ class CrawlResult:
     """Return type of crawl() — GET testable URLs and discovered POST form targets."""
     get_urls: list[str]
     post_forms: list[PostFormTarget]
+    upload_targets: list[UploadTarget]
     visited_urls: list[str]  # All pages actually fetched — used for post-injection sweep
     detected_waf: str | None = None  # WAF auto-detected from crawl seed response
 
@@ -100,6 +102,7 @@ class _LinkExtractor(HTMLParser):
             self._form = {
                 "action": attr.get("action", "").strip(),
                 "method": method if method else "GET",
+                "enctype": attr.get("enctype", "").strip().lower(),
                 "fields": [],  # list of (name, input_type, value)
             }
 
@@ -108,7 +111,10 @@ class _LinkExtractor(HTMLParser):
             input_type = attr.get("type", "text").strip().lower()
             value = attr.get("value", "").strip()
             existing_names = [f[0] for f in self._form["fields"]]
-            if name and input_type not in self._SKIP_TYPES and name not in existing_names:
+            should_include = input_type not in self._SKIP_TYPES or (
+                input_type == "file" and self._form.get("method") != "GET"
+            )
+            if name and should_include and name not in existing_names:
                 self._form["fields"].append((name, input_type, value))
 
     def handle_endtag(self, tag: str) -> None:
@@ -138,6 +144,7 @@ class _LinkExtractor(HTMLParser):
             if fields:
                 self.post_form_raws.append({
                     "action": action,
+                    "enctype": form.get("enctype", ""),
                     "fields": fields,
                 })
 
@@ -224,6 +231,7 @@ def crawl(
     waf: str | None = None,
     auth_headers: dict[str, str] | None = None,
     on_progress: Callable[[int, int, int], None] | None = None,
+    scope: ScopeConfig | None = None,
 ) -> CrawlResult:
     """BFS-crawl from *start_url* and return a CrawlResult with:
       - get_urls:   deduplicated URLs that have at least one non-tracking GET param.
@@ -247,6 +255,7 @@ def crawl(
     ordered_targets: list[str] = []
     seen_post_keys: set[str] = set()   # dedup POST forms by action+param signature
     post_forms: list[PostFormTarget] = []
+    upload_targets: list[UploadTarget] = []
 
     current_level: list[str] = [start_url]
     _crawl_detected_waf: str | None = None
@@ -319,12 +328,18 @@ def crawl(
             if current_depth < depth:
                 for href in raw_links:
                     resolved = _resolve(href, final_url)
-                    if resolved and _same_origin(resolved, origin):
+                    if not resolved:
+                        continue
+                    if scope is not None and not is_in_scope(resolved, scope):
+                        log.debug("Crawl: out-of-scope, skipping %s", resolved)
+                        continue
+                    if _same_origin(resolved, origin):
                         next_level.append(resolved)
 
             # Convert raw POST form dicts to PostFormTarget objects (all depths)
             for raw_form in raw_post_forms:
                     action = raw_form["action"]
+                    enctype = str(raw_form.get("enctype", "") or "").lower()
                     fields: list[tuple[str, str, str]] = raw_form["fields"]
 
                     # Resolve the action URL to absolute
@@ -336,8 +351,12 @@ def crawl(
                     csrf_field: str | None = None
                     hidden_defaults: dict[str, str] = {}
                     param_names: list[str] = []
+                    file_field_names: list[str] = []
 
                     for name, ftype, value in fields:
+                        if ftype == "file":
+                            file_field_names.append(name)
+                            continue
                         if ftype == "hidden":
                             hidden_defaults[name] = value
                         if csrf_field is None and _is_csrf_field(name, ftype):
@@ -345,32 +364,56 @@ def crawl(
                         else:
                             param_names.append(name)
 
-                    if not param_names:
-                        continue
+                    if file_field_names or "multipart/form-data" in enctype:
+                        upload_key = (
+                            f"{abs_action}[files:{','.join(sorted(file_field_names))}]"
+                            f"[fields:{','.join(sorted(param_names))}]"
+                        )
+                        if upload_key not in seen_post_keys:
+                            seen_post_keys.add(upload_key)
+                            upload_targets.append(UploadTarget(
+                                action_url=abs_action,
+                                source_page_url=final_url,
+                                file_field_names=file_field_names or ["file"],
+                                companion_field_names=param_names,
+                                csrf_field=csrf_field,
+                                hidden_defaults=hidden_defaults,
+                            ))
+                            log.debug(
+                                "Upload form found: action=%s files=%s params=%s csrf=%s",
+                                abs_action, file_field_names, param_names, csrf_field,
+                            )
 
-                    # Dedup by action URL + sorted param names
-                    post_key = f"{abs_action}[{','.join(sorted(param_names))}]"
-                    if post_key in seen_post_keys:
-                        continue
-                    seen_post_keys.add(post_key)
+                    if param_names:
+                        # Dedup by action URL + sorted param names
+                        post_key = f"{abs_action}[{','.join(sorted(param_names))}]"
+                        if post_key in seen_post_keys:
+                            continue
+                        seen_post_keys.add(post_key)
 
-                    post_forms.append(PostFormTarget(
-                        action_url=abs_action,
-                        source_page_url=final_url,
-                        param_names=param_names,
-                        csrf_field=csrf_field,
-                        hidden_defaults=hidden_defaults,
-                    ))
-                    log.debug(
-                        "POST form found: action=%s params=%s csrf=%s",
-                        abs_action, param_names, csrf_field,
-                    )
+                        post_forms.append(PostFormTarget(
+                            action_url=abs_action,
+                            source_page_url=final_url,
+                            param_names=param_names,
+                            csrf_field=csrf_field,
+                            hidden_defaults=hidden_defaults,
+                        ))
+                        log.debug(
+                            "POST form found: action=%s params=%s csrf=%s",
+                            abs_action, param_names, csrf_field,
+                        )
 
         next_level = sorted(next_level, key=lambda u: 0 if _testable_params(u) else 1)
         current_level = next_level
 
     log.info(
-        "Crawl complete: %d page(s) visited | %d GET target(s) | %d POST form(s)",
-        len(visited_pages), len(ordered_targets), len(post_forms),
+        "Crawl complete: %d page(s) visited | %d GET target(s) | %d POST form(s) | %d upload form(s)",
+        len(visited_pages), len(ordered_targets), len(post_forms), len(upload_targets),
     )
-    return CrawlResult(get_urls=ordered_targets, post_forms=post_forms, visited_urls=all_fetched_urls, detected_waf=_crawl_detected_waf)
+    return CrawlResult(
+        get_urls=ordered_targets,
+        post_forms=post_forms,
+        upload_targets=upload_targets,
+        visited_urls=all_fetched_urls,
+        detected_waf=_crawl_detected_waf,
+    )

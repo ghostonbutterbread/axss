@@ -16,7 +16,7 @@ Atomicity:
   crash mid-write never leaves a corrupted session file.
 
 Session identity (seed_hash):
-  SHA-256 of sorted URL list + sorted POST form keys + scan type flags.
+  SHA-256 of sorted URL list + sorted POST/upload target keys + scan type flags.
   This is deterministic for --urls FILE mode and deterministic per-crawl for
   -u URL mode (same crawl → same URLs → same hash).  Auth headers and rate
   are deliberately excluded so users can tweak them on resume.
@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from ai_xss_generator.active.worker import ConfirmedFinding, WorkerResult
-    from ai_xss_generator.types import PostFormTarget
+    from ai_xss_generator.types import PostFormTarget, UploadTarget
 
 from ai_xss_generator.config import CONFIG_DIR
 
@@ -50,8 +50,10 @@ SESSIONS_DIR = CONFIG_DIR / "sessions"
 def compute_seed_hash(
     urls: list[str],
     post_forms: "list[PostFormTarget]",
+    upload_targets: "list[UploadTarget]",
     scan_reflected: bool,
     scan_stored: bool,
+    scan_uploads: bool,
     scan_dom: bool,
 ) -> str:
     """Return a 64-char hex SHA-256 that uniquely identifies this scan profile."""
@@ -64,8 +66,20 @@ def compute_seed_hash(
             ],
             key=lambda d: (d["action_url"], d["params"]),
         ),
+        "upload_targets": sorted(
+            [
+                {
+                    "action_url": ut.action_url,
+                    "files": sorted(ut.file_field_names),
+                    "fields": sorted(ut.companion_field_names),
+                }
+                for ut in upload_targets
+            ],
+            key=lambda d: (d["action_url"], d["files"], d["fields"]),
+        ),
         "reflected": scan_reflected,
         "stored": scan_stored,
+        "uploads": scan_uploads,
         "dom": scan_dom,
     }
     raw = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
@@ -103,6 +117,7 @@ def _finding_to_dict(f: "ConfirmedFinding") -> dict:
         "fired_url": f.fired_url,
         "source": f.source,
         "cloud_escalated": f.cloud_escalated,
+        "bypass_family": getattr(f, "bypass_family", ""),
     }
 
 
@@ -122,6 +137,7 @@ def _dict_to_finding(d: dict) -> "ConfirmedFinding":
         fired_url=d["fired_url"],
         source=d["source"],
         cloud_escalated=d.get("cloud_escalated", False),
+        bypass_family=d.get("bypass_family", ""),
     )
 
 
@@ -137,6 +153,13 @@ def _result_to_dict(r: "WorkerResult") -> dict:
         "duration_seconds": r.duration_seconds,
         "params_tested": r.params_tested,
         "params_reflected": r.params_reflected,
+        "dead_target": getattr(r, "dead_target", False),
+        "dead_reason": getattr(r, "dead_reason", ""),
+        "target_tier": getattr(r, "target_tier", ""),
+        "local_model_rounds": getattr(r, "local_model_rounds", 0),
+        "cloud_model_rounds": getattr(r, "cloud_model_rounds", 0),
+        "fallback_rounds": getattr(r, "fallback_rounds", 0),
+        "escalation_reasons": list(getattr(r, "escalation_reasons", []) or []),
         "confirmed_findings": [_finding_to_dict(f) for f in r.confirmed_findings],
     }
 
@@ -155,6 +178,13 @@ def _dict_to_result(d: dict) -> "WorkerResult":
         duration_seconds=d.get("duration_seconds", 0.0),
         params_tested=d.get("params_tested", 0),
         params_reflected=d.get("params_reflected", 0),
+        dead_target=d.get("dead_target", False),
+        dead_reason=d.get("dead_reason", ""),
+        target_tier=d.get("target_tier", ""),
+        local_model_rounds=d.get("local_model_rounds", 0),
+        cloud_model_rounds=d.get("cloud_model_rounds", 0),
+        fallback_rounds=d.get("fallback_rounds", 0),
+        escalation_reasons=list(d.get("escalation_reasons", []) or []),
     )
 
 
@@ -232,12 +262,13 @@ def checkpoint(session: dict, url: str, result: "WorkerResult") -> None:
     Safe to call from within the orchestrator drain loop — the atomic write
     ensures a crash mid-write never corrupts the session.
     """
-    session.setdefault("completed", {})[url] = _result_to_dict(result)
+    result_key = f"{getattr(result, 'kind', 'get')}:{result.url}"
+    session.setdefault("completed", {})[result_key] = _result_to_dict(result)
     session["updated_at"] = _now_iso()
     try:
         _atomic_write(_session_path(session["seed_hash"]), session)
     except Exception as exc:
-        log.debug("Session checkpoint failed for %s: %s", url, exc)
+        log.debug("Session checkpoint failed for %s: %s", result_key, exc)
 
 
 def mark_status(session: dict, status: str) -> None:
@@ -252,8 +283,16 @@ def mark_status(session: dict, status: str) -> None:
 
 
 def completed_urls(session: dict) -> set[str]:
-    """Return the set of URLs already completed in this session."""
-    return set(session.get("completed", {}).keys())
+    """Return the set of completed work-item keys ('kind:url')."""
+    completed = set()
+    for key, entry in session.get("completed", {}).items():
+        if ":" in key:
+            completed.add(key)
+            continue
+        kind = str(entry.get("kind", "get"))
+        url = str(entry.get("url", key))
+        completed.add(f"{kind}:{url}")
+    return completed
 
 
 def restore_results(session: dict) -> "list[WorkerResult]":

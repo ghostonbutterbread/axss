@@ -120,6 +120,15 @@ def crawl_urls(
                 # --- Fast path: curl_cffi ---
                 try:
                     response = session.get(url, **fetch_kwargs)
+                    # 429 / 503 rate-limit backoff: wait and retry up to 3 times
+                    _backoff_attempt = 0
+                    while getattr(response, "status_code", 0) in (429, 503) and _backoff_attempt < 3:
+                        retry_after = int(response.headers.get("retry-after", 0) if hasattr(response, "headers") else 0)
+                        wait = retry_after if retry_after > 0 else (2 ** _backoff_attempt * 2)
+                        log.warning("Rate-limited (%s) on %s — backing off %ds", response.status_code, url, wait)
+                        time.sleep(wait)
+                        response = session.get(url, **fetch_kwargs)
+                        _backoff_attempt += 1
                     results[url] = _build_result(url, response)
                     if detect_waf_on_seed and not _waf_detected and waf is None:
                         try:
@@ -184,15 +193,35 @@ def _build_result(url: str, response: Any, note: str = "Fetched with Scrapling."
     markup = extract_markup_from_response(response)
     if response.url != url:
         markup.notes.append(f"Final URL: {response.url}")
+    status_code = getattr(response, "status", None)
+    if status_code is None:
+        status_code = getattr(response, "status_code", None)
     html_text = response.text or response.body.decode("utf-8", errors="replace")
+
+    # CSP detection — parse headers and attach analysis if a policy is present
+    csp_analysis = None
+    try:
+        from ai_xss_generator.csp import csp_from_headers
+        raw_headers = dict(getattr(response, "headers", {}) or {})
+        csp_analysis = csp_from_headers(raw_headers)
+        if csp_analysis and csp_analysis.would_block:
+            markup.notes.append(f"[csp:blocking] {csp_analysis.raw[:120]}")
+        elif csp_analysis and csp_analysis.raw:
+            markup.notes.append(f"[csp:present] {csp_analysis.raw[:120]}")
+    except Exception:
+        pass
+
     return {
         "source": url,
         "source_type": "url",
         "html": html_text,
+        "status_code": status_code,
+        "final_url": str(getattr(response, "url", "") or url),
         "title": markup.title,
         "forms": markup.forms,
         "inputs": markup.inputs,
         "handlers": markup.handlers,
         "inline_scripts": markup.inline_scripts,
         "notes": [note, *markup.notes],
+        "csp": csp_analysis,
     }

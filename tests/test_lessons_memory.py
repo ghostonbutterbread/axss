@@ -11,7 +11,6 @@ from ai_xss_generator.lessons import (
     LESSON_TYPE_XSS_LOGIC,
     build_mapping_lessons,
     build_probe_lessons,
-    lessons_prompt_section,
 )
 
 
@@ -49,10 +48,13 @@ class EphemeralLessonsTest(unittest.TestCase):
             surviving_chars=frozenset("<>()")
         )
         probe_result = _make_probe_result("name", [reflection])
+        probe_result.tested_chars = "<>()"
+        probe_result.probe_mode = "stealth"
         lessons = build_probe_lessons([probe_result], delivery_mode="get")
         filter_lesson = next(l for l in lessons if l.lesson_type == LESSON_TYPE_FILTER)
         for ch in "<>()":
             self.assertIn(ch, filter_lesson.surviving_chars)
+        self.assertIn("Tested charset was ()<>", filter_lesson.summary)
 
     def test_build_mapping_lessons_capture_forms_dom_auth(self):
         form = MagicMock()
@@ -79,19 +81,6 @@ class EphemeralLessonsTest(unittest.TestCase):
         self.assertFalse(hasattr(lessons_module, "save_lesson"))
         self.assertFalse(hasattr(lessons_module, "load_lessons"))
         self.assertFalse(hasattr(lessons_module, "LESSONS_DIR"))
-
-    def test_lessons_prompt_section_formats_correctly(self):
-        lesson = Lesson(
-            lesson_type=LESSON_TYPE_FILTER,
-            title="html_body filter profile",
-            summary="Surviving chars: <>(). Blocked: everything else.",
-            context_type="html_body",
-            surviving_chars="<>()",
-            blocked_chars=";",
-        )
-        section = lessons_prompt_section([lesson])
-        self.assertIn("html_body filter profile", section)
-        self.assertIn("Surviving chars", section)
 
     def test_no_storage_fields_on_lesson_dataclass(self):
         """Lesson dataclass has no persistence-specific fields."""

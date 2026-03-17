@@ -10,6 +10,7 @@ to the AI generator, so payloads are targeted to confirmed contexts.
 from __future__ import annotations
 
 import logging
+import json
 import os
 import re
 import secrets
@@ -21,11 +22,13 @@ from itertools import cycle
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote as url_quote
+import urllib.parse
 
 log = logging.getLogger(__name__)
 
 from scrapling.fetchers import FetcherSession
 
+from ai_xss_generator.browser_nav import goto_with_edge_recovery
 from ai_xss_generator.types import DomSink, ParsedContext, PayloadCandidate
 
 # curl error code for HTTP/2 stream reset — server/WAF rejected the connection
@@ -95,6 +98,8 @@ _PROBE_MAX_WORKERS = 6
 
 # Max crawled pages to sweep for session-stored XSS (caps follow-up sweep cost)
 _FOLLOW_UP_CRAWLED_LIMIT = 30
+_BROWSER_PROBE_TIMEOUT_MS = 25_000
+_BROWSER_PROBE_SETTLE_SECONDS = 0.35
 
 
 class _RateLimiter:
@@ -155,6 +160,30 @@ class ReflectionContext:
     attr_name: str = ""
     """Attribute name for html_attr_* contexts (e.g. 'href', 'onclick')."""
 
+    tag_name: str = ""
+    """HTML tag name for reflected markup contexts when it can be inferred."""
+
+    quote_style: str = ""
+    """Quote style for reflected attr/json contexts: single | double | unquoted."""
+
+    html_subcontext: str = ""
+    """Narrower reflected HTML placement hint for prompt routing."""
+
+    attacker_prefix: str = ""
+    """Short local content prefix immediately before the reflected value."""
+
+    attacker_suffix: str = ""
+    """Short local content suffix immediately after the reflected value."""
+
+    payload_shape: str = ""
+    """Best-fit exploit shape such as quote_closure or same_tag_attr_pivot."""
+
+    subcontext_explanation: str = ""
+    """Short human-readable explanation of the reflected placement."""
+
+    evidence_confidence: float = 0.0
+    """Confidence that the inferred reflected subcontext is correct."""
+
     surviving_chars: frozenset[str] = field(default_factory=frozenset)
     """Probe chars that came back literally unmodified in the response."""
 
@@ -191,11 +220,39 @@ class ReflectionContext:
             return "-" in sc or "<" in sc
         if ct == "json_value":
             return '"' in sc
+        if ct == "fast_omni":
+            return True  # synthetic omni context — always exploitable
         return bool(sc)
 
     @property
     def short_label(self) -> str:
         return self.context_type + (f"({self.attr_name})" if self.attr_name else "")
+
+
+def _truncate_context_fragment(value: str, *, limit: int = 120, tail: bool = True) -> str:
+    if len(value) <= limit:
+        return value
+    if tail:
+        return value[-limit:]
+    return value[:limit]
+
+
+def _clone_reflection_context(ctx: ReflectionContext, *, surviving_chars: frozenset[str]) -> ReflectionContext:
+    return ReflectionContext(
+        context_type=ctx.context_type,
+        attr_name=ctx.attr_name,
+        tag_name=ctx.tag_name,
+        quote_style=ctx.quote_style,
+        html_subcontext=ctx.html_subcontext,
+        attacker_prefix=ctx.attacker_prefix,
+        attacker_suffix=ctx.attacker_suffix,
+        payload_shape=ctx.payload_shape,
+        subcontext_explanation=ctx.subcontext_explanation,
+        evidence_confidence=ctx.evidence_confidence,
+        surviving_chars=surviving_chars,
+        snippet=ctx.snippet,
+        context_before=ctx.context_before,
+    )
 
 
 @dataclass(slots=True)
@@ -206,6 +263,10 @@ class ProbeResult:
     original_value: str
     reflections: list[ReflectionContext] = field(default_factory=list)
     error: str | None = None
+    reflection_transform: str = ""
+    discovery_style: str = ""
+    probe_mode: str = ""
+    tested_chars: str = PROBE_CHARS
 
     @property
     def is_reflected(self) -> bool:
@@ -248,6 +309,105 @@ def _make_canary() -> str:
     return "axss" + secrets.token_hex(4)
 
 
+@dataclass(slots=True)
+class _ProbeSeed:
+    reflection_value: str
+    char_probe_value: str
+    style: str
+
+
+@dataclass(slots=True)
+class _ProbePlan:
+    mode: str
+    chars: str
+    follow_up_limit: int
+
+
+def _probe_seed_for_param(param_name: str, canary: str, original_value: str = "") -> _ProbeSeed:
+    """Return a low-noise reflection seed for semantically constrained params."""
+    name = param_name.lower()
+    original = (original_value or "").strip().lower()
+    markers = _PROBE_OPEN + PROBE_CHARS + _PROBE_CLOSE
+
+    def _wrap(prefix: str = "", suffix: str = "", style: str = "plain") -> _ProbeSeed:
+        return _ProbeSeed(
+            reflection_value=prefix + canary + suffix,
+            char_probe_value=prefix + canary + markers + suffix,
+            style=style,
+        )
+
+    urlish_names = {
+        "url", "uri", "redirect", "return", "returnto", "next", "continue",
+        "dest", "destination", "target", "href", "src", "link",
+    }
+    search_names = {
+        "q", "query", "search", "text", "articleq", "keyword", "keywords",
+        "term", "name",
+    }
+    location_names = {
+        "location", "city", "state", "country", "zip", "zipcode", "postcode",
+        "post_code", "address", "region",
+    }
+    email_names = {"email", "mail", "username", "user"}
+
+    if name in urlish_names or original.startswith(("http://", "https://", "/")):
+        return _wrap(prefix="https://axss.invalid/", style="url_like")
+    if name in email_names or "@" in original:
+        return _wrap(suffix="@example.test", style="email_like")
+    if name in location_names:
+        return _wrap(prefix="san-francisco-", style="location_like")
+    if name in search_names:
+        return _wrap(prefix="search-", style="search_text")
+    return _wrap(style="plain")
+
+
+def _adaptive_probe_plan(
+    *,
+    url: str,
+    waf: str | None,
+    auth_headers: dict[str, str] | None,
+    param_name: str,
+    param_count: int,
+) -> _ProbePlan:
+    """Choose a bounded discovery mode based on observed target sensitivity."""
+    lower_url = url.lower()
+    lower_param = param_name.lower()
+    lower_waf = (waf or "").lower()
+    sensitive_path = any(
+        marker in lower_url
+        for marker in ("/login", "/signin", "/auth", "/register", "/account", "/checkout")
+    )
+    sensitive_param = lower_param in {
+        "redirect", "return", "returnto", "next", "continue",
+        "location", "email", "username", "token",
+    }
+    strong_edge = lower_waf in _BROWSER_REQUIRED_WAFS
+    auth_required = bool(auth_headers)
+
+    if strong_edge or auth_required or sensitive_path:
+        chars = '<>"\'()/'
+        if sensitive_param:
+            chars = '"\'()'
+        return _ProbePlan(
+            mode="stealth",
+            chars=chars,
+            follow_up_limit=8 if param_count > 3 else 12,
+        )
+
+    if param_count >= 8:
+        return _ProbePlan(mode="budgeted", chars='<>"/\'()', follow_up_limit=12)
+
+    return _ProbePlan(mode="standard", chars=PROBE_CHARS, follow_up_limit=_FOLLOW_UP_CRAWLED_LIMIT)
+
+
+def _canary_variants(canary: str) -> list[str]:
+    variants = [canary]
+    for variant in (canary.upper(), canary.lower()):
+        if variant not in variants:
+            variants.append(variant)
+    return variants
+
+
 def _inside_inert_tag(before: str) -> bool:
     """Return True if *before* ends inside a non-executable tag's content.
 
@@ -267,6 +427,104 @@ def _inside_inert_tag(before: str) -> bool:
         if close_pos == -1 or close_pos < open_pos:
             return True
     return False
+
+
+def _infer_tag_name(tag_content: str) -> str:
+    match = re.match(r"<\s*([A-Za-z][\w:-]*)", tag_content)
+    return match.group(1).lower() if match else ""
+
+
+def _build_reflected_explanation(
+    *,
+    context_type: str,
+    tag_name: str = "",
+    attr_name: str = "",
+    quote_style: str = "",
+) -> str:
+    if context_type == "html_attr_url":
+        style = f"{quote_style}-quoted " if quote_style in ("single", "double") else (
+            "unquoted " if quote_style == "unquoted" else ""
+        )
+        location = f"{style}{attr_name} attribute"
+        if tag_name:
+            location += f" on <{tag_name}>"
+        return f"Reflection is inside a {location}."
+    if context_type == "html_attr_event":
+        style = f"{quote_style}-quoted " if quote_style in ("single", "double") else (
+            "unquoted " if quote_style == "unquoted" else ""
+        )
+        location = f"{style}{attr_name} event handler"
+        if tag_name:
+            location += f" on <{tag_name}>"
+        return f"Reflection is inside a {location}."
+    if context_type == "html_attr_value":
+        style = f"{quote_style}-quoted " if quote_style in ("single", "double") else (
+            "unquoted " if quote_style == "unquoted" else ""
+        )
+        location = f"{style}{attr_name} attribute"
+        if tag_name:
+            location += f" on <{tag_name}>"
+        return f"Reflection is inside a {location}."
+    if context_type == "html_comment":
+        return "Reflection is inside an open HTML comment."
+    if context_type == "json_value":
+        style = f"{quote_style}-quoted " if quote_style else ""
+        return f"Reflection appears inside a {style}JSON string value.".strip()
+    return "Reflection appears in raw HTML body text."
+
+
+def _build_payload_shape(context_type: str, attr_name: str, quote_style: str) -> str:
+    if context_type == "html_attr_url":
+        if attr_name == "srcdoc":
+            return "same_tag_attr_pivot_or_srcdoc"
+        if quote_style in ("single", "double"):
+            return "scheme_or_quote_closure"
+        return "scheme_or_same_tag_attr_pivot"
+    if context_type == "html_attr_event":
+        return "event_handler_in_place"
+    if context_type == "html_attr_value":
+        if quote_style in ("single", "double"):
+            return "quote_closure_or_same_tag_attr_pivot"
+        return "same_tag_attr_pivot"
+    if context_type == "html_comment":
+        return "comment_breakout"
+    if context_type == "json_value":
+        return "json_string_breakout"
+    return "raw_tag_injection"
+
+
+def _build_html_subcontext(context_type: str, attr_name: str, quote_style: str) -> str:
+    if context_type == "html_attr_url":
+        prefix = {
+            "single": "single_quoted",
+            "double": "double_quoted",
+            "unquoted": "unquoted",
+        }.get(quote_style, "unknown")
+        suffix = "srcdoc_attr" if attr_name == "srcdoc" else "url_attr"
+        return f"{prefix}_{suffix}"
+    if context_type == "html_attr_event":
+        prefix = {
+            "single": "single_quoted",
+            "double": "double_quoted",
+            "unquoted": "unquoted",
+        }.get(quote_style, "unknown")
+        return f"{prefix}_event_attr"
+    if context_type == "html_attr_value":
+        prefix = {
+            "single": "single_quoted",
+            "double": "double_quoted",
+            "unquoted": "unquoted",
+        }.get(quote_style, "unknown")
+        return f"{prefix}_attr_value"
+    if context_type == "html_comment":
+        return "html_comment"
+    if context_type == "json_value":
+        prefix = {
+            "single": "single_quoted",
+            "double": "double_quoted",
+        }.get(quote_style, "quoted")
+        return f"{prefix}_json_value"
+    return "raw_html_body"
 
 
 def _classify_context_at(html: str, idx: int, canary: str) -> ReflectionContext | None:
@@ -289,7 +547,18 @@ def _classify_context_at(html: str, idx: int, canary: str) -> ReflectionContext 
     copen = before.rfind("<!--")
     cclose = before.rfind("-->")
     if copen != -1 and (cclose == -1 or cclose < copen):
-        return ReflectionContext(context_type="html_comment", snippet=snippet)
+        comment_start = max(copen, idx - 80)
+        comment_end = min(len(html), idx + len(canary) + 80)
+        return ReflectionContext(
+            context_type="html_comment",
+            html_subcontext="html_comment",
+            attacker_prefix=_truncate_context_fragment(html[comment_start:idx]),
+            attacker_suffix=_truncate_context_fragment(html[idx + len(canary):comment_end], tail=False),
+            payload_shape="comment_breakout",
+            subcontext_explanation=_build_reflected_explanation(context_type="html_comment"),
+            evidence_confidence=0.9,
+            snippet=snippet,
+        )
 
     # 2. Inside a <script> block?
     script_open_pos = before.rfind("<script")
@@ -332,54 +601,168 @@ def _classify_context_at(html: str, idx: int, canary: str) -> ReflectionContext 
     last_tag_close = before.rfind(">")
     if last_tag_open != -1 and last_tag_open > last_tag_close:
         tag_content = before[last_tag_open:]
-        attr_m = re.search(r"""([\w:-]+)\s*=\s*["']?[^"'<>]*$""", tag_content)
+        tag_name = _infer_tag_name(tag_content)
+        attr_m = re.search(r"""([\w:-]+)\s*=\s*(?:(['"])([^'"]*)|([^\s"'<>`=]*))$""", tag_content)
         if attr_m:
             attr_name = attr_m.group(1).lower()
+            quote_char = attr_m.group(2) or ""
+            quote_style = {"'": "single", '"': "double"}.get(quote_char, "unquoted")
+            tag_end = html.find(">", idx)
+            attacker_prefix = _truncate_context_fragment(tag_content)
+            attacker_suffix = ""
+            if tag_end != -1:
+                attacker_suffix = _truncate_context_fragment(
+                    html[idx + len(canary): tag_end + 1],
+                    tail=False,
+                )
             if attr_name.startswith("on"):
                 return ReflectionContext(
-                    context_type="html_attr_event", attr_name=attr_name, snippet=snippet
+                    context_type="html_attr_event",
+                    attr_name=attr_name,
+                    tag_name=tag_name,
+                    quote_style=quote_style,
+                    html_subcontext=_build_html_subcontext("html_attr_event", attr_name, quote_style),
+                    attacker_prefix=attacker_prefix,
+                    attacker_suffix=attacker_suffix,
+                    payload_shape=_build_payload_shape("html_attr_event", attr_name, quote_style),
+                    subcontext_explanation=_build_reflected_explanation(
+                        context_type="html_attr_event",
+                        tag_name=tag_name,
+                        attr_name=attr_name,
+                        quote_style=quote_style,
+                    ),
+                    evidence_confidence=0.96,
+                    snippet=snippet,
                 )
             if attr_name in (
                 "href", "src", "action", "formaction", "data",
                 "xlink:href", "content", "srcdoc",
             ):
                 return ReflectionContext(
-                    context_type="html_attr_url", attr_name=attr_name, snippet=snippet
+                    context_type="html_attr_url",
+                    attr_name=attr_name,
+                    tag_name=tag_name,
+                    quote_style=quote_style,
+                    html_subcontext=_build_html_subcontext("html_attr_url", attr_name, quote_style),
+                    attacker_prefix=attacker_prefix,
+                    attacker_suffix=attacker_suffix,
+                    payload_shape=_build_payload_shape("html_attr_url", attr_name, quote_style),
+                    subcontext_explanation=_build_reflected_explanation(
+                        context_type="html_attr_url",
+                        tag_name=tag_name,
+                        attr_name=attr_name,
+                        quote_style=quote_style,
+                    ),
+                    evidence_confidence=0.96,
+                    snippet=snippet,
                 )
             return ReflectionContext(
-                context_type="html_attr_value", attr_name=attr_name, snippet=snippet
+                context_type="html_attr_value",
+                attr_name=attr_name,
+                tag_name=tag_name,
+                quote_style=quote_style,
+                html_subcontext=_build_html_subcontext("html_attr_value", attr_name, quote_style),
+                attacker_prefix=attacker_prefix,
+                attacker_suffix=attacker_suffix,
+                payload_shape=_build_payload_shape("html_attr_value", attr_name, quote_style),
+                subcontext_explanation=_build_reflected_explanation(
+                    context_type="html_attr_value",
+                    tag_name=tag_name,
+                    attr_name=attr_name,
+                    quote_style=quote_style,
+                ),
+                evidence_confidence=0.94,
+                snippet=snippet,
             )
 
     # 4. JSON value heuristic
     stripped_before = before.rstrip()
     if stripped_before.endswith(('": "', "': '", '":"', "':'")):
-        return ReflectionContext(context_type="json_value", snippet=snippet)
+        quote_style = "double" if stripped_before.endswith(('": "', '":"')) else "single"
+        return ReflectionContext(
+            context_type="json_value",
+            quote_style=quote_style,
+            html_subcontext=_build_html_subcontext("json_value", "", quote_style),
+            attacker_prefix=_truncate_context_fragment(before),
+            attacker_suffix=_truncate_context_fragment(
+                html[idx + len(canary): min(len(html), idx + len(canary) + 100)],
+                tail=False,
+            ),
+            payload_shape=_build_payload_shape("json_value", "", quote_style),
+            subcontext_explanation=_build_reflected_explanation(
+                context_type="json_value",
+                quote_style=quote_style,
+            ),
+            evidence_confidence=0.88,
+            snippet=snippet,
+        )
 
     # 5. Raw HTML body (fallback)
-    return ReflectionContext(context_type="html_body", snippet=snippet)
+    body_start = max(last_tag_close + 1, idx - 80)
+    next_tag_open = html.find("<", idx + len(canary))
+    if next_tag_open == -1:
+        next_tag_open = min(len(html), idx + len(canary) + 80)
+    return ReflectionContext(
+        context_type="html_body",
+        html_subcontext="raw_html_body",
+        attacker_prefix=_truncate_context_fragment(html[body_start:idx]),
+        attacker_suffix=_truncate_context_fragment(
+            html[idx + len(canary):next_tag_open],
+            tail=False,
+        ),
+        payload_shape="raw_tag_injection",
+        subcontext_explanation=_build_reflected_explanation(context_type="html_body"),
+        evidence_confidence=0.82,
+        snippet=snippet,
+    )
 
 
 def _find_reflections(html: str, canary: str) -> list[ReflectionContext]:
     """Find all positions of *canary* in *html* and classify each injection context."""
-    contexts: list[ReflectionContext] = []
-    seen: set[str] = set()
-    pos = 0
-    while True:
-        idx = html.find(canary, pos)
-        if idx == -1:
-            break
-        pos = idx + 1
-        ctx = _classify_context_at(html, idx, canary)
-        if ctx and ctx.context_type not in seen:
-            contexts.append(ctx)
-            seen.add(ctx.context_type)
-    return contexts
+    indexed_contexts: list[tuple[int, ReflectionContext]] = []
+    seen_contexts: set[str] = set()
+    seen_positions: set[int] = set()
+    for variant in _canary_variants(canary):
+        pos = 0
+        while True:
+            idx = html.find(variant, pos)
+            if idx == -1:
+                break
+            pos = idx + 1
+            if idx in seen_positions:
+                continue
+            seen_positions.add(idx)
+            ctx = _classify_context_at(html, idx, variant)
+            if ctx and ctx.context_type not in seen_contexts:
+                indexed_contexts.append((idx, ctx))
+                seen_contexts.add(ctx.context_type)
+    indexed_contexts.sort(key=lambda item: item[0])
+    return [ctx for _, ctx in indexed_contexts]
+
+
+def _reflection_transform(html: str, canary: str) -> str:
+    variants = _canary_variants(canary)
+    if html.find(variants[0]) != -1:
+        return "exact"
+    for variant in variants[1:]:
+        if html.find(variant) != -1:
+            if variant == canary.upper():
+                return "upper"
+            if variant == canary.lower():
+                return "lower"
+            return "variant"
+    return ""
 
 
 def _analyze_char_survival(html: str, canary: str) -> frozenset[str]:
     """Return the set of probe chars that appeared unmodified in the response."""
-    open_marker = canary + _PROBE_OPEN
-    pos = html.find(open_marker)
+    open_marker = ""
+    pos = -1
+    for variant in _canary_variants(canary):
+        open_marker = variant + _PROBE_OPEN
+        pos = html.find(open_marker)
+        if pos != -1:
+            break
     if pos == -1:
         return frozenset()
     start = pos + len(open_marker)
@@ -497,6 +880,112 @@ def _rebuild_url(url: str, params: dict[str, str]) -> str:
     )
 
 
+def _browser_context_auth(
+    url: str,
+    auth_headers: dict[str, str] | None,
+    user_agent: str,
+) -> tuple[dict[str, str], list[dict[str, Any]], str]:
+    """Split auth headers into Playwright headers + cookies for *url*."""
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.hostname or ""
+    secure = parsed.scheme == "https"
+
+    extra_headers: dict[str, str] = {}
+    cookie_header = ""
+    for name, value in (auth_headers or {}).items():
+        if name.lower() == "cookie":
+            cookie_header = value
+            continue
+        extra_headers[name] = value
+
+    cookies: list[dict[str, Any]] = []
+    if cookie_header and host:
+        for raw_cookie in cookie_header.split(";"):
+            if "=" not in raw_cookie:
+                continue
+            cookie_name, cookie_value = raw_cookie.split("=", 1)
+            cookie_name = cookie_name.strip()
+            if not cookie_name:
+                continue
+            cookies.append({
+                "name": cookie_name,
+                "value": cookie_value.strip(),
+                "domain": host,
+                "path": "/",
+                "secure": secure,
+                "httpOnly": False,
+            })
+
+    return extra_headers, cookies, user_agent
+
+
+def _page_fetch_html(page: Any, url: str, timeout_ms: int = _BROWSER_PROBE_TIMEOUT_MS) -> str:
+    """Navigate a Playwright page and return rendered HTML."""
+    ok, _phases, nav_error = goto_with_edge_recovery(
+        page,
+        url,
+        timeout_ms=timeout_ms,
+    )
+    if ok:
+        time.sleep(_BROWSER_PROBE_SETTLE_SECONDS)
+    try:
+        return page.content()
+    except Exception:
+        if nav_error is not None:
+            raise nav_error
+        raise
+
+
+def fetch_html_with_browser(
+    url: str,
+    *,
+    auth_headers: dict[str, str] | None = None,
+    user_agent: str = "axss/0.1 (+authorized security testing; playwright)",
+    proxy: str | None = None,
+    timeout_ms: int = _BROWSER_PROBE_TIMEOUT_MS,
+) -> str:
+    """Fetch rendered HTML through a real Playwright browser context."""
+    from playwright.sync_api import sync_playwright
+
+    extra_headers, cookies, browser_user_agent = _browser_context_auth(
+        url,
+        auth_headers,
+        user_agent,
+    )
+    launch_kwargs: dict[str, Any] = {
+        "headless": True,
+        "args": ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+    }
+    if proxy:
+        launch_kwargs["proxy"] = {"server": proxy}
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(**launch_kwargs)
+        try:
+            context = browser.new_context(
+                ignore_https_errors=True,
+                extra_http_headers={**extra_headers, "Accept": "text/html,application/xhtml+xml"},
+                user_agent=browser_user_agent,
+            )
+            try:
+                if cookies:
+                    context.add_cookies(cookies)
+
+                def _route_handler(route: Any) -> None:
+                    if route.request.resource_type in {"image", "media", "font", "stylesheet"}:
+                        route.abort()
+                    else:
+                        route.continue_()
+
+                context.route("**/*", _route_handler)
+                page = context.new_page()
+                return _page_fetch_html(page, url, timeout_ms=timeout_ms)
+            finally:
+                context.close()
+        finally:
+            browser.close()
+
+
 def _session_get(session: Any, url: str, req_kwargs: dict[str, Any]) -> Any:
     """FetcherSession.get with automatic HTTP/1.1 retry on HTTP/2 stream reset."""
     try:
@@ -522,11 +1011,22 @@ def _probe_param(
     delay: float,
     ua_cycle: Any,
     proxy_cycle: Any | None,
+    waf: str | None = None,
     auth_headers: dict[str, str] | None = None,
     rate_limiter: "_RateLimiter | None" = None,
     sink_url: str | None = None,
+    crawled_pages: list[str] | None = None,
 ) -> ProbeResult:
     """Send two probe requests for one parameter and return a ProbeResult."""
+    probe_seed = _probe_seed_for_param(param_name, canary, original_value)
+    probe_plan = _adaptive_probe_plan(
+        url=url,
+        waf=waf,
+        auth_headers=auth_headers,
+        param_name=param_name,
+        param_count=len(all_params),
+    )
+    probe_marker = _PROBE_OPEN + probe_plan.chars + _PROBE_CLOSE
     # Auth headers first; User-Agent from rotation always wins
     merged_headers: dict[str, str] = {**(auth_headers or {}), "User-Agent": next(ua_cycle)}
     req_kwargs: dict[str, Any] = {"headers": merged_headers}
@@ -542,11 +1042,24 @@ def _probe_param(
     # Phase 1 — reflection mapping
     _wait()
     try:
-        resp1 = _session_get(session, _rebuild_url(url, {**all_params, param_name: canary}), req_kwargs)
+        resp1 = _session_get(
+            session,
+            _rebuild_url(url, {**all_params, param_name: probe_seed.reflection_value}),
+            req_kwargs,
+        )
     except Exception as exc:
-        return ProbeResult(param_name=param_name, original_value=original_value, error=str(exc))
+        return ProbeResult(
+            param_name=param_name,
+            original_value=original_value,
+            error=str(exc),
+            discovery_style=probe_seed.style,
+            probe_mode=probe_plan.mode,
+            tested_chars=probe_plan.chars,
+        )
 
-    reflections = _find_reflections(_resp_html(resp1), canary)
+    html1 = _resp_html(resp1)
+    reflections = _find_reflections(html1, canary)
+    reflection_transform = _reflection_transform(html1, canary)
     if not reflections:
         # --sink-url: check user-specified sink page for GET-based stored XSS.
         # Session cookies carry the injected canary across requests.
@@ -554,15 +1067,17 @@ def _probe_param(
             try:
                 _wait()
                 _sink_resp = _session_get(session, sink_url, {"headers": {"User-Agent": next(ua_cycle)}})
-                _sink_refs = _find_reflections(_resp_html(_sink_resp), canary)
+                _sink_html = _resp_html(_sink_resp)
+                _sink_refs = _find_reflections(_sink_html, canary)
                 if _sink_refs:
-                    _char_probe = canary + _PROBE_OPEN + PROBE_CHARS + _PROBE_CLOSE
-                    _char_url = _rebuild_url(url, {**all_params, param_name: _char_probe})
+                    _char_url = _rebuild_url(url, {**all_params, param_name: probe_seed.char_probe_value})
                     _wait()
                     _session_get(session, _char_url, {"headers": {"User-Agent": next(ua_cycle)}})
                     _wait()
                     _sink_resp2 = _session_get(session, sink_url, {"headers": {"User-Agent": next(ua_cycle)}})
                     _surviving = _analyze_char_survival(_resp_html(_sink_resp2), canary)
+                    if _reflection_transform(_sink_html, canary) == "upper":
+                        _surviving = _surviving.union(frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZ"))
                     log.debug(
                         "probe_url: canary found in sink_url %s for param %s",
                         sink_url, param_name,
@@ -570,48 +1085,169 @@ def _probe_param(
                     return ProbeResult(
                         param_name=param_name,
                         original_value=original_value,
+                        reflection_transform=_reflection_transform(_sink_html, canary),
+                        discovery_style=probe_seed.style,
+                        probe_mode=probe_plan.mode,
+                        tested_chars=probe_plan.chars,
                         reflections=[
-                            ReflectionContext(
-                                context_type=ctx.context_type,
-                                attr_name=ctx.attr_name,
-                                surviving_chars=_surviving,
-                                snippet=ctx.snippet,
-                                context_before=ctx.context_before,
-                            )
+                            _clone_reflection_context(ctx, surviving_chars=_surviving)
                             for ctx in _sink_refs
                         ],
                     )
             except Exception as _exc:
                 log.debug("probe_url: sink_url check failed for %s: %s", sink_url, _exc)
-        return ProbeResult(param_name=param_name, original_value=original_value)
+
+        # Crawled-page sweep for GET-based stored XSS.
+        # After the GET request the canary may be stored server-side; check
+        # each crawled page (session cookies carry the storage context).
+        # Priority: explicit sink_url already checked above; this sweeps the
+        # crawl boundary for anything the user hasn't manually specified.
+        if crawled_pages:
+            _sweep_pages = [p for p in crawled_pages if p != sink_url][:30]
+            for _fu in _sweep_pages:
+                try:
+                    _wait()
+                    _fu_resp = _session_get(session, _fu, {"headers": {"User-Agent": next(ua_cycle)}})
+                    _fu_html = _resp_html(_fu_resp)
+                    _fu_refs = _find_reflections(_fu_html, canary)
+                    if _fu_refs:
+                        _char_url = _rebuild_url(url, {**all_params, param_name: probe_seed.char_probe_value})
+                        _wait()
+                        _session_get(session, _char_url, {"headers": {"User-Agent": next(ua_cycle)}})
+                        _wait()
+                        _fu_resp2 = _session_get(session, _fu, {"headers": {"User-Agent": next(ua_cycle)}})
+                        _surviving = _analyze_char_survival(_resp_html(_fu_resp2), canary)
+                        if _reflection_transform(_fu_html, canary) == "upper":
+                            _surviving = _surviving.union(frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZ"))
+                        log.debug(
+                            "probe_url: stored canary found in crawled page %s for param %s",
+                            _fu, param_name,
+                        )
+                        return ProbeResult(
+                            param_name=param_name,
+                            original_value=original_value,
+                            reflection_transform=_reflection_transform(_fu_html, canary),
+                            discovery_style="stored_get",
+                            probe_mode=probe_plan.mode,
+                            tested_chars=probe_plan.chars,
+                            reflections=[
+                                _clone_reflection_context(ctx, surviving_chars=_surviving)
+                                for ctx in _fu_refs
+                            ],
+                        )
+                except Exception as _exc:
+                    log.debug("probe_url: crawled-page sweep error for %s: %s", _fu, _exc)
+
+        return ProbeResult(
+            param_name=param_name,
+            original_value=original_value,
+            reflection_transform=reflection_transform,
+            discovery_style=probe_seed.style,
+            probe_mode=probe_plan.mode,
+            tested_chars=probe_plan.chars,
+        )
 
     # Phase 2 — character survival
-    char_probe = canary + _PROBE_OPEN + PROBE_CHARS + _PROBE_CLOSE
     _wait()
     try:
-        resp2 = _session_get(session, _rebuild_url(url, {**all_params, param_name: char_probe}), req_kwargs)
+        resp2 = _session_get(
+            session,
+            _rebuild_url(
+                url,
+                {**all_params, param_name: probe_seed.reflection_value + probe_marker},
+            ),
+            req_kwargs,
+        )
         surviving = _analyze_char_survival(_resp_html(resp2), canary)
+        if reflection_transform == "upper":
+            surviving = surviving.union(frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZ"))
     except Exception:
         surviving = frozenset()
+
+    final_reflections = [
+        _clone_reflection_context(ctx, surviving_chars=surviving)
+        for ctx in reflections
+    ]
+
+    # ── href/formaction follow-up ─────────────────────────────────────────────
+    # When we have an html_body reflection but < is blocked (so is_injectable
+    # would be False), check whether a javascript: URI survives in href/formaction.
+    # This turns a "soft dead" into an injectable html_attr_url context.
+    has_html_body = any(ctx.context_type == "html_body" for ctx in final_reflections)
+    already_injectable = any(ctx.is_exploitable for ctx in final_reflections)
+    if has_html_body and not already_injectable:
+        try:
+            rate_val = 1.0 / delay if delay > 0 else 25.0
+            _confirmed_attr = _probe_href_injectable(
+                url=url,
+                param_name=param_name,
+                original_value=original_value,
+                canary=canary,
+                rate=rate_val,
+                auth_headers=auth_headers,
+            )
+            if _confirmed_attr:
+                final_reflections.append(
+                    ReflectionContext(
+                        context_type="html_attr_url",
+                        attr_name=_confirmed_attr,
+                        surviving_chars=frozenset("<>\"'"),
+                        snippet=f"{_confirmed_attr}=javascript: URI injection confirmed",
+                        evidence_confidence=0.92,
+                    )
+                )
+                log.info(
+                    "_probe_param: html_attr_url (%s=javascript:) confirmed for param %s at %s",
+                    _confirmed_attr, param_name, url,
+                )
+        except Exception as _href_exc:
+            log.debug("_probe_param: href follow-up failed for %s: %s", param_name, _href_exc)
+
+    # ── HTML tag survival follow-up ───────────────────────────────────────────
+    # Raw `<` may be encoded in text context (e.g. sanitizer encodes &lt;) but
+    # whole HTML tags like <img src=x> can still pass through the filter.
+    # This is different from raw char survival — test a full tag structure.
+    # If <img src=x> survives, the AI can attempt filter-bypass payloads
+    # (event handler obfuscation, alternative tags, mXSS, etc.).
+    already_injectable2 = any(ctx.is_exploitable for ctx in final_reflections)
+    if has_html_body and not already_injectable2:
+        try:
+            _tag_test_payload = f"<img src={canary}>"
+            _tag_test_url = _rebuild_url(url, {**all_params, param_name: _tag_test_payload})
+            _wait()
+            _tag_resp = _session_get(session, _tag_test_url, req_kwargs)
+            _tag_html = _resp_html(_tag_resp)
+            # Check if <img was preserved (tag injection possible even if raw < isn't)
+            if "<img" in _tag_html.lower() and canary.lower() in _tag_html.lower():
+                final_reflections.append(
+                    ReflectionContext(
+                        context_type="html_body",
+                        surviving_chars=frozenset("<>\"'"),
+                        snippet=f"HTML tag injection confirmed (<img> passes filter)",
+                        evidence_confidence=0.88,
+                    )
+                )
+                log.info(
+                    "_probe_param: html_tag_injectable confirmed for param %s at %s "
+                    "(raw < encoded but <img> passes filter)",
+                    param_name, url,
+                )
+        except Exception as _tag_exc:
+            log.debug("_probe_param: html tag follow-up failed for %s: %s", param_name, _tag_exc)
 
     return ProbeResult(
         param_name=param_name,
         original_value=original_value,
-        reflections=[
-            ReflectionContext(
-                context_type=ctx.context_type,
-                attr_name=ctx.attr_name,
-                surviving_chars=surviving,
-                snippet=ctx.snippet,
-                context_before=ctx.context_before,
-            )
-            for ctx in reflections
-        ],
+        reflection_transform=reflection_transform,
+        discovery_style=probe_seed.style,
+        probe_mode=probe_plan.mode,
+        tested_chars=probe_plan.chars,
+        reflections=final_reflections,
     )
 
 
 def _probe_param_playwright(
-    dyn_session: Any,
+    page: Any,
     url: str,
     param_name: str,
     original_value: str,
@@ -621,57 +1257,82 @@ def _probe_param_playwright(
     delay: float,
     ua_cycle: Any,
     proxy_cycle: Any | None,
+    waf: str | None = None,
     auth_headers: dict[str, str] | None = None,
 ) -> ProbeResult:
-    """Probe a single parameter using a shared Playwright browser session.
+    """Probe a single parameter using a shared Playwright page.
 
-    Used when WAF detection indicates a real browser is required (akamai,
-    cloudflare, datadome, etc.). The caller holds the DynamicSession context
-    open across all parameter probes for the same URL so only one browser
-    launch is needed.
+    Used when WAF detection indicates a real browser is required. The caller
+    owns the Playwright browser context so session cookies and auth state are
+    preserved across every probe request.
     """
-    extra_headers: dict[str, str] = {**(auth_headers or {}), "User-Agent": next(ua_cycle)}
-    fetch_kwargs: dict[str, Any] = {"extra_headers": extra_headers}
-    if proxy_cycle:
-        fetch_kwargs["proxy"] = next(proxy_cycle)
 
+    probe_seed = _probe_seed_for_param(param_name, canary, original_value)
+    probe_plan = _adaptive_probe_plan(
+        url=url,
+        waf=waf,
+        auth_headers=auth_headers,
+        param_name=param_name,
+        param_count=len(all_params),
+    )
+    probe_marker = _PROBE_OPEN + probe_plan.chars + _PROBE_CLOSE
     # Phase 1 — reflection mapping
     if delay > 0:
         time.sleep(delay)
     try:
-        resp1 = dyn_session.fetch(
-            _rebuild_url(url, {**all_params, param_name: canary}), **fetch_kwargs
+        resp1_html = _page_fetch_html(
+            page,
+            _rebuild_url(url, {**all_params, param_name: probe_seed.reflection_value}),
         )
     except Exception as exc:
-        return ProbeResult(param_name=param_name, original_value=original_value, error=str(exc))
+        return ProbeResult(
+            param_name=param_name,
+            original_value=original_value,
+            error=str(exc),
+            discovery_style=probe_seed.style,
+            probe_mode=probe_plan.mode,
+            tested_chars=probe_plan.chars,
+        )
 
-    reflections = _find_reflections(_resp_html(resp1), canary)
+    html1 = resp1_html
+    reflections = _find_reflections(html1, canary)
+    reflection_transform = _reflection_transform(html1, canary)
     if not reflections:
-        return ProbeResult(param_name=param_name, original_value=original_value)
+        return ProbeResult(
+            param_name=param_name,
+            original_value=original_value,
+            reflection_transform=reflection_transform,
+            discovery_style=probe_seed.style,
+            probe_mode=probe_plan.mode,
+            tested_chars=probe_plan.chars,
+        )
 
     # Phase 2 — character survival
-    char_probe = canary + _PROBE_OPEN + PROBE_CHARS + _PROBE_CLOSE
     if delay > 0:
         time.sleep(delay)
     try:
-        resp2 = dyn_session.fetch(
-            _rebuild_url(url, {**all_params, param_name: char_probe}), **fetch_kwargs
+        resp2_html = _page_fetch_html(
+            page,
+            _rebuild_url(
+                url,
+                {**all_params, param_name: probe_seed.reflection_value + probe_marker},
+            ),
         )
-        surviving = _analyze_char_survival(_resp_html(resp2), canary)
+        surviving = _analyze_char_survival(resp2_html, canary)
+        if reflection_transform == "upper":
+            surviving = surviving.union(frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZ"))
     except Exception:
         surviving = frozenset()
 
     return ProbeResult(
         param_name=param_name,
         original_value=original_value,
+        reflection_transform=reflection_transform,
+        discovery_style=probe_seed.style,
+        probe_mode=probe_plan.mode,
+        tested_chars=probe_plan.chars,
         reflections=[
-            ReflectionContext(
-                context_type=ctx.context_type,
-                attr_name=ctx.attr_name,
-                surviving_chars=surviving,
-                snippet=ctx.snippet,
-                context_before=ctx.context_before,
-            )
+            _clone_reflection_context(ctx, surviving_chars=surviving)
             for ctx in reflections
         ],
     )
@@ -685,6 +1346,7 @@ def probe_url(
     on_result: Callable[[ProbeResult], None] | None = None,
     auth_headers: dict[str, str] | None = None,
     sink_url: str | None = None,
+    crawled_pages: list[str] | None = None,
 ) -> list[ProbeResult]:
     """Probe all query parameters of *url* for XSS reflection contexts.
 
@@ -743,55 +1405,109 @@ def probe_url(
 
     if needs_browser:
         log.info("WAF=%s — using Playwright for probe requests", waf)
-        from scrapling.fetchers import DynamicSession
-        with DynamicSession(headless=True, timeout=45_000) as dyn:
-            for param_name, original_value in flat_params.items():
-                result = _probe_param_playwright(
-                    dyn, url, param_name, original_value, flat_params,
-                    canary=canary, delay=delay, ua_cycle=ua_cycle, proxy_cycle=proxy_cycle,
-                    auth_headers=auth_headers,
-                )
-                # --sink-url: DynamicSession maintains cookies across fetch() calls
-                # within the same session, so the stored canary is visible on sink_url.
-                if sink_url and not result.reflections and not result.error:
-                    try:
-                        if delay > 0:
-                            time.sleep(delay)
-                        _sink_resp = dyn.fetch(sink_url)
-                        _sink_refs = _find_reflections(_resp_html(_sink_resp), canary)
-                        if _sink_refs:
-                            _char_probe = canary + _PROBE_OPEN + PROBE_CHARS + _PROBE_CLOSE
-                            _char_url = _rebuild_url(url, {**flat_params, param_name: _char_probe})
+        from playwright.sync_api import sync_playwright
+
+        proxy = next(proxy_cycle) if proxy_cycle else None
+        user_agent = next(ua_cycle)
+        extra_headers, cookies, browser_user_agent = _browser_context_auth(
+            url,
+            auth_headers,
+            user_agent,
+        )
+        launch_kwargs: dict[str, Any] = {
+            "headless": True,
+            "args": ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+        }
+        if proxy:
+            launch_kwargs["proxy"] = {"server": proxy}
+
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(**launch_kwargs)
+            context = browser.new_context(
+                ignore_https_errors=True,
+                extra_http_headers={**extra_headers, "Accept": "text/html,application/xhtml+xml"},
+                user_agent=browser_user_agent,
+            )
+            try:
+                if cookies:
+                    context.add_cookies(cookies)
+
+                def _route_handler(route: Any) -> None:
+                    if route.request.resource_type in {"image", "media", "font", "stylesheet"}:
+                        route.abort()
+                    else:
+                        route.continue_()
+
+                context.route("**/*", _route_handler)
+                page = context.new_page()
+
+                for param_name, original_value in flat_params.items():
+                    probe_seed = _probe_seed_for_param(param_name, canary, original_value)
+                    probe_plan = _adaptive_probe_plan(
+                        url=url,
+                        waf=waf,
+                        auth_headers=auth_headers,
+                        param_name=param_name,
+                        param_count=len(flat_params),
+                    )
+                    result = _probe_param_playwright(
+                        page, url, param_name, original_value, flat_params,
+                        canary=canary, delay=delay, ua_cycle=ua_cycle, proxy_cycle=proxy_cycle,
+                        waf=waf,
+                        auth_headers=auth_headers,
+                    )
+                    if sink_url and not result.reflections and not result.error:
+                        try:
                             if delay > 0:
                                 time.sleep(delay)
-                            dyn.fetch(_char_url)
-                            if delay > 0:
-                                time.sleep(delay)
-                            _sink_resp2 = dyn.fetch(sink_url)
-                            _surviving = _analyze_char_survival(_resp_html(_sink_resp2), canary)
-                            result = ProbeResult(
-                                param_name=param_name,
-                                original_value=original_value,
-                                reflections=[
-                                    ReflectionContext(
-                                        context_type=ctx.context_type,
-                                        attr_name=ctx.attr_name,
-                                        surviving_chars=_surviving,
-                                        snippet=ctx.snippet,
-                                        context_before=ctx.context_before,
-                                    )
-                                    for ctx in _sink_refs
-                                ],
-                            )
-                            log.debug(
-                                "probe_url (browser): canary found in sink_url %s for param %s",
-                                sink_url, param_name,
-                            )
-                    except Exception as _exc:
-                        log.debug("probe_url (browser): sink_url check failed: %s", _exc)
-                results.append(result)
-                if on_result:
-                    on_result(result)
+                            _sink_html = _page_fetch_html(page, sink_url)
+                            _sink_refs = _find_reflections(_sink_html, canary)
+                            if _sink_refs:
+                                _char_url = _rebuild_url(
+                                    url,
+                                    {
+                                        **flat_params,
+                                        param_name: (
+                                            probe_seed.reflection_value
+                                            + _PROBE_OPEN
+                                            + probe_plan.chars
+                                            + _PROBE_CLOSE
+                                        ),
+                                    },
+                                )
+                                if delay > 0:
+                                    time.sleep(delay)
+                                _page_fetch_html(page, _char_url)
+                                if delay > 0:
+                                    time.sleep(delay)
+                                _sink_html2 = _page_fetch_html(page, sink_url)
+                                _surviving = _analyze_char_survival(_sink_html2, canary)
+                                if _reflection_transform(_sink_html, canary) == "upper":
+                                    _surviving = _surviving.union(frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZ"))
+                                result = ProbeResult(
+                                    param_name=param_name,
+                                    original_value=original_value,
+                                    reflection_transform=_reflection_transform(_sink_html, canary),
+                                    discovery_style=probe_seed.style,
+                                    probe_mode=probe_plan.mode,
+                                    tested_chars=probe_plan.chars,
+                                    reflections=[
+                                        _clone_reflection_context(ctx, surviving_chars=_surviving)
+                                        for ctx in _sink_refs
+                                    ],
+                                )
+                                log.debug(
+                                    "probe_url (browser): canary found in sink_url %s for param %s",
+                                    sink_url, param_name,
+                                )
+                        except Exception as _exc:
+                            log.debug("probe_url (browser): sink_url check failed: %s", _exc)
+                    results.append(result)
+                    if on_result:
+                        on_result(result)
+            finally:
+                context.close()
+                browser.close()
     else:
         # Parallel probe: each thread gets its own FetcherSession; the shared
         # token-bucket rate limiter ensures the global req/s cap is respected.
@@ -816,9 +1532,11 @@ def probe_url(
                     canary=canary, delay=0,
                     ua_cycle=cycle([ua]),
                     proxy_cycle=cycle([proxy]) if proxy else None,
+                    waf=waf,
                     auth_headers=auth_headers,
                     rate_limiter=rl,
                     sink_url=sink_url,
+                    crawled_pages=crawled_pages,
                 )
 
         n_workers = min(len(flat_params), _PROBE_MAX_WORKERS)
@@ -930,6 +1648,14 @@ def probe_post_form(
         retries=1,
     ) as session:
         for param_name in param_names:
+            probe_seed = _probe_seed_for_param(param_name, canary, "")
+            probe_plan = _adaptive_probe_plan(
+                url=action_url,
+                waf=waf,
+                auth_headers=auth_headers,
+                param_name=param_name,
+                param_count=len(param_names),
+            )
             merged_headers: dict[str, str] = {
                 **(auth_headers or {}),
                 "User-Agent": next(ua_cycle),
@@ -976,11 +1702,20 @@ def probe_post_form(
             if delay > 0:
                 time.sleep(delay)
             try:
-                resp1 = session.post(action_url, data=_build_post_body(canary), **req_kwargs)
+                resp1 = session.post(
+                    action_url,
+                    data=_build_post_body(probe_seed.reflection_value),
+                    **req_kwargs,
+                )
                 html1 = _resp_html(resp1)
             except Exception as exc:
                 result = ProbeResult(
-                    param_name=param_name, original_value="", error=str(exc)
+                    param_name=param_name,
+                    original_value="",
+                    error=str(exc),
+                    discovery_style=probe_seed.style,
+                    probe_mode=probe_plan.mode,
+                    tested_chars=probe_plan.chars,
                 )
                 results.append(result)
                 if on_result:
@@ -988,6 +1723,7 @@ def probe_post_form(
                 continue
 
             reflections = _find_reflections(html1, canary)
+            reflection_transform = _reflection_transform(html1, canary)
 
             # --- Follow-up page check for session-stored XSS ---
             # If the POST response itself doesn't reflect the canary, the input
@@ -1005,7 +1741,7 @@ def probe_post_form(
                 _follow_up_candidates = list(dict.fromkeys(
                     ([sink_url] if sink_url else [])
                     + [source_page_url, _origin_root]
-                    + list(crawled_pages or [])[:_FOLLOW_UP_CRAWLED_LIMIT]
+                    + list(crawled_pages or [])[:probe_plan.follow_up_limit]
                 ))
                 for _fu in _follow_up_candidates:
                     try:
@@ -1017,6 +1753,7 @@ def probe_post_form(
                         if _fu_refs:
                             reflections = _fu_refs
                             follow_up_url = _fu
+                            reflection_transform = _reflection_transform(_fu_html, canary)
                             log.debug(
                                 "POST probe: canary found on follow-up page %s (session-stored)",
                                 _fu,
@@ -1027,13 +1764,16 @@ def probe_post_form(
 
             if not reflections:
                 result = ProbeResult(param_name=param_name, original_value="")
+                result.discovery_style = probe_seed.style
+                result.reflection_transform = reflection_transform
+                result.probe_mode = probe_plan.mode
+                result.tested_chars = probe_plan.chars
                 results.append(result)
                 if on_result:
                     on_result(result)
                 continue
 
             # --- Step 3: Char survival probe ---
-            char_probe_val = canary + _PROBE_OPEN + PROBE_CHARS + _PROBE_CLOSE
             if delay > 0:
                 time.sleep(delay)
             surviving = frozenset()
@@ -1059,7 +1799,9 @@ def probe_post_form(
                         char_body[hname] = hval
                 if csrf_field and current_csrf is not None:
                     char_body[csrf_field] = current_csrf
-                char_body[param_name] = char_probe_val
+                char_body[param_name] = (
+                    probe_seed.reflection_value + _PROBE_OPEN + probe_plan.chars + _PROBE_CLOSE
+                )
 
                 resp2 = session.post(action_url, data=char_body, **req_kwargs)
 
@@ -1080,14 +1822,12 @@ def probe_post_form(
             result = ProbeResult(
                 param_name=param_name,
                 original_value="",
+                reflection_transform=reflection_transform,
+                discovery_style=probe_seed.style,
+                probe_mode=probe_plan.mode,
+                tested_chars=probe_plan.chars,
                 reflections=[
-                    ReflectionContext(
-                        context_type=ctx.context_type,
-                        attr_name=ctx.attr_name,
-                        surviving_chars=surviving,
-                        snippet=ctx.snippet,
-                        context_before=ctx.context_before,
-                    )
+                    _clone_reflection_context(ctx, surviving_chars=surviving)
                     for ctx in reflections
                 ],
             )
@@ -1096,6 +1836,86 @@ def probe_post_form(
                 on_result(result)
 
     return results
+
+
+def _probe_href_injectable(
+    url: str,
+    param_name: str,
+    original_value: str,
+    canary: str,
+    rate: float,
+    auth_headers: dict[str, str] | None,
+) -> str | None:
+    """Follow-up probe: check whether a javascript: URI survives into href/formaction.
+
+    Injects ``<a href="javascript:{canary}">x</a>`` and
+    ``<button formaction="javascript:{canary}">x</button>`` as the param value
+    and checks the HTTP response for literal href/formaction URI reflection.
+
+    Returns the attribute name ("href" or "formaction") if confirmed, else None.
+    """
+    parsed = urllib.parse.urlparse(url)
+    raw_params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+    flat_params = {k: v[0] for k, v in raw_params.items()}
+
+    ua_list = _load_rotation_values(os.environ.get("AXSS_USER_AGENTS")) or [
+        "axss/0.1 (+authorized security testing; scrapling)"
+    ]
+    merged_headers: dict[str, str] = {**(auth_headers or {}), "User-Agent": ua_list[0]}
+    req_kwargs: dict[str, Any] = {"headers": merged_headers}
+
+    delay = max(0.0, 1.0 / rate) if rate > 0 else 0.0
+
+    def _wait() -> None:
+        if delay > 0:
+            time.sleep(delay)
+
+    probes = [
+        ("href", f'<a href="javascript:{canary}">x</a>'),
+        ("formaction", f'<button formaction="javascript:{canary}">x</button>'),
+    ]
+
+    try:
+        with FetcherSession(impersonate="chrome", stealthy_headers=True, timeout=20,
+                            follow_redirects=True, retries=1) as session:
+            for attr_name, inject_value in probes:
+                _wait()
+                try:
+                    test_url = _rebuild_url(url, {**flat_params, param_name: inject_value})
+                    resp = _session_get(session, test_url, req_kwargs)
+                    html = _resp_html(resp)
+                    # Case-insensitive check for the attribute name, case-sensitive for canary value
+                    pattern = re.compile(
+                        rf'(?i){re.escape(attr_name)}\s*=\s*["\']?javascript:{re.escape(canary)}',
+                    )
+                    if pattern.search(html):
+                        log.debug(
+                            "_probe_href_injectable: confirmed %s=javascript: for param %s at %s",
+                            attr_name, param_name, url,
+                        )
+                        return attr_name
+                except Exception as exc:
+                    log.debug("_probe_href_injectable: request failed for %s: %s", attr_name, exc)
+    except Exception as exc:
+        log.debug("_probe_href_injectable: session setup failed: %s", exc)
+
+    return None
+
+
+def make_fast_probe_result(param_name: str, original_value: str) -> "ProbeResult":
+    """Synthetic probe result for fast (no-probe) mode. Covers all contexts."""
+    ctx = ReflectionContext(
+        context_type="fast_omni",
+        surviving_chars=frozenset("<>\"'`=;/()"),  # assume everything survives
+        snippet="[fast mode — no probe]",
+        evidence_confidence=0.5,
+    )
+    return ProbeResult(
+        param_name=param_name,
+        original_value=original_value,
+        reflections=[ctx],
+        probe_mode="fast_omni",
+    )
 
 
 def enrich_context(context: ParsedContext, probe_results: list[ProbeResult]) -> ParsedContext:
@@ -1119,10 +1939,29 @@ def enrich_context(context: ParsedContext, probe_results: list[ProbeResult]) -> 
         for ctx in result.reflections:
             chars_str = "".join(sorted(ctx.surviving_chars)) if ctx.surviving_chars else "?"
             status = "INJECTABLE" if ctx.is_exploitable else "chars filtered"
+            tested_chars = getattr(result, "tested_chars", PROBE_CHARS) or PROBE_CHARS
+            probe_mode = getattr(result, "probe_mode", "") or "standard"
             extra_notes.append(
                 f"[probe:CONFIRMED] '{result.param_name}' → {ctx.short_label} "
-                f"surviving={chars_str!r} [{status}]"
+                f"surviving={chars_str!r} tested={tested_chars!r} mode={probe_mode} [{status}]"
             )
+            subcontext_payload = {
+                "param_name": result.param_name,
+                "context_type": ctx.context_type,
+                "attr_name": ctx.attr_name,
+                "tag_name": ctx.tag_name,
+                "quote_style": ctx.quote_style,
+                "html_subcontext": ctx.html_subcontext,
+                "payload_shape": ctx.payload_shape,
+                "attacker_prefix": ctx.attacker_prefix,
+                "attacker_suffix": ctx.attacker_suffix,
+                "snippet": _truncate_context_fragment(ctx.snippet, limit=180, tail=False),
+                "explanation": ctx.subcontext_explanation,
+                "confidence": round(ctx.evidence_confidence, 2) if ctx.evidence_confidence else 0.0,
+                "surviving_chars": sorted(ctx.surviving_chars),
+                "is_injectable": ctx.is_exploitable,
+            }
+            extra_notes.append("[probe:SUBCONTEXT] " + json.dumps(subcontext_payload, ensure_ascii=True))
 
     return dc_replace(
         context,

@@ -10,13 +10,20 @@ Nothing in this module touches disk.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 
 LESSON_TYPE_MAPPING  = "mapping"
 LESSON_TYPE_XSS_LOGIC = "xss_logic"
 LESSON_TYPE_FILTER   = "filter"
+LESSON_TYPE_BEHAVIOR = "behavior"
 
-VALID_LESSON_TYPES = {LESSON_TYPE_MAPPING, LESSON_TYPE_XSS_LOGIC, LESSON_TYPE_FILTER}
+VALID_LESSON_TYPES = {
+    LESSON_TYPE_MAPPING,
+    LESSON_TYPE_XSS_LOGIC,
+    LESSON_TYPE_FILTER,
+    LESSON_TYPE_BEHAVIOR,
+}
 
 PROBE_CHARSET = frozenset('<>"\';\\/`(){}')
 
@@ -37,40 +44,7 @@ class Lesson:
     frameworks: list[str] = field(default_factory=list)
     auth_required: bool = False
     confidence: float = 0.0
-
-
-# ---------------------------------------------------------------------------
-# Prompt formatting
-# ---------------------------------------------------------------------------
-
-def lessons_prompt_section(lessons: list[Lesson]) -> str:
-    if not lessons:
-        return ""
-    lines = [
-        "Active probe observations for this target "
-        "(use as reasoning context — these reflect what this target actually does):"
-    ]
-    for lesson in lessons:
-        lines.append(
-            f"  type={lesson.lesson_type}  title={lesson.title}  "
-            f"context={lesson.context_type or '-'}  sink={lesson.sink_type or '-'}  "
-            f"delivery={lesson.delivery_mode or '-'}"
-        )
-        lines.append(f"  summary: {lesson.summary}")
-        if lesson.surviving_chars or lesson.blocked_chars:
-            lines.append(
-                f"  filter: surviving={lesson.surviving_chars or '-'} "
-                f"blocked={lesson.blocked_chars or '-'}"
-            )
-        if lesson.frameworks or lesson.waf_name or lesson.auth_required:
-            lines.append(
-                f"  landscape: frameworks={','.join(lesson.frameworks) or '-'}  "
-                f"waf={lesson.waf_name or '-'}  "
-                f"auth_required={'yes' if lesson.auth_required else 'no'}"
-            )
-        lines.append("")
-    return "\n".join(lines)
-
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 # ---------------------------------------------------------------------------
 # Builder helpers
@@ -121,16 +95,18 @@ def build_probe_lessons(
 
     for result in probe_results:
         param_name = str(getattr(result, "param_name", "") or "")
+        tested_charset = _sorted_chars(getattr(result, "tested_chars", PROBE_CHARSET))
         for reflection in getattr(result, "reflections", []):
             context_type = str(getattr(reflection, "context_type", "") or "")
             attr_name    = str(getattr(reflection, "attr_name", "") or "")
             surviving    = _sorted_chars(getattr(reflection, "surviving_chars", frozenset()))
-            blocked      = _sorted_chars(PROBE_CHARSET.difference(set(surviving)))
+            blocked      = _sorted_chars(set(tested_charset).difference(set(surviving)))
             dm           = delivery_mode or str(memory_profile.get("delivery_mode", ""))
             sink_type    = f"probe:{context_type}" if context_type else ""
             waf          = str(memory_profile.get("waf_name", ""))
             fw           = [str(f).lower() for f in memory_profile.get("frameworks", [])]
             auth         = bool(memory_profile.get("auth_required", False))
+            probe_mode   = str(getattr(result, "probe_mode", "") or "")
 
             lessons.append(Lesson(
                 lesson_type=LESSON_TYPE_XSS_LOGIC,
@@ -139,6 +115,7 @@ def build_probe_lessons(
                     f"Parameter '{param_name}' reflected via {dm or 'unknown'} "
                     f"into {context_type}{f'({attr_name})' if attr_name else ''}. "
                     f"{_logic_focus(context_type, attr_name)}"
+                    + (f" Probe mode was {probe_mode}." if probe_mode else "")
                 ).strip(),
                 sink_type=sink_type,
                 context_type=context_type,
@@ -158,7 +135,8 @@ def build_probe_lessons(
                 summary=(
                     f"For {context_type or 'unknown'} reflections, the filter preserved "
                     f"{surviving or 'no critical chars'} and blocked "
-                    f"{blocked or 'none of the probe charset'}. "
+                    f"{blocked or 'none of the tested probe charset'}. "
+                    f" Tested charset was {tested_charset or '-'}."
                     "Bias toward techniques that only require the surviving set."
                 ),
                 sink_type=sink_type,
@@ -270,3 +248,63 @@ def build_mapping_lessons(
         ))
 
     return lessons
+
+
+def build_behavior_lessons(profile: object) -> list[Lesson]:
+    """Build compact operational lessons from a target behavior profile."""
+    if profile is None:
+        return []
+
+    delivery_mode = str(getattr(profile, "delivery_mode", "") or "")
+    waf_name = str(getattr(profile, "waf_name", "") or "")
+    frameworks = list(getattr(profile, "frameworks", []) or [])
+    auth_required = bool(getattr(profile, "auth_required", False))
+    reflected_params = int(getattr(profile, "reflected_params", 0) or 0)
+    injectable_params = int(getattr(profile, "injectable_params", 0) or 0)
+    reflection_contexts = list(getattr(profile, "reflection_contexts", []) or [])
+    reflection_transforms = list(getattr(profile, "reflection_transforms", []) or [])
+    discovery_styles = list(getattr(profile, "discovery_styles", []) or [])
+    observations = list(getattr(profile, "observations", []) or [])
+    dom_sources = list(getattr(profile, "dom_sources", []) or [])
+    dom_sinks = list(getattr(profile, "dom_sinks", []) or [])
+    browser_required = bool(getattr(profile, "browser_required", False))
+
+    summary_parts = [
+        f"Delivery mode is {delivery_mode or 'unknown'} with {reflected_params} reflected and {injectable_params} injectable parameter(s).",
+    ]
+    if browser_required:
+        summary_parts.append("The edge required browser-native session handling.")
+    if reflection_contexts:
+        summary_parts.append(
+            "Confirmed contexts: " + ", ".join(reflection_contexts) + "."
+        )
+    if reflection_transforms:
+        summary_parts.append(
+            "Observed transforms: " + ", ".join(reflection_transforms) + "."
+        )
+    if discovery_styles:
+        summary_parts.append(
+            "Probe styles already tolerated here: " + ", ".join(discovery_styles) + "."
+        )
+    if dom_sources or dom_sinks:
+        summary_parts.append(
+            "DOM landscape: sources="
+            + (", ".join(dom_sources) or "-")
+            + " sinks="
+            + (", ".join(dom_sinks[:6]) or "-")
+            + "."
+        )
+    if observations:
+        summary_parts.append(" ".join(observations[:2]))
+
+    return [Lesson(
+        lesson_type=LESSON_TYPE_BEHAVIOR,
+        title="Target behavior profile",
+        summary=" ".join(summary_parts),
+        source_pattern=f"behavior:{delivery_mode or 'unknown'}",
+        waf_name=waf_name,
+        delivery_mode=delivery_mode,
+        frameworks=[str(item).lower() for item in frameworks if str(item).strip()],
+        auth_required=auth_required,
+        confidence=0.76,
+    )]
