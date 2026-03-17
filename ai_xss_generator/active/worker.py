@@ -862,6 +862,7 @@ def run_worker(
     cloud_attempts: int = 1,
     deep: bool = False,
     fast: bool = False,
+    obliterate: bool = False,
     waf_source: str | None = None,
     keep_searching: bool = False,
     extreme: bool = False,
@@ -903,6 +904,7 @@ def run_worker(
             cloud_attempts=cloud_attempts,
             deep=deep,
             fast=fast,
+            obliterate=obliterate,
             waf_source=waf_source,
             keep_searching=keep_searching,
             extreme=extreme,
@@ -937,6 +939,7 @@ def _run(
     cloud_attempts: int = 1,
     deep: bool = False,
     fast: bool = False,
+    obliterate: bool = False,
     waf_source: str | None = None,
     keep_searching: bool = False,
     extreme: bool = False,
@@ -983,9 +986,9 @@ def _run(
     coordinated_attempts: list[Any] = []
     target_disposition: Any = None
 
-    if fast:
-        # Fast mode: synthesise a ProbeResult for every testable param using the
-        # omni context — no network probing, all params assumed injectable.
+    if fast or obliterate:
+        # Fast/obliterate mode: synthesise a ProbeResult for every testable param
+        # using the omni context — no network probing, all params assumed injectable.
         from ai_xss_generator.probe import make_fast_probe_result
         for _pn, _pv in flat_params.items():
             if _pn.lower() not in testable_params:
@@ -1045,8 +1048,8 @@ def _run(
         log.debug("Pre-parse of %s failed (will retry per-param): %s", url, exc)
 
     session_lessons: list[Any] = []
-    if not fast:
-        # Behavior/disposition/lessons block — skipped in fast mode.
+    if not fast and not obliterate:
+        # Behavior/disposition/lessons block — skipped in fast/obliterate mode.
         try:
             from ai_xss_generator.behavior import (
                 attach_behavior_profile,
@@ -1250,8 +1253,8 @@ def _run(
                     fast_generated_count = 0
                     fast_reflected_count = 0
 
-                    # fast_omni: single cloud call with broad-spectrum prompt,
-                    # no feedback loop, no deep escalation.
+                    # fast_omni: broad-spectrum cloud call, no feedback loop.
+                    # obliterate expands to 3 phases (scout+contextual+research).
                     if context_type == "fast_omni":
                         cloud_escalated = True
                         cloud_model_rounds += 1
@@ -1269,6 +1272,7 @@ def _run(
                             cli_tool=cli_tool,
                             cli_model=cli_model,
                             session_lessons=session_lessons,
+                            deep=deep or obliterate,
                         ))
                         cloud_payloads, _ = _unique_new_payloads(cloud_plan.payloads, seen_cloud_payloads)
                         fast_generated_count += len(cloud_payloads)
@@ -2451,6 +2455,7 @@ def run_dom_worker(
     cloud_attempts: int = 1,
     deep: bool = False,
     fast: bool = False,
+    obliterate: bool = False,
     waf_source: str | None = None,
     keep_searching: bool = False,
     extreme: bool = False,
@@ -2486,6 +2491,7 @@ def run_dom_worker(
             cloud_attempts=cloud_attempts,
             deep=deep,
             fast=fast,
+            obliterate=obliterate,
             waf_source=waf_source,
             keep_searching=keep_searching,
             extreme=extreme,
@@ -2514,6 +2520,7 @@ def _run_dom(
     cloud_attempts: int = 1,
     deep: bool = False,
     fast: bool = False,
+    obliterate: bool = False,
     waf_source: str | None = None,
     keep_searching: bool = False,
     extreme: bool = False,
@@ -2666,8 +2673,8 @@ def _run_dom(
                 ai_engine = ""
                 ai_note = ""
                 local_stage = None
-                # fast mode: bypass local model entirely — cloud fires immediately
-                local_done = (not escalation_policy.use_local) or fast
+                # fast/obliterate mode: bypass local model — cloud fires immediately
+                local_done = (not escalation_policy.use_local) or fast or obliterate
                 local_payloads: list[str] = []
                 local_payloads_tried = False
                 cloud_stage = None
@@ -2774,7 +2781,7 @@ def _run_dom(
                                 session_lessons=dom_session_lessons,
                                 feedback_lessons=cloud_feedback_lessons,
                                 phase_profile=phase_profile,
-                                deep=deep,
+                                deep=deep or obliterate,
                             ))
 
                     if cloud_stage is not None:
@@ -3233,11 +3240,14 @@ def _get_fast_omni_payloads(
     cli_model: str | None = None,
     session_lessons: list[Any] | None = None,
     delivery_mode: str = "get",
+    deep: bool = False,
 ) -> CloudPayloadPlan:
     """Generate payloads in fast omni mode (no probe was run).
 
     Passes ``phase_profile="fast_omni"`` to ``generate_cloud_payloads`` so the
     prompt is augmented with broad-spectrum multi-context instructions.
+    When ``deep=True`` (obliterate mode) all three generation phases run:
+    scout → contextual → research, each with the broad-spectrum prompt.
     No probe_result enrichment is performed — base_context is passed directly.
     """
     use_dedup = True
@@ -3271,6 +3281,7 @@ def _get_fast_omni_payloads(
             cli_model=cli_model,
             memory_profile=memory_profile,
             phase_profile="fast_omni",
+            deep=deep,
         )
         result_plan = CloudPayloadPlan(
             payloads=[p.payload for p in payloads if p.payload],
@@ -3320,6 +3331,7 @@ def run_post_worker(
     cloud_attempts: int = 1,
     deep: bool = False,
     fast: bool = False,
+    obliterate: bool = False,
     waf_source: str | None = None,
     keep_searching: bool = False,
     extreme: bool = False,
@@ -3355,6 +3367,7 @@ def run_post_worker(
             cloud_attempts=cloud_attempts,
             deep=deep,
             fast=fast,
+            obliterate=obliterate,
             waf_source=waf_source,
             keep_searching=keep_searching,
             extreme=extreme,
@@ -3390,6 +3403,7 @@ def _run_post(
     cloud_attempts: int = 1,
     deep: bool = False,
     fast: bool = False,
+    obliterate: bool = False,
     waf_source: str | None = None,
     keep_searching: bool = False,
     extreme: bool = False,
@@ -3436,8 +3450,8 @@ def _run_post(
     generation_context = _cached_context
     effective_sink_url = sink_url
 
-    if fast:
-        # Fast mode: synthesise a ProbeResult for every param — no network probing.
+    if fast or obliterate:
+        # Fast/obliterate mode: synthesise a ProbeResult for every param — no network probing.
         from ai_xss_generator.probe import make_fast_probe_result
         probe_results = [
             make_fast_probe_result(pn, "") for pn in post_form.param_names
@@ -3475,7 +3489,7 @@ def _run_post(
     post_session_lessons: list[Any] = []
     target_disposition: Any = None
     try:
-        if not fast and not _timed_out():
+        if not fast and not obliterate and not _timed_out():
             discovered_sink_url, sink_reflection, parsed_sink_context = _autodiscover_post_sink_context(
                 executor=executor,
                 post_form=post_form,
@@ -3500,7 +3514,7 @@ def _run_post(
                     parsed_sink_context = attach_waf_knowledge(parsed_sink_context, analyze_waf_source(waf_source))
                 generation_context = parsed_sink_context
 
-        if not fast:
+        if not fast and not obliterate:
             from ai_xss_generator.behavior import (
                 attach_behavior_profile,
                 build_target_behavior_profile,
@@ -3684,7 +3698,8 @@ def _run_post(
                     fast_generated_count = 0
                     fast_reflected_count = 0
 
-                    # fast_omni: single broad-spectrum cloud call, no feedback loop.
+                    # fast_omni: broad-spectrum cloud call, no feedback loop.
+                    # obliterate expands to 3 phases (scout+contextual+research).
                     if context_type == "fast_omni":
                         cloud_escalated = True
                         cloud_model_rounds += 1
@@ -3703,6 +3718,7 @@ def _run_post(
                             cli_model=cli_model,
                             session_lessons=post_session_lessons,
                             delivery_mode="post",
+                            deep=deep or obliterate,
                         ))
                         cloud_payloads, _ = _unique_new_payloads(cloud_plan.payloads, seen_cloud_payloads)
                         fast_generated_count += len(cloud_payloads)

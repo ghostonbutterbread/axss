@@ -506,6 +506,17 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--obliterate",
+        action="store_true",
+        default=False,
+        help=(
+            "--obliterate  Maximum coverage mode: combines --fast (skip probe, assume all "
+            "params injectable) with full 3-phase deep generation (scout → contextual → "
+            "research), each using a broad-spectrum multi-context prompt. No probe delay, "
+            "maximum AI payload breadth. Higher API spend than either --fast or --deep alone."
+        ),
+    )
+    parser.add_argument(
         "--extreme",
         action="store_true",
         default=False,
@@ -1321,7 +1332,9 @@ def _run_active_scan(
         info("Active scan profile: extreme")
     if getattr(args, "research", False):
         info("Active scan profile: research")
-    if getattr(args, "deep", False):
+    if getattr(args, "obliterate", False):
+        info("AI phase mode: obliterate (fast probe-skip + 3-phase broad-spectrum generation)")
+    elif getattr(args, "deep", False):
         info("AI phase mode: deep")
     if getattr(args, "keep_searching", False):
         info("Post-confirmation mode: keep searching for distinct variants")
@@ -1365,6 +1378,7 @@ def _run_active_scan(
         cloud_attempts=getattr(args, "attempts", 1),
         deep=getattr(args, "deep", False),
         fast=getattr(args, "fast", False),
+        obliterate=getattr(args, "obliterate", False),
         waf_source=getattr(args, "waf_source", None),
         keep_searching=getattr(args, "keep_searching", False),
         extreme=getattr(args, "extreme", False),
@@ -1396,7 +1410,8 @@ def _run_active_scan(
         f"rate={args.rate:g} req/s | workers={scan_config.workers} | "
         f"model={scan_config.model} | waf={waf or 'none'} | "
         f"cloud_attempts={scan_config.cloud_attempts}"
-        + (" | deep=true" if getattr(args, "deep", False) else "")
+        + (" | obliterate=true" if getattr(args, "obliterate", False) else
+           " | deep=true" if getattr(args, "deep", False) else "")
         + (" | profile=extreme" if getattr(args, "extreme", False) else "")
         + (" | profile=research" if getattr(args, "research", False) else "")
         + (" | keep_searching=true" if getattr(args, "keep_searching", False) else "")

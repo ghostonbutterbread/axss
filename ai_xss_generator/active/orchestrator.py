@@ -72,6 +72,7 @@ class ActiveScanConfig:
     cloud_attempts: int = 1       # recursive cloud reasoning rounds per context
     deep: bool = False
     fast: bool = False            # skip local triage, run cloud Gen XSS directly
+    obliterate: bool = False      # fast + deep: skip probe, 3-phase broad-spectrum generation
     blind_callback: str | None = None  # OOB callback URL for blind XSS payloads
     waf_source: str | None = None # local path to open-source WAF/filter code for planning hints
     keep_searching: bool = False
@@ -395,6 +396,7 @@ def run_active_scan(
                                 "crawled_pages": crawled_pages_list,
                                 "deep": config.deep,
                                 "fast": config.fast,
+                                "obliterate": config.obliterate,
                                 "waf_source": config.waf_source,
                                 "keep_searching": config.keep_searching,
                                 "extreme": config.extreme,
@@ -420,6 +422,7 @@ def run_active_scan(
                                 "dedup_lock": dedup_lock,
                                 "auth_headers": config.auth_headers,
                                 "fast": config.fast,
+                                "obliterate": config.obliterate,
                                 "waf_source": config.waf_source,
                                 "keep_searching": config.keep_searching,
                                 "extreme": config.extreme,
@@ -465,6 +468,7 @@ def run_active_scan(
                                 "sink_url": config.sink_url,
                                 "deep": config.deep,
                                 "fast": config.fast,
+                                "obliterate": config.obliterate,
                                 "waf_source": config.waf_source,
                                 "keep_searching": config.keep_searching,
                                 "extreme": config.extreme,
