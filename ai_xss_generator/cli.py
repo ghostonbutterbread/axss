@@ -467,9 +467,9 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help=(
-            "--fast  Skip local model triage and run cloud Gen XSS directly on every "
-            "reflection context. Faster per-target but spends cloud API budget without "
-            "intelligent gating. Default (no flag) uses the local model to triage first."
+            "--fast  (default) Skip probe, run broad-spectrum Gen XSS directly. "
+            "No char-survival analysis — payloads cover all contexts at once. "
+            "Fastest mode. Explicit flag is a no-op since this is the default behavior."
         ),
     )
     parser.add_argument(
@@ -477,11 +477,11 @@ def build_parser(config_default_model: str) -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help=(
-            "--deep  Engage reasoning model strategy analysis before cloud Gen XSS. "
-            "The reasoning model analyses each triage-approved injection point and "
-            "produces a strategy brief that guides payload generation. Slower but "
-            "produces highly targeted payloads for hard targets. Pairs with scan-type "
-            "flags (e.g. --deep --stored) to scope where reasoning is applied."
+            "--deep  Full probe + 3-phase targeted generation. Probes each parameter "
+            "first (char-survival analysis, reflection context detection) then runs "
+            "all three AI phases (scout → contextual → research) using that real context. "
+            "Slower but finds context-specific injections (JS string escapes, "
+            "attribute breakouts, href/formaction bypasses) that the default mode misses."
         ),
     )
     parser.add_argument(
@@ -1363,7 +1363,9 @@ def _run_active_scan(
     if getattr(args, "obliterate", False):
         info("AI phase mode: obliterate (fast probe-skip + 3-phase broad-spectrum generation)")
     elif getattr(args, "deep", False):
-        info("AI phase mode: deep")
+        info("AI phase mode: deep (probe + 3-phase targeted generation)")
+    else:
+        info("AI phase mode: fast (default — broad-spectrum Gen XSS, no probe)")
     if getattr(args, "keep_searching", False):
         info("Post-confirmation mode: keep searching for distinct variants")
     if getattr(args, "waf_source", None):
@@ -1405,7 +1407,7 @@ def _run_active_scan(
         cli_model=ai_config.cli_model,
         cloud_attempts=getattr(args, "attempts", 1),
         deep=getattr(args, "deep", False),
-        fast=getattr(args, "fast", False),
+        fast=not getattr(args, "deep", False) and not getattr(args, "obliterate", False),
         obliterate=getattr(args, "obliterate", False),
         fresh=getattr(args, "fresh", False),
         waf_source=getattr(args, "waf_source", None),

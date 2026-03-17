@@ -24,16 +24,13 @@ axss --help
 ## Quick start
 
 ```bash
-# Full active scan (fast mode by default)
+# Default — broad-spectrum Gen XSS, no probe (fast is the default)
 axss -u "https://target.tld" --active
 
-# Skip probe — broad-spectrum payloads, fastest possible scan
-axss -u "https://target.tld" --active --fast
-
-# Full phased generation on every attempt
+# Full probe + 3-phase targeted generation — finds context-specific injections
 axss -u "https://target.tld" --active --deep
 
-# Maximum coverage: skip probe AND run full 3-phase generation
+# Maximum coverage: no probe + full 3-phase broad-spectrum
 axss -u "https://target.tld" --active --obliterate
 
 # Stored XSS only
@@ -91,10 +88,9 @@ active scan
 
 | Flag | Probe | Phases | Best for |
 |------|-------|--------|----------|
-| *(default)* | full | scout → escalate | general use |
-| `--fast` | skip | 1 broad-spectrum | quick triage, known-clean targets |
-| `--deep` | full | 3 phases always | thorough, hard-to-hit contexts |
-| `--obliterate` | skip | 3 phases broad-spectrum | maximum speed + maximum payload variety |
+| *(default)* / `--fast` | skip | 1 broad-spectrum | general use — fast Gen XSS across all contexts |
+| `--deep` | full | 3 phases targeted | thorough assessment, context-specific injections (JS strings, attr breakouts, href bypass) |
+| `--obliterate` | skip | 3 phases broad-spectrum | maximum payload variety at full speed |
 
 ## Cache behavior
 
