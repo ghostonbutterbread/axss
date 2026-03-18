@@ -467,6 +467,18 @@ def _build_scan_parser(
         ),
     )
 
+    # ── Pre-flight ────────────────────────────────────────────────────────
+    scan.add_argument(
+        "--live",
+        action="store_true",
+        default=False,
+        help=(
+            "Force pre-flight liveness check even for --urls lists. "
+            "By default, liveness checking is skipped for --urls (large pre-enumerated lists) "
+            "and runs automatically for -u (crawler-discovered URLs)."
+        ),
+    )
+
     # ── Active scan tuning ────────────────────────────────────────────────
     scan.add_argument(
         "--workers",
@@ -1372,6 +1384,9 @@ def _run_active_scan(
         keep_searching=getattr(args, "keep_searching", False),
         extreme=getattr(args, "extreme", False),
         research=getattr(args, "research", False),
+        # --urls = pre-enumerated list: skip liveness by default, --live overrides
+        # -u     = crawler-discovered: always check (list is small and fresh)
+        skip_liveness=bool(args.urls) and not getattr(args, "live", False),
     )
 
     # ── Pre-scan session validity check ──────────────────────────────────────

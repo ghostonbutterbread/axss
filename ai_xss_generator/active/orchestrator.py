@@ -84,6 +84,7 @@ class ActiveScanConfig:
     keep_searching: bool = False
     extreme: bool = False
     research: bool = False
+    skip_liveness: bool = False   # skip pre-flight HEAD checks (default for --urls lists)
 
 
 def _auto_workers(rate: float, explicit_workers: int) -> int:
@@ -368,11 +369,12 @@ def run_active_scan(
     # Pre-flight: deduplicate parametric path variants, then drop dead URLs
     if url_list:
         url_list = _dedup_urls_by_path_shape(url_list)
-        url_list = _filter_live_urls(
-            url_list,
-            auth_headers=config.auth_headers,
-            rate_limiter=rate_limiter,
-        )
+        if not config.skip_liveness:
+            url_list = _filter_live_urls(
+                url_list,
+                auth_headers=config.auth_headers,
+                rate_limiter=rate_limiter,
+            )
 
     # Build work items filtered by enabled scan types
     work_items: list[tuple[str, Any]] = []
