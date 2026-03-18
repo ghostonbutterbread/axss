@@ -425,6 +425,7 @@ def discover_dom_taint_paths(
     browser,
     auth_headers: dict[str, str] | None = None,
     timeout_ms: int = _NAV_TIMEOUT_MS,
+    sources: list[tuple[str, str]] | None = None,
 ) -> list[DomTaintHit]:
     """Return tainted DOM source → sink paths discovered via runtime sink hooking.
 
@@ -443,29 +444,38 @@ def discover_dom_taint_paths(
       - referrer               : canary embedded in Referer HTTP header
     """
     hits_out: list[DomTaintHit] = []
+
+    # Build sources list — caller can restrict to URL params only (Normal mode)
+    # by passing an explicit list. None = full set (Deep mode / existing behaviour).
+    if sources is not None:
+        _sources = sources
+    else:
+        parsed = urllib.parse.urlparse(url)
+        raw_params = dict(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True))
+        # URL-injectable sources
+        _sources: list[tuple[str, str]] = [("query_param", k) for k in raw_params]
+        _sources.append(("fragment", "hash"))
+        # Non-URL sources: injection handled via init script / request headers
+        _sources += [
+            ("window_name",     "window.name"),
+            ("local_storage",   "localStorage"),
+            ("session_storage", "sessionStorage"),
+            ("referrer",        "document.referrer"),
+        ]
+
+    # Early exit if no sources to probe
+    if not _sources:
+        return []
+
     canary = _make_canary()
     _auth = auth_headers or {}
 
-    parsed = urllib.parse.urlparse(url)
-    raw_params = dict(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True))
-
-    # URL-injectable sources
-    sources: list[tuple[str, str]] = [("query_param", k) for k in raw_params]
-    sources.append(("fragment", "hash"))
-    # Non-URL sources: injection handled via init script / request headers
-    sources += [
-        ("window_name",     "window.name"),
-        ("local_storage",   "localStorage"),
-        ("session_storage", "sessionStorage"),
-        ("referrer",        "document.referrer"),
-    ]
-
-    _debug(f"DOM XSS scan: {url}  canary={canary}  sources={[s[1] for s in sources]}")
+    _debug(f"DOM XSS scan: {url}  canary={canary}  sources={[s[1] for s in _sources]}")
 
     # Dedup: avoid reporting the same (source_name, sink) pair twice
     seen: set[tuple[str, str]] = set()
 
-    for source_type, source_name in sources:
+    for source_type, source_name in _sources:
         # Build URL (unchanged for non-URL sources)
         canary_url = _inject_source(url, source_type, source_name, canary)
 
