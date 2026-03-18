@@ -342,6 +342,29 @@ def _dedup_urls_by_path_shape(url_list: list[str]) -> list[str]:
     return result
 
 
+def _strip_tracking_params(url_list: list[str]) -> list[str]:
+    """Remove known tracking/analytics query parameters from every URL.
+
+    Reuses _TRACKING_PARAM_BLOCKLIST from probe.py — single source of truth.
+    If stripping produces a duplicate URL already seen, the duplicate is dropped
+    (preserving first-seen order).
+    """
+    from ai_xss_generator.probe import _TRACKING_PARAM_BLOCKLIST
+
+    seen: set[str] = set()
+    result: list[str] = []
+    for url in url_list:
+        parsed = urllib.parse.urlparse(url)
+        qs = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+        stripped = {k: v for k, v in qs.items() if k.lower() not in _TRACKING_PARAM_BLOCKLIST}
+        new_query = urllib.parse.urlencode(stripped, doseq=True)
+        stripped_url = urllib.parse.urlunparse(parsed._replace(query=new_query))
+        if stripped_url not in seen:
+            seen.add(stripped_url)
+            result.append(stripped_url)
+    return result
+
+
 def run_active_scan(
     urls: Sequence[str],
     config: ActiveScanConfig,
@@ -366,8 +389,9 @@ def run_active_scan(
     # Single rate limiter shared across ALL phases of this scan session
     rate_limiter = _GlobalRateLimiter(config.rate)
 
-    # Pre-flight: deduplicate parametric path variants, then drop dead URLs
+    # Pre-flight: strip tracking params, deduplicate parametric path variants, then drop dead URLs
     if url_list:
+        url_list = _strip_tracking_params(url_list)
         url_list = _dedup_urls_by_path_shape(url_list)
         if not config.skip_liveness:
             url_list = _filter_live_urls(

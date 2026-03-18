@@ -6,6 +6,7 @@ import pytest
 from ai_xss_generator.active.orchestrator import (
     _dedup_urls_by_path_shape,
     _filter_live_urls,
+    _strip_tracking_params,
 )
 
 
@@ -285,3 +286,53 @@ class TestLiveness:
         result = _filter_live_urls(["http://example.com/only"])
         assert called == []
         assert result == ["http://example.com/only"]
+
+
+# ---------------------------------------------------------------------------
+# Tracking param stripping
+# ---------------------------------------------------------------------------
+
+class TestStripTrackingParams:
+    def test_removes_utm_params(self):
+        urls = ["http://example.com/page?q=xss&utm_source=google&utm_medium=cpc"]
+        result = _strip_tracking_params(urls)
+        assert result == ["http://example.com/page?q=xss"]
+
+    def test_removes_gclid(self):
+        urls = ["http://example.com/?q=1&gclid=abc123"]
+        result = _strip_tracking_params(urls)
+        assert result == ["http://example.com/?q=1"]
+
+    def test_removes_fbclid(self):
+        urls = ["http://example.com/?id=5&fbclid=XYZ"]
+        result = _strip_tracking_params(urls)
+        assert result == ["http://example.com/?id=5"]
+
+    def test_keeps_non_tracking_params(self):
+        urls = ["http://example.com/?search=hello&page=2"]
+        result = _strip_tracking_params(urls)
+        assert result == ["http://example.com/?search=hello&page=2"]
+
+    def test_keeps_url_with_no_params_after_strip(self):
+        urls = ["http://example.com/page?utm_source=google"]
+        result = _strip_tracking_params(urls)
+        assert result == ["http://example.com/page"]
+
+    def test_deduplicates_after_strip(self):
+        urls = [
+            "http://example.com/page?q=1&utm_source=a",
+            "http://example.com/page?q=1&utm_source=b",
+        ]
+        result = _strip_tracking_params(urls)
+        assert result == ["http://example.com/page?q=1"]
+
+    def test_preserves_order(self):
+        urls = [
+            "http://example.com/a?q=1&utm_source=x",
+            "http://example.com/b?q=2",
+        ]
+        result = _strip_tracking_params(urls)
+        assert result == ["http://example.com/a?q=1", "http://example.com/b?q=2"]
+
+    def test_empty_list(self):
+        assert _strip_tracking_params([]) == []
