@@ -114,10 +114,20 @@ def _filter_live_urls(
     url_list: list[str],
     auth_headers: dict[str, str] | None = None,
 ) -> list[str]:
-    """HEAD-check every URL concurrently; drop anything that doesn't respond 2xx/3xx.
+    """HEAD-check every URL concurrently; drop only URLs that are provably gone.
 
-    Falls back to GET when the server returns 405 on HEAD.  Auth headers are
-    forwarded so token-protected endpoints aren't falsely marked dead.
+    "Provably gone" means:
+      - The host is unreachable (DNS failure, connection refused, timeout)
+      - The server returned 404 Not Found or 410 Gone
+
+    Everything else is treated as alive.  In particular:
+      - 401/403 — server is up; auth or a WAF JS challenge is gating it.
+        The Playwright worker can handle JS challenges; plain requests cannot.
+      - 429 — rate-limited but alive
+      - 5xx — server error, but the endpoint exists
+
+    Falls back from HEAD to GET on 405.  Auth headers are forwarded so
+    token-protected endpoints aren't falsely flagged as gone.
     """
     if len(url_list) < _LIVENESS_MIN_LIST:
         return url_list
@@ -125,8 +135,18 @@ def _filter_live_urls(
     import requests
     from requests.exceptions import RequestException
 
-    req_headers = {"User-Agent": "Mozilla/5.0 (compatible; axss/1.0)"}
+    # Use a browser-like UA so WAFs don't immediately 403 the probe itself
+    req_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        )
+    }
     req_headers.update(auth_headers or {})
+
+    # Only these status codes mean the URL itself is gone
+    _GONE_STATUSES = {404, 410}
 
     def _check(url: str) -> tuple[str, bool, str]:
         try:
@@ -138,7 +158,7 @@ def _filter_live_urls(
                                  timeout=_LIVENESS_TIMEOUT,
                                  allow_redirects=True, stream=True)
                 r.close()
-            alive = r.status_code < 400
+            alive = r.status_code not in _GONE_STATUSES
             return url, alive, str(r.status_code)
         except RequestException as exc:
             return url, False, str(exc)

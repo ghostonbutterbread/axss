@@ -140,34 +140,90 @@ class TestLiveness:
         result = _filter_live_urls(urls)
         assert result == urls
 
-    def test_removes_dead_urls(self, monkeypatch):
+    def test_removes_404_urls(self, monkeypatch):
         import requests
 
-        class FakeDeadResponse:
-            status_code = 404
-            def close(self): pass
-
-        class FakeLiveResponse:
-            status_code = 200
-            def close(self): pass
-
         def fake_head(url, **kw):
-            if "dead" in url:
-                return FakeDeadResponse()
-            return FakeLiveResponse()
+            code = 404 if "gone" in url else 200
+            return type("R", (), {"status_code": code, "close": lambda self: None})()
 
         monkeypatch.setattr(requests, "head", fake_head)
 
         urls = [
             "http://example.com/live-a",
-            "http://example.com/dead-b",
+            "http://example.com/gone-b",
             "http://example.com/live-c",
-            "http://example.com/dead-d",
+            "http://example.com/gone-d",
             "http://example.com/live-e",
         ]
         result = _filter_live_urls(urls)
         assert len(result) == 3
         assert all("live" in u for u in result)
+
+    def test_keeps_403_waf_challenge(self, monkeypatch):
+        """403 from a WAF JS challenge must NOT be dropped — Playwright can handle it."""
+        import requests
+
+        def fake_head(url, **kw):
+            return type("R", (), {"status_code": 403, "close": lambda self: None})()
+
+        monkeypatch.setattr(requests, "head", fake_head)
+
+        urls = ["http://akamai-protected.example.com/page",
+                "http://akamai-protected.example.com/other"]
+        result = _filter_live_urls(urls)
+        assert result == urls
+
+    def test_keeps_401_auth_gated(self, monkeypatch):
+        import requests
+
+        def fake_head(url, **kw):
+            return type("R", (), {"status_code": 401, "close": lambda self: None})()
+
+        monkeypatch.setattr(requests, "head", fake_head)
+
+        urls = ["http://example.com/api/protected", "http://example.com/api/other"]
+        result = _filter_live_urls(urls)
+        assert result == urls
+
+    def test_keeps_429_rate_limited(self, monkeypatch):
+        import requests
+
+        def fake_head(url, **kw):
+            return type("R", (), {"status_code": 429, "close": lambda self: None})()
+
+        monkeypatch.setattr(requests, "head", fake_head)
+
+        urls = ["http://example.com/a", "http://example.com/b"]
+        result = _filter_live_urls(urls)
+        assert result == urls
+
+    def test_keeps_500_server_error(self, monkeypatch):
+        import requests
+
+        def fake_head(url, **kw):
+            return type("R", (), {"status_code": 500, "close": lambda self: None})()
+
+        monkeypatch.setattr(requests, "head", fake_head)
+
+        urls = ["http://example.com/a", "http://example.com/b"]
+        result = _filter_live_urls(urls)
+        assert result == urls
+
+    def test_removes_410_gone(self, monkeypatch):
+        import requests
+
+        def fake_head(url, **kw):
+            code = 410 if "old" in url else 200
+            return type("R", (), {"status_code": code, "close": lambda self: None})()
+
+        monkeypatch.setattr(requests, "head", fake_head)
+
+        urls = ["http://example.com/new-page", "http://example.com/old-page",
+                "http://example.com/new-other"]
+        result = _filter_live_urls(urls)
+        assert len(result) == 2
+        assert all("new" in u for u in result)
 
     def test_preserves_order(self, monkeypatch):
         import requests
