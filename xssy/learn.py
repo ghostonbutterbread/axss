@@ -30,7 +30,7 @@ python xssy/learn.py --list
 python xssy/learn.py --no-curate
 
 # Save a JSON report of all generated payloads
-python xssy/learn.py --json-out xssy_results.json
+python xssy/learn.py --output xssy_results.json
 
 # Use a specific local Ollama model for generation
 python xssy/learn.py --model qwen3.5:4b
@@ -350,7 +350,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="List matching labs and exit without fetching HTML or generating payloads.",
     )
     p.add_argument(
-        "--json-out",
+        "-o",
+        "--output",
         metavar="PATH",
         default=None,
         help="Write a JSON report of all results to this file.",
@@ -602,10 +603,10 @@ def main(argv: list[str] | None = None) -> int:
         info("No findings curated — check that your AI backend is configured (run: axss --check-keys).")
 
     # ── JSON output ───────────────────────────────────────────────────────────
-    if args.json_out:
+    if args.output:
         try:
-            Path(args.json_out).write_text(json.dumps(all_results, indent=2), encoding="utf-8")
-            success(f"JSON report written to {args.json_out}")
+            Path(args.output).write_text(json.dumps(all_results, indent=2), encoding="utf-8")
+            success(f"JSON report written to {args.output}")
         except Exception as exc:
             warn(f"Could not write JSON report: {exc}")
 

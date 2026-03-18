@@ -143,7 +143,7 @@ def test_cli_scan_uses_explicit_profile_without_deleting_store(tmp_path, monkeyp
 
     monkeypatch.setattr(cli, "_run_active_scan", _fake_run_active_scan)
 
-    rc = cli.main(["-u", "https://example.test/account", "--profile", "demo/admin", "--reflected"])
+    rc = cli.main(["scan", "-u", "https://example.test/account", "--profile", "demo/admin", "--reflected"])
 
     assert rc == 0
     assert captured["auth_headers"]["Authorization"] == "Bearer abc"

@@ -6,62 +6,109 @@ from ai_xss_generator.cli import build_parser
 from ai_xss_generator.config import DEFAULT_MODEL
 
 
-class CliHelpTest(unittest.TestCase):
-    def test_help_pairs_are_clear(self) -> None:
-        help_text = build_parser(DEFAULT_MODEL).format_help()
+def _subparser_help(name: str) -> str:
+    parser = build_parser(DEFAULT_MODEL)
+    for action in parser._subparsers._group_actions:
+        sub = action.choices.get(name)
+        if sub:
+            return sub.format_help()
+    return ""
 
+
+class CliHelpTest(unittest.TestCase):
+    def test_top_level_help(self) -> None:
+        help_text = build_parser(DEFAULT_MODEL).format_help()
         self.assertIn("-h, --help", help_text)
+        self.assertIn("-V, --version", help_text)
+        self.assertIn("--clear-reports", help_text)
+        self.assertIn("memory", help_text)
+        self.assertIn("generate", help_text)
+        self.assertIn("scan", help_text)
+        self.assertIn("models", help_text)
+        # Old flat flags must not appear at top level
+        self.assertNotIn("-u TARGET", help_text)
+        self.assertNotIn("--memory-list", help_text)
+        self.assertNotIn("-l, --list-models", help_text)
+
+    def test_generate_help(self) -> None:
+        help_text = _subparser_help("generate")
+        self.assertIn("-u TARGET, --url TARGET", help_text)
+        self.assertIn("--urls FILE", help_text)
+        self.assertIn("-i FILE_OR_SNIPPET, --input FILE_OR_SNIPPET", help_text)
+        self.assertIn("--public", help_text)
+        self.assertIn("--merge-batch", help_text)
+        self.assertIn("-m MODEL, --model MODEL", help_text)
+        self.assertIn("--display {list,heat,interactive}", help_text)
+        self.assertIn("--format {json}", help_text)
+        self.assertIn("-t N, --top N", help_text)
+        self.assertIn("-o PATH, --output PATH", help_text)
+        self.assertIn("-v, --verbose", help_text)
+        self.assertIn("--waf-source PATH", help_text)
+        self.assertIn("--no-probe", help_text)
+        # generate has no scan-mode flags
+        self.assertNotIn("--deep", help_text)
+        self.assertNotIn("--fast", help_text)
+        self.assertNotIn("--reflected", help_text)
+        self.assertNotIn("--extreme", help_text)
+        self.assertNotIn("--research", help_text)
+        self.assertNotIn("(default: None)", help_text)
+
+    def test_scan_help(self) -> None:
+        help_text = _subparser_help("scan")
         self.assertIn("-u TARGET, --url TARGET", help_text)
         self.assertIn("--urls FILE", help_text)
         self.assertIn("--interesting FILE", help_text)
-        self.assertIn("-i FILE_OR_SNIPPET, --input FILE_OR_SNIPPET", help_text)
-        self.assertIn("-l, --list-models", help_text)
-        self.assertIn("-s QUERY, --search-models QUERY", help_text)
-        self.assertIn("-m MODEL, --model MODEL", help_text)
-        self.assertIn("-o {json,list,heat,interactive}, --output", help_text)
-        self.assertIn("-t N, --top N", help_text)
-        self.assertIn("-j PATH, --json-out PATH", help_text)
-        self.assertIn("-v, --verbose", help_text)
-        self.assertIn("--merge-batch", help_text)
-        self.assertIn("--attempts N", help_text)
         self.assertIn("--deep", help_text)
-        self.assertIn("--extreme", help_text)
-        self.assertIn("--research", help_text)
-        self.assertIn("--keep-searching", help_text)
-        self.assertIn("--waf-source PATH", help_text)
-        self.assertIn("--memory-list", help_text)
-        self.assertIn("--memory-stats", help_text)
-        self.assertIn("--memory-export", help_text)
-        self.assertIn("--memory-import", help_text)
-        self.assertNotIn("--memory-review", help_text)
-        self.assertNotIn("--memory-promote", help_text)
-        self.assertNotIn("--memory-reject", help_text)
-        self.assertIn("-V, --version", help_text)
-        # XSS type selectors
-        self.assertIn("--generate", help_text)
+        self.assertIn("--fast", help_text)
+        self.assertIn("--obliterate", help_text)
         self.assertIn("--reflected", help_text)
         self.assertIn("--stored", help_text)
         self.assertIn("--uploads", help_text)
         self.assertIn("--dom", help_text)
+        self.assertIn("--attempts N", help_text)
+        self.assertIn("--keep-searching", help_text)
+        self.assertIn("--waf-source PATH", help_text)
+        self.assertIn("-m MODEL, --model MODEL", help_text)
+        self.assertIn("--display {list,heat,interactive}", help_text)
+        self.assertIn("-o PATH, --output PATH", help_text)
+        self.assertNotIn("--extreme", help_text)
+        self.assertNotIn("--research", help_text)
         self.assertNotIn("--html", help_text)
         self.assertNotIn("(default: None)", help_text)
+
+    def test_memory_help(self) -> None:
+        help_text = _subparser_help("memory")
+        self.assertIn("show", help_text)
+        self.assertIn("stats", help_text)
+        self.assertIn("import", help_text)
+        self.assertIn("export", help_text)
+
+    def test_models_help(self) -> None:
+        help_text = _subparser_help("models")
+        self.assertIn("list", help_text)
+        self.assertIn("search", help_text)
+        self.assertIn("check-keys", help_text)
 
     def test_memory_commands_parse_cleanly(self) -> None:
         parser = build_parser(DEFAULT_MODEL)
 
-        args = parser.parse_args(["--memory-list"])
-        self.assertTrue(args.memory_list)
+        args = parser.parse_args(["memory", "show"])
+        self.assertEqual(args.command, "memory")
+        self.assertEqual(args.memory_action, "show")
 
-        args = parser.parse_args(["--memory-stats"])
-        self.assertTrue(args.memory_stats)
+        args = parser.parse_args(["memory", "stats"])
+        self.assertEqual(args.memory_action, "stats")
 
-        args = parser.parse_args(["--memory-export", "/tmp/out.yaml"])
-        self.assertEqual(args.memory_export, "/tmp/out.yaml")
+        args = parser.parse_args(["memory", "export", "/tmp/out.yaml"])
+        self.assertEqual(args.memory_action, "export")
+        self.assertEqual(args.path, "/tmp/out.yaml")
 
-        args = parser.parse_args(["--memory-import", "/tmp/in.yaml"])
-        self.assertEqual(args.memory_import, "/tmp/in.yaml")
+        args = parser.parse_args(["memory", "import", "/tmp/in.yaml"])
+        self.assertEqual(args.memory_action, "import")
+        self.assertEqual(args.path, "/tmp/in.yaml")
 
-        args = parser.parse_args(["--deep"])
+        args = parser.parse_args(["scan", "--deep"])
+        self.assertEqual(args.command, "scan")
         self.assertTrue(args.deep)
 
     def test_main_routes_upload_only_scan_to_active_runner(self) -> None:
@@ -75,7 +122,7 @@ class CliHelpTest(unittest.TestCase):
             patch.object(cli, "_run_active_scan", side_effect=_fake_run_active_scan),
             patch("ai_xss_generator.ai_capabilities.choose_generation_tool", return_value=("claude", "")),
         ):
-            rc = cli.main(["-u", "https://example.test/profile", "--uploads"])
+            rc = cli.main(["scan", "-u", "https://example.test/profile", "--uploads"])
 
         self.assertEqual(rc, 0)
         self.assertFalse(captured["scan_reflected"])
@@ -94,7 +141,7 @@ class CliHelpTest(unittest.TestCase):
             patch.object(cli, "_run_active_scan", side_effect=_fake_run_active_scan),
             patch("ai_xss_generator.ai_capabilities.choose_generation_tool", return_value=("claude", "")),
         ):
-            rc = cli.main(["-u", "https://example.test/profile"])
+            rc = cli.main(["scan", "-u", "https://example.test/profile"])
 
         self.assertEqual(rc, 0)
         self.assertTrue(captured["scan_reflected"])
@@ -115,7 +162,7 @@ class CliHelpTest(unittest.TestCase):
             patch.object(cli, "_run_active_scan", side_effect=_fake_run_active_scan),
             patch("ai_xss_generator.ai_capabilities.choose_generation_tool", return_value=("claude", "")),
         ):
-            rc = cli.main(["-u", "https://example.test/profile", "--extreme"])
+            rc = cli.main(["scan", "-u", "https://example.test/profile", "--extreme"])
 
         self.assertEqual(rc, 0)
         self.assertEqual(captured["attempts"], 3)
@@ -134,7 +181,7 @@ class CliHelpTest(unittest.TestCase):
             patch.object(cli, "_run_active_scan", side_effect=_fake_run_active_scan),
             patch("ai_xss_generator.ai_capabilities.choose_generation_tool", return_value=("claude", "")),
         ):
-            rc = cli.main(["-u", "https://example.test/profile", "--research"])
+            rc = cli.main(["scan", "-u", "https://example.test/profile", "--research"])
 
         self.assertEqual(rc, 0)
         self.assertEqual(captured["attempts"], 5)
