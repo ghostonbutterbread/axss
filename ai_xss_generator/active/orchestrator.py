@@ -20,9 +20,12 @@ from __future__ import annotations
 import logging
 import math
 import multiprocessing
+import re
 import signal
 import time
 import urllib.parse
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence, TYPE_CHECKING
@@ -99,6 +102,180 @@ def _work_item_key(kind: str, item: Any) -> str:
     return f"{kind}:{_work_item_url(kind, item)}"
 
 
+# ---------------------------------------------------------------------------
+# Pre-flight: liveness filter
+# ---------------------------------------------------------------------------
+
+_LIVENESS_TIMEOUT = 5          # seconds per HEAD/GET
+_LIVENESS_WORKERS = 50         # concurrent connections
+_LIVENESS_MIN_LIST  = 2        # skip check for tiny lists
+
+def _filter_live_urls(
+    url_list: list[str],
+    auth_headers: dict[str, str] | None = None,
+) -> list[str]:
+    """HEAD-check every URL concurrently; drop anything that doesn't respond 2xx/3xx.
+
+    Falls back to GET when the server returns 405 on HEAD.  Auth headers are
+    forwarded so token-protected endpoints aren't falsely marked dead.
+    """
+    if len(url_list) < _LIVENESS_MIN_LIST:
+        return url_list
+
+    import requests
+    from requests.exceptions import RequestException
+
+    req_headers = {"User-Agent": "Mozilla/5.0 (compatible; axss/1.0)"}
+    req_headers.update(auth_headers or {})
+
+    def _check(url: str) -> tuple[str, bool, str]:
+        try:
+            r = requests.head(url, headers=req_headers,
+                              timeout=_LIVENESS_TIMEOUT, allow_redirects=True)
+            if r.status_code == 405:
+                # Server doesn't support HEAD — try a streaming GET
+                r = requests.get(url, headers=req_headers,
+                                 timeout=_LIVENESS_TIMEOUT,
+                                 allow_redirects=True, stream=True)
+                r.close()
+            alive = r.status_code < 400
+            return url, alive, str(r.status_code)
+        except RequestException as exc:
+            return url, False, str(exc)
+
+    step(f"Pre-flight liveness check: probing {len(url_list)} URL(s)…")
+    n_workers = min(_LIVENESS_WORKERS, len(url_list))
+    results: list[tuple[str, bool, str]] = []
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        futures = {pool.submit(_check, u): u for u in url_list}
+        for fut in as_completed(futures):
+            results.append(fut.result())
+
+    dead = [(u, reason) for u, ok, reason in results if not ok]
+    live_set = {u for u, ok, _ in results if ok}
+    # Preserve original order
+    live = [u for u in url_list if u in live_set]
+
+    if dead:
+        warn(f"Pre-flight: removed {len(dead)} dead URL(s) "
+             f"({len(live)} of {len(url_list)} alive)")
+        for dead_url, reason in dead[:5]:
+            warn(f"  dead  {dead_url}  →  {reason}")
+        if len(dead) > 5:
+            warn(f"  … and {len(dead) - 5} more")
+    else:
+        info(f"Pre-flight: all {len(live)} URL(s) alive")
+
+    return live
+
+
+# ---------------------------------------------------------------------------
+# Pre-flight: path-shape deduplication
+# ---------------------------------------------------------------------------
+
+_RE_PURE_DIGITS  = re.compile(r'^\d+$')
+_RE_UUID         = re.compile(
+    r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
+    re.IGNORECASE,
+)
+# slug-with-trailing-number: word-123, product-v2, etc.
+_RE_ENDS_DIGIT   = re.compile(r'^[a-z0-9]+(-[a-z0-9]+)*-\d+$', re.IGNORECASE)
+# three-or-more hyphen-separated words: a-b-c, foo-bar-baz-qux
+_RE_MULTI_HYPHEN = re.compile(r'^[a-z0-9]+(-[a-z0-9]+){2,}$', re.IGNORECASE)
+
+_SIBLING_THRESHOLD = 3   # N siblings at same parent → last segment is parametric
+
+
+def _segment_is_parametric(seg: str) -> bool:
+    return bool(
+        _RE_PURE_DIGITS.match(seg)
+        or _RE_UUID.match(seg)
+        or _RE_ENDS_DIGIT.match(seg)
+        or _RE_MULTI_HYPHEN.match(seg)
+    )
+
+
+def _path_shape(path: str) -> str:
+    """Replace obviously parametric segments with '*'."""
+    parts = [s for s in path.split('/') if s]
+    return '/' + '/'.join('*' if _segment_is_parametric(s) else s for s in parts)
+
+
+def _dedup_urls_by_path_shape(url_list: list[str]) -> list[str]:
+    """Collapse URLs that share the same path shape into one representative.
+
+    Two-pass strategy:
+    1. Content-based: digits, UUIDs, slugs-with-trailing-numbers, 3+ word slugs
+       → replaced with '*' immediately.
+    2. Sibling-based: if ≥ SIBLING_THRESHOLD URLs share the same (netloc,
+       parent-path) after pass 1, the varying last segment is also '*'.
+
+    The first URL encountered for each shape is kept as the representative so
+    session resume and report URLs stay meaningful.
+    """
+    if len(url_list) <= 1:
+        return url_list
+
+    # Pass 1 — content normalization
+    entries: list[tuple[str, str, str]] = []  # (original, netloc, norm_path)
+    for url in url_list:
+        p = urllib.parse.urlparse(url)
+        norm = _path_shape(p.path)
+        entries.append((url, p.netloc, norm))
+
+    # Pass 2 — sibling detection
+    # Group by (netloc, parent_norm_path); parent = everything except last segment
+    parent_groups: dict[str, list[int]] = defaultdict(list)
+    for i, (_, netloc, norm_path) in enumerate(entries):
+        parts = [s for s in norm_path.split('/') if s]
+        if len(parts) >= 1:
+            parent = netloc + '/' + '/'.join(parts[:-1])
+            parent_groups[parent].append(i)
+
+    # Indices whose last segment should be forced to '*'
+    sibling_collapse: set[int] = {
+        idx
+        for idxs in parent_groups.values()
+        if len(idxs) >= _SIBLING_THRESHOLD
+        for idx in idxs
+    }
+
+    # Build final shape keys and pick representatives
+    seen_shapes: dict[str, str] = {}   # final_shape_key → representative URL
+    collapsed_count = 0
+    collapsed_examples: list[str] = []
+
+    for i, (url, netloc, norm_path) in enumerate(entries):
+        if i in sibling_collapse:
+            parts = [s for s in norm_path.split('/') if s]
+            parts[-1] = '*'
+            norm_path = '/' + '/'.join(parts)
+
+        p = urllib.parse.urlparse(url)
+        shape_key = f"{p.scheme}://{netloc}{norm_path}"
+
+        if shape_key not in seen_shapes:
+            seen_shapes[shape_key] = url
+        else:
+            collapsed_count += 1
+            if len(collapsed_examples) < 3:
+                collapsed_examples.append(url)
+
+    result = list(seen_shapes.values())
+
+    if collapsed_count:
+        info(
+            f"Path-shape dedup: {collapsed_count} redundant URL(s) collapsed "
+            f"→ {len(result)} distinct endpoint(s) to test"
+        )
+        for ex in collapsed_examples:
+            info(f"  skipped  {ex}")
+        if collapsed_count > len(collapsed_examples):
+            info(f"  … and {collapsed_count - len(collapsed_examples)} more")
+
+    return result
+
+
 def run_active_scan(
     urls: Sequence[str],
     config: ActiveScanConfig,
@@ -119,6 +296,11 @@ def run_active_scan(
     post_form_list = list(post_forms)
     upload_target_list = list(upload_targets)
     crawled_pages_list = list(crawled_pages)
+
+    # Pre-flight: deduplicate parametric path variants, then drop dead URLs
+    if url_list:
+        url_list = _dedup_urls_by_path_shape(url_list)
+        url_list = _filter_live_urls(url_list, auth_headers=config.auth_headers)
 
     # Build work items filtered by enabled scan types
     work_items: list[tuple[str, Any]] = []
