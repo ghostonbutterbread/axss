@@ -2860,3 +2860,177 @@ def generate_payloads(
         ranked = sorted(ranked, key=lambda item: (-item.risk_score, item.payload))
 
     return ranked, engine, used_fallback, resolved_model
+
+
+# ---------------------------------------------------------------------------
+# Fast-batch generation — one upfront call, application-agnostic
+# ---------------------------------------------------------------------------
+
+_FAST_BATCH_PROMPT = """\
+You are generating a large, diverse XSS payload set for authorized penetration testing.
+This is application-agnostic: generate payloads purely from XSS theory — no knowledge of \
+the specific target is needed.
+
+Generate exactly {count} payloads covering the full context matrix below.
+Distribute payloads roughly evenly across all context classes.
+Include multiple encoding variants per payload class.
+
+CONTEXT CLASSES (tag each payload with one primary context tag):
+  context:html_body        — injected directly into HTML document body
+  context:html_attr_event  — injected into an HTML attribute (onX handlers, onerror, onload)
+  context:html_attr_url    — injected into href, src, action, formaction (javascript: URI payloads)
+  context:js_string_single — injected inside a JS single-quoted string
+  context:js_string_double — injected inside a JS double-quoted string
+  context:js_template      — injected inside a JS template literal (`...`)
+  context:url_fragment     — injected into URL hash/query (DOM-sink targets: location, document.URL)
+
+ENCODING / BYPASS FAMILIES to cover (add a bypass tag for each):
+  bypass:raw              — no encoding
+  bypass:html_entity      — &#x3c;script&#x3e; style
+  bypass:js_escape        — \\x3c, \\u003c style
+  bypass:double_encode    — %2522, &#x26;#x3c; style
+  bypass:case_variation   — ScRiPt, IMG, sVg etc.
+  bypass:null_byte        — null byte / truncation tricks
+  bypass:comment_break    — /**/ or <!--> interruption
+  bypass:backtick         — backtick as quote substitute
+  bypass:polyglot         — works in 2+ contexts simultaneously
+  bypass:mxss             — mutation XSS (browser parser diff tricks)
+  bypass:waf_generic      — generic WAF evasion patterns{waf_block}
+
+PAYLOAD REQUIREMENTS:
+- Each payload MUST call alert(document.cookie) or alert(document.domain) on execution
+- Cover at least 2 payloads per context class
+- Cover at least 2 payloads per bypass family
+- Payloads should be syntactically complete (ready to inject as-is)
+- Prefer payload variety over repetition
+
+Return a JSON object with this exact structure:
+{{
+  "payloads": [
+    {{
+      "payload": "<the raw XSS payload string>",
+      "title": "short human-readable name",
+      "tags": ["context:html_body", "bypass:raw"],
+      "target_sink": "innerHTML / eval / href / etc.",
+      "bypass_family": "raw",
+      "risk_score": 7,
+      "explanation": "one sentence on why this works"
+    }}
+  ]
+}}
+"""
+
+_WAF_BYPASS_ADDENDUM = """
+  bypass:waf_{waf}        — known bypass patterns specific to {waf}
+"""
+
+
+def generate_fast_batch(
+    cloud_model: str,
+    waf: str | None = None,
+    count: int = 250,
+    ai_backend: str = "api",
+    cli_tool: str = "claude",
+    cli_model: str | None = None,
+    request_timeout_seconds: int = 180,
+) -> list[PayloadCandidate]:
+    """Generate a large application-agnostic payload batch in a single LLM call.
+
+    Used by fast mode to produce the batch upfront before workers start,
+    replacing per-URL/per-parameter cloud calls entirely.
+
+    Args:
+        cloud_model:   Cloud model identifier (OpenRouter / OpenAI format).
+        waf:           Known/detected WAF name — adds WAF-specific bypass instructions.
+        count:         Number of payloads to request (default 250).
+        ai_backend:    "api" (OpenRouter/OpenAI) or "cli" (claude/codex subprocess).
+        cli_tool:      CLI tool name when ai_backend="cli".
+        cli_model:     Model override for CLI backend.
+        request_timeout_seconds: HTTP timeout for the LLM call.
+
+    Returns:
+        List of PayloadCandidate objects tagged with context and bypass families.
+        Falls back to an empty list on error (scan continues with heuristic payloads).
+    """
+    from ai_xss_generator.config import load_api_key
+
+    waf_block = (
+        _WAF_BYPASS_ADDENDUM.format(waf=waf.lower().replace(" ", "_"))
+        if waf else ""
+    )
+    prompt = _FAST_BATCH_PROMPT.format(count=count, waf_block=waf_block)
+
+    system_msg = (
+        "You are an expert offensive-security researcher specialising in XSS. "
+        "Return strict JSON only — no markdown, no commentary outside the JSON object."
+    )
+
+    def _call_api(base_url: str, api_key: str, model: str, source: str) -> list[PayloadCandidate]:
+        headers: dict[str, str] = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        if "openrouter" in base_url:
+            headers["HTTP-Referer"] = "https://github.com/axss"
+            headers["X-Title"] = "axss"
+        import requests as _req
+        resp = _req.post(
+            f"{base_url}/chat/completions",
+            headers=headers,
+            json={
+                "model": model,
+                "response_format": {"type": "json_object"},
+                "messages": [
+                    {"role": "system", "content": system_msg},
+                    {"role": "user",   "content": prompt},
+                ],
+                "temperature": 0.7,  # higher temp = more payload variety
+            },
+            timeout=max(1, request_timeout_seconds),
+        )
+        resp.raise_for_status()
+        content = resp.json()["choices"][0]["message"]["content"]
+        data = _extract_json_blob(content)
+        return _normalize_payloads(data.get("payloads", []), source=source)
+
+    log.info("Generating fast batch (%d payloads) via %s …", count, cloud_model)
+
+    if ai_backend == "cli":
+        try:
+            from ai_xss_generator.models import _generate_with_cli  # noqa: F401 — used below
+            # Build a minimal stub context for the CLI path
+            from ai_xss_generator.types import ParsedContext
+            stub = ParsedContext.__new__(ParsedContext)
+            candidates = _generate_with_cli(
+                context=stub,
+                tool=cli_tool,
+                model_override=cli_model,
+                strategy_hint=prompt,
+                request_timeout_seconds=request_timeout_seconds,
+            )
+            log.info("Fast batch: %d payloads from CLI backend", len(candidates))
+            return candidates
+        except Exception as exc:
+            log.warning("CLI batch generation failed, falling back to API: %s", exc)
+
+    # Try OpenRouter first, then OpenAI
+    api_key = os.environ.get("OPENROUTER_API_KEY", "") or load_api_key("openrouter_api_key")
+    if api_key:
+        try:
+            payloads = _call_api(OPENROUTER_BASE_URL, api_key, cloud_model, "openrouter")
+            log.info("Fast batch: %d payloads from OpenRouter", len(payloads))
+            return payloads
+        except Exception as exc:
+            log.warning("OpenRouter fast batch failed: %s", exc)
+
+    api_key = os.environ.get("OPENAI_API_KEY", "") or load_api_key("openai_api_key")
+    if api_key:
+        try:
+            payloads = _call_api(OPENAI_BASE_URL, api_key, cloud_model, "openai")
+            log.info("Fast batch: %d payloads from OpenAI", len(payloads))
+            return payloads
+        except Exception as exc:
+            log.warning("OpenAI fast batch failed: %s", exc)
+
+    log.error("Fast batch generation failed — no API key available or all backends failed")
+    return []

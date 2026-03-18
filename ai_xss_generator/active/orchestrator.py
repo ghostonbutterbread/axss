@@ -376,6 +376,24 @@ def run_active_scan(
                 rate_limiter=rate_limiter,
             )
 
+    # Fast mode: generate one payload batch upfront for all workers to share.
+    # Obliterate keeps per-URL 3-phase generation; fast alone uses the batch.
+    fast_batch: list[Any] = []
+    if config.fast and not config.obliterate and url_list:
+        from ai_xss_generator.models import generate_fast_batch
+        step("Fast mode: generating payload batch…")
+        fast_batch = generate_fast_batch(
+            cloud_model=config.cloud_model,
+            waf=config.waf,
+            ai_backend=config.ai_backend,
+            cli_tool=config.cli_tool,
+            cli_model=config.cli_model,
+        )
+        if fast_batch:
+            info(f"Fast batch ready: {len(fast_batch)} payloads")
+        else:
+            warn("Fast batch generation failed — workers will fall back to per-URL generation")
+
     # Build work items filtered by enabled scan types
     work_items: list[tuple[str, Any]] = []
     if config.scan_reflected:
@@ -659,6 +677,7 @@ def run_active_scan(
                                 "keep_searching": config.keep_searching,
                                 "extreme": config.extreme,
                                 "research": config.research,
+                                "fast_batch": fast_batch or None,
                                 **_cli_kwargs,
                             },
                             daemon=True,
@@ -732,6 +751,7 @@ def run_active_scan(
                                 "keep_searching": config.keep_searching,
                                 "extreme": config.extreme,
                                 "research": config.research,
+                                "fast_batch": fast_batch or None,
                                 **_cli_kwargs,
                             },
                             daemon=True,

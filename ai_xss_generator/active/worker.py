@@ -421,6 +421,54 @@ def _analyze_fast_failure_strategy(
         return ""
 
 
+_URL_CONTEXT_PARAMS = frozenset({
+    "href", "src", "url", "uri", "link", "redirect", "return", "next",
+    "location", "goto", "target", "action", "formaction", "ref",
+})
+_JS_CONTEXT_PARAMS = frozenset({
+    "callback", "jsonp", "cb", "eval", "func", "fn", "handler", "on",
+})
+
+
+def _filter_batch_for_params(
+    batch: "list[Any]",
+    param_name: str,
+    url: str,
+) -> "list[Any]":
+    """Lightweight batch filter — drops payloads that obviously don't fit.
+
+    Only filters out clear mismatches using param name and URL heuristics.
+    When in doubt, the payload is kept. No network requests.
+    """
+    param_lower = param_name.lower()
+    url_lower = url.lower()
+
+    is_url_sink  = param_lower in _URL_CONTEXT_PARAMS
+    is_js_sink   = param_lower in _JS_CONTEXT_PARAMS
+    is_script_url = ".js" in url_lower or "/api/" in url_lower
+
+    kept: list[Any] = []
+    for candidate in batch:
+        tags = {t.lower() for t in getattr(candidate, "tags", [])}
+        ctx_tags = {t for t in tags if t.startswith("context:")}
+
+        # If we have a strong URL-sink signal, skip pure JS-string payloads
+        if is_url_sink and ctx_tags and ctx_tags <= {
+            "context:js_string_single", "context:js_string_double",
+            "context:js_template",
+        }:
+            continue
+
+        # If no URL/event-handler signals, skip pure javascript: URI payloads
+        if not is_url_sink and ctx_tags == {"context:html_attr_url"}:
+            continue
+
+        kept.append(candidate)
+
+    # If filtering removed everything, return the full batch — better noisy than empty
+    return kept if kept else list(batch)
+
+
 def _unique_new_payloads(payloads: list[Any], seen: set[str]) -> tuple[list[Any], list[str]]:
     fresh: list[Any] = []
     duplicates: list[str] = []
@@ -868,6 +916,7 @@ def run_worker(
     keep_searching: bool = False,
     extreme: bool = False,
     research: bool = False,
+    fast_batch: "list[Any] | None" = None,
 ) -> None:
     """Target function for multiprocessing.Process.
 
@@ -911,6 +960,7 @@ def run_worker(
             keep_searching=keep_searching,
             extreme=extreme,
             research=research,
+            fast_batch=fast_batch,
         )
     except Exception as exc:
         log.exception("Worker crashed for %s", url)
@@ -947,6 +997,7 @@ def _run(
     keep_searching: bool = False,
     extreme: bool = False,
     research: bool = False,
+    fast_batch: "list[Any] | None" = None,
 ) -> None:
     deadline = start_time + active_worker_timeout_budget(
         timeout_seconds,
@@ -1273,28 +1324,34 @@ def _run(
                     fast_generated_count = 0
                     fast_reflected_count = 0
 
-                    # fast_omni: broad-spectrum cloud call, no feedback loop.
-                    # obliterate expands to 3 phases (scout+contextual+research).
+                    # fast_omni: use pre-generated batch if available, otherwise
+                    # fall back to per-URL cloud call (obliterate always uses per-URL).
                     if context_type == "fast_omni":
                         cloud_escalated = True
-                        cloud_model_rounds += 1
-                        cloud_plan = _coerce_cloud_plan(_get_fast_omni_payloads(
-                            url=url,
-                            param_name=param_name,
-                            cloud_model=cloud_model,
-                            waf=waf_hint,
-                            ekey=ekey,
-                            dedup_registry=dedup_registry,
-                            dedup_lock=dedup_lock,
-                            base_context=_cached_context,
-                            auth_headers=auth_headers,
-                            ai_backend=ai_backend,
-                            cli_tool=cli_tool,
-                            cli_model=cli_model,
-                            session_lessons=session_lessons,
-                            deep=deep or obliterate,
-                        ))
-                        cloud_payloads, _ = _unique_new_payloads(cloud_plan.payloads, seen_cloud_payloads)
+                        if fast_batch and not obliterate:
+                            # Filter the shared batch to payloads that make sense
+                            # for this URL's param names — lightweight, no network.
+                            filtered = _filter_batch_for_params(fast_batch, param_name, url)
+                            cloud_payloads, _ = _unique_new_payloads(filtered, seen_cloud_payloads)
+                        else:
+                            cloud_model_rounds += 1
+                            cloud_plan = _coerce_cloud_plan(_get_fast_omni_payloads(
+                                url=url,
+                                param_name=param_name,
+                                cloud_model=cloud_model,
+                                waf=waf_hint,
+                                ekey=ekey,
+                                dedup_registry=dedup_registry,
+                                dedup_lock=dedup_lock,
+                                base_context=_cached_context,
+                                auth_headers=auth_headers,
+                                ai_backend=ai_backend,
+                                cli_tool=cli_tool,
+                                cli_model=cli_model,
+                                session_lessons=session_lessons,
+                                deep=deep or obliterate,
+                            ))
+                            cloud_payloads, _ = _unique_new_payloads(cloud_plan.payloads, seen_cloud_payloads)
                         fast_generated_count += len(cloud_payloads)
                         for cp in cloud_payloads:
                             if _timed_out():
