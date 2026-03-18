@@ -704,6 +704,7 @@ def run_active_scan(
                                 "keep_searching": config.keep_searching,
                                 "extreme": config.extreme,
                                 "research": config.research,
+                                "fast_batch": fast_batch or None,
                                 **_cli_kwargs,
                             },
                             daemon=True,

@@ -2537,6 +2537,7 @@ def run_dom_worker(
     keep_searching: bool = False,
     extreme: bool = False,
     research: bool = False,
+    fast_batch: "list[Any] | None" = None,
 ) -> None:
     """Worker entry point for DOM XSS runtime scanning.
 
@@ -3414,6 +3415,7 @@ def run_post_worker(
     keep_searching: bool = False,
     extreme: bool = False,
     research: bool = False,
+    fast_batch: "list[Any] | None" = None,
 ) -> None:
     """Worker entry point for POST form targets. Mirrors run_worker() for GET URLs."""
     start_time = time.monotonic()
@@ -3451,6 +3453,7 @@ def run_post_worker(
             keep_searching=keep_searching,
             extreme=extreme,
             research=research,
+            fast_batch=fast_batch,
         )
     except Exception as exc:
         log.exception("POST worker crashed for %s", post_form.action_url)
@@ -3488,6 +3491,7 @@ def _run_post(
     keep_searching: bool = False,
     extreme: bool = False,
     research: bool = False,
+    fast_batch: "list[Any] | None" = None,
 ) -> None:
     from ai_xss_generator.probe import probe_post_form
     from ai_xss_generator.active.executor import ActiveExecutor
@@ -3797,30 +3801,36 @@ def _run_post(
                     fast_generated_count = 0
                     fast_reflected_count = 0
 
-                    # fast_omni: broad-spectrum cloud call, no feedback loop.
-                    # obliterate expands to 3 phases (scout+contextual+research).
+                    # fast_omni: use pre-generated batch if available (no LLM call),
+                    # otherwise fall back to per-param cloud generation.
+                    # obliterate always uses per-param generation.
                     if context_type == "fast_omni":
                         cloud_escalated = True
-                        cloud_model_rounds += 1
-                        cloud_plan = _coerce_cloud_plan(_get_fast_omni_payloads(
-                            url=post_form.source_page_url,
-                            param_name=param_name,
-                            cloud_model=cloud_model,
-                            waf=waf_hint,
-                            ekey=ekey,
-                            dedup_registry=dedup_registry,
-                            dedup_lock=dedup_lock,
-                            base_context=generation_context,
-                            auth_headers=auth_headers,
-                            ai_backend=ai_backend,
-                            cli_tool=cli_tool,
-                            cli_model=cli_model,
-                            session_lessons=post_session_lessons,
-                            delivery_mode="post",
-                            deep=deep or obliterate,
-                        ))
-                        cloud_payloads, _ = _unique_new_payloads(cloud_plan.payloads, seen_cloud_payloads)
+                        if fast_batch and not obliterate:
+                            filtered = _filter_batch_for_params(fast_batch, param_name, post_form.action_url)
+                            cloud_payloads, _ = _unique_new_payloads(filtered, seen_cloud_payloads)
+                        else:
+                            cloud_model_rounds += 1
+                            cloud_plan = _coerce_cloud_plan(_get_fast_omni_payloads(
+                                url=post_form.source_page_url,
+                                param_name=param_name,
+                                cloud_model=cloud_model,
+                                waf=waf_hint,
+                                ekey=ekey,
+                                dedup_registry=dedup_registry,
+                                dedup_lock=dedup_lock,
+                                base_context=generation_context,
+                                auth_headers=auth_headers,
+                                ai_backend=ai_backend,
+                                cli_tool=cli_tool,
+                                cli_model=cli_model,
+                                session_lessons=post_session_lessons,
+                                delivery_mode="post",
+                                deep=deep or obliterate,
+                            ))
+                            cloud_payloads, _ = _unique_new_payloads(cloud_plan.payloads, seen_cloud_payloads)
                         fast_generated_count += len(cloud_payloads)
+                        _consecutive_waf_blocks = 0
                         for cp in cloud_payloads:
                             if _timed_out():
                                 break
@@ -3839,6 +3849,21 @@ def _run_post(
                                 extra_sink_urls=crawled_pages or [],
                             )
                             _ai_tried_payloads.append((_cp_text, "cloud_model"))
+                            # WAF block detection: if the request errored with a
+                            # network/HTTP failure, back off before the next attempt.
+                            if not result.confirmed and result.error and any(
+                                sig in result.error.lower()
+                                for sig in ("403", "blocked", "net::", "timeout", "err_")
+                            ):
+                                _consecutive_waf_blocks += 1
+                                if _consecutive_waf_blocks >= 3:
+                                    log.debug(
+                                        "POST batch: %d consecutive WAF blocks on %s, backing off",
+                                        _consecutive_waf_blocks, post_form.action_url,
+                                    )
+                                    time.sleep(2.0)
+                            else:
+                                _consecutive_waf_blocks = 0
                             if result.confirmed:
                                 finding = _make_finding(
                                     url=post_form.action_url,
