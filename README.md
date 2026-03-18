@@ -131,6 +131,55 @@ axss -u "https://target.tld" --active --fast
 axss -u "https://target.tld" --active --obliterate --fresh
 ```
 
+## Scope enforcement
+
+`--scope` tells the crawler and scanner which hosts are in-bounds. It accepts several formats:
+
+```bash
+# Auto-derive from the seed URL (default)
+axss scan -u "https://target.tld"
+
+# Bug bounty platform — pulls scope directly from the API
+axss scan --urls urls.txt --scope h1:twitter
+axss scan --urls urls.txt --scope bc:tesla
+axss scan --urls urls.txt --scope ig:superdrug
+
+# Full program URL — platform is auto-detected, API is tried first,
+# falls back to Playwright render + LLM parse if credentials aren't configured
+axss scan --urls urls.txt --scope "https://app.intigriti.com/programs/aswatson/superdrug/detail"
+axss scan --urls urls.txt --scope "https://hackerone.com/twitter"
+axss scan --urls urls.txt --scope "https://bugcrowd.com/tesla"
+
+# Any other URL — rendered with Playwright and LLM-parsed for scope info
+axss scan --urls urls.txt --scope "https://example.com/security/scope.html"
+
+# Manual list
+axss scan --urls urls.txt --scope "target.tld,*.target.tld,!admin.target.tld"
+```
+
+Platform API credentials are stored in `~/.axss/keys` (written by `setup.sh`):
+
+```
+h1_username        = your-h1-username
+h1_token           = your-h1-api-token
+bugcrowd_api_key   = your-bc-key
+intigriti_api_token = your-ig-token
+```
+
+When a program URL is given but credentials are missing, axss automatically falls back to rendering the page with Playwright and using an LLM to extract the scope.
+
+## Rate limiting
+
+`--rate N` caps the global request rate across **all** phases — pre-flight liveness checks, crawling, and active scan workers all share the same token bucket. Use this when a target is aggressive about IP-banning scanners:
+
+```bash
+# 2 requests per second across the entire session
+axss scan --urls urls.txt -r 2
+
+# Uncapped (default)
+axss scan -u "https://target.tld"
+```
+
 ## Notes
 
 - Use only on systems you are authorized to test.

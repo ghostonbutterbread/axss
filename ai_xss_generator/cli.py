@@ -1661,6 +1661,23 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     # ── generate / scan subcommands ───────────────────────────────────────
+    # Print subcommand help when invoked with no arguments.
+    if args.command in ("scan", "generate"):
+        has_any_arg = bool(
+            getattr(args, "url", None)
+            or getattr(args, "urls", None)
+            or getattr(args, "input", None)
+            or getattr(args, "interesting", None)
+            or getattr(args, "public", False)
+        )
+        if not has_any_arg:
+            for action in parser._subparsers._group_actions:
+                sub = action.choices.get(args.command)
+                if sub:
+                    sub.print_help()
+                    break
+            return 0
+
     # Normalize: fill in defaults for attributes defined only on the other subcommand.
     _normalize_args(args)
 

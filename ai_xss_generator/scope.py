@@ -279,16 +279,19 @@ def resolve_scope(scope_arg: str | None, seed_urls: list[str]) -> ScopeConfig:
     """Parse the unified --scope argument and return a ScopeConfig.
 
     scope_arg formats:
-      None / 'auto'           → auto-derive from seed URL
-      'h1:HANDLE'             → HackerOne API
-      'hackerone:HANDLE'      → HackerOne API
-      'bc:SLUG'               → Bugcrowd API
-      'bugcrowd:SLUG'         → Bugcrowd API
-      'ig:HANDLE'             → Intigriti API
-      'intigriti:HANDLE'      → Intigriti API
-      'https://...'           → fetch page, LLM-parse scope
-      'http://...'            → fetch page, LLM-parse scope
-      'domain.com,*.other.com' → comma-separated manual list
+      None / 'auto'                        → auto-derive from seed URL
+      'h1:HANDLE'                          → HackerOne API
+      'hackerone:HANDLE'                   → HackerOne API
+      'bc:SLUG'                            → Bugcrowd API
+      'bugcrowd:SLUG'                      → Bugcrowd API
+      'ig:HANDLE'                          → Intigriti API
+      'intigriti:HANDLE'                   → Intigriti API
+      'https://app.intigriti.com/...'      → auto-detect platform, API then LLM fallback
+      'https://hackerone.com/...'          → auto-detect platform, API then LLM fallback
+      'https://bugcrowd.com/...'           → auto-detect platform, API then LLM fallback
+      'https://...' (any other URL)        → fetch page, LLM-parse scope
+      'http://...'                         → fetch page, LLM-parse scope
+      'domain.com,*.other.com'             → comma-separated manual list
     """
     if scope_arg is None or scope_arg.strip().lower() in ("auto", ""):
         return scope_from_urls(seed_urls)
@@ -307,8 +310,24 @@ def resolve_scope(scope_arg: str | None, seed_urls: list[str]) -> ScopeConfig:
             if platform == "intigriti":
                 return scope_from_intigriti(handle)
 
-    # URL → fetch page and LLM-parse
+    # URL → try platform auto-detection first, fall back to LLM page parse
     if scope_arg.startswith("http://") or scope_arg.startswith("https://"):
+        detected = _detect_platform_url(scope_arg)
+        if detected:
+            platform, handle = detected
+            try:
+                if platform == "h1":
+                    return scope_from_h1(handle)
+                if platform == "bugcrowd":
+                    return scope_from_bugcrowd(handle)
+                if platform == "intigriti":
+                    return scope_from_intigriti(handle)
+            except ValueError as exc:
+                log.info(
+                    "API credentials not configured for %s (%s); "
+                    "falling back to LLM page parse",
+                    platform, exc,
+                )
         return scope_from_page_url(scope_arg)
 
     # Fallback: comma- or whitespace-separated manual domain list
@@ -320,23 +339,11 @@ def scope_from_page_url(url: str) -> ScopeConfig:
     """Fetch a URL and use an LLM to extract in-scope / out-of-scope targets.
 
     Works with bug bounty program pages, security.txt files, or any scope doc.
+    Uses Playwright to render JS-heavy SPAs; falls back to plain HTTP on error.
     Requires OPENROUTER_API_KEY or OPENAI_API_KEY (env vars or ~/.axss/keys).
     """
     log.info("Fetching scope page: %s", url)
-    try:
-        resp = requests.get(
-            url,
-            timeout=20,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; axss-scope/1.0)"},
-        )
-        resp.raise_for_status()
-        raw = resp.text
-    except Exception as exc:
-        raise RuntimeError(f"Failed to fetch scope page '{url}': {exc}") from exc
-
-    # Strip HTML tags and collapse whitespace for cleaner LLM input
-    text = re.sub(r"<[^>]+>", " ", raw)
-    text = re.sub(r"\s{2,}", " ", text).strip()[:6000]
+    text = _fetch_page_text(url)
 
     log.info("Asking LLM to parse scope from page (%d chars)", len(text))
     parsed = _llm_parse_scope(text, url)
@@ -465,6 +472,92 @@ def is_in_scope(url: str, scope: ScopeConfig) -> bool:
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
+
+# Top-level paths on each platform that are not program handles
+_H1_NON_PROGRAM: frozenset[str] = frozenset({
+    "login", "logout", "users", "reports", "hacktivity", "leaderboard",
+    "opportunities", "bounty-programs", "directory", "settings", "security",
+    "blog", "signup", "404", "500",
+})
+_BC_NON_PROGRAM: frozenset[str] = frozenset({
+    "login", "logout", "user", "settings", "programs", "leaderboard",
+    "blog", "about", "signup", "404", "500",
+})
+
+
+def _detect_platform_url(url: str) -> tuple[str, str] | None:
+    """Detect a known bug bounty platform URL and return (platform, handle).
+
+    Supported patterns:
+      https://app.intigriti.com/programs/{company}/{handle}/...
+      https://hackerone.com/{handle}
+      https://hackerone.com/programs/{handle}
+      https://bugcrowd.com/{slug}
+
+    Returns None for unrecognised or ambiguous URLs.
+    """
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    path = parsed.path.rstrip("/")
+
+    if host == "app.intigriti.com":
+        m = re.match(r"^/programs/[^/]+/([^/]+)", path)
+        if m:
+            return ("intigriti", m.group(1))
+
+    if host in ("hackerone.com", "www.hackerone.com"):
+        m = re.match(r"^/programs/([^/]+)", path)
+        if m:
+            return ("h1", m.group(1))
+        m = re.match(r"^/([^/]+)$", path)
+        if m and m.group(1) not in _H1_NON_PROGRAM:
+            return ("h1", m.group(1))
+
+    if host in ("bugcrowd.com", "www.bugcrowd.com"):
+        m = re.match(r"^/([^/]+)$", path)
+        if m and m.group(1) not in _BC_NON_PROGRAM:
+            return ("bugcrowd", m.group(1))
+
+    return None
+
+
+def _fetch_page_text(url: str) -> str:
+    """Return visible text from a URL, using Playwright for JS-heavy pages.
+
+    Playwright renders the full SPA before extracting text; falls back to a
+    plain HTTP GET if Playwright is unavailable or fails.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+            )
+            try:
+                page = browser.new_page()
+                page.goto(url, wait_until="networkidle", timeout=30_000)
+                html = page.content()
+            finally:
+                browser.close()
+        log.debug("Playwright rendered scope page (%d bytes)", len(html))
+    except Exception as exc:
+        log.debug("Playwright render failed, falling back to requests: %s", exc)
+        try:
+            resp = requests.get(
+                url,
+                timeout=20,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; axss-scope/1.0)"},
+            )
+            resp.raise_for_status()
+            html = resp.text
+        except Exception as req_exc:
+            raise RuntimeError(f"Failed to fetch scope page '{url}': {req_exc}") from req_exc
+
+    text = re.sub(r"<[^>]+>", " ", html)
+    text = re.sub(r"\s{2,}", " ", text).strip()[:8000]
+    return text
+
 
 def _host(url: str) -> str:
     return (urlparse(url).hostname or "").lower()

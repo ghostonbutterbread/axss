@@ -411,6 +411,19 @@ PYEOF
 openrouter_api_key =
 openai_api_key     =
 #
+# HackerOne — used by --scope h1:HANDLE
+# Create an API token at https://hackerone.com/settings/api_token/edit
+h1_username        =
+h1_token           =
+#
+# Bugcrowd — used by --scope bc:SLUG
+# Create an API key at https://bugcrowd.com/user/api_keys
+bugcrowd_api_key   =
+#
+# Intigriti — used by --scope ig:HANDLE
+# Create a personal access token at https://app.intigriti.com/profile/tokens
+intigriti_api_token =
+#
 # xssy.uk JWT — copy from localStorage key userData.token after logging in
 # Used by axss_learn.py --xssy-token to get private lab instances
 xssy_jwt           =
@@ -420,6 +433,18 @@ KEYS
   else
     # Ensure perms are correct even if file already existed
     chmod 600 "$CONFIG_DIR/keys"
+    # Append any keys introduced after initial setup (idempotent — skips if already present)
+    _append_key_if_missing() {
+      local key="$1" comment="$2"
+      if ! grep -q "^${key}" "$CONFIG_DIR/keys" 2>/dev/null; then
+        printf '\n%s\n%s =\n' "$comment" "$key" >> "$CONFIG_DIR/keys"
+        echo "  Added missing key slot: $key"
+      fi
+    }
+    _append_key_if_missing "h1_username"         "# HackerOne username — used by --scope h1:HANDLE"
+    _append_key_if_missing "h1_token"            "# HackerOne API token — https://hackerone.com/settings/api_token/edit"
+    _append_key_if_missing "bugcrowd_api_key"    "# Bugcrowd API key — used by --scope bc:SLUG"
+    _append_key_if_missing "intigriti_api_token" "# Intigriti personal access token — used by --scope ig:HANDLE"
   fi
 
   # 5. ollama serve log placeholder (created lazily, just ensure dir is ready)

@@ -1,7 +1,8 @@
 """Active scan orchestrator — spawns per-URL worker processes and aggregates results.
 
 Rate limiting:
-  - Per-domain: each domain gets its own token bucket at `rate` req/s.
+  - Global: a single token bucket at `rate` req/s is shared across ALL phases —
+    pre-flight liveness checks, dedup crawl fetches, and active scan workers.
   - Global cap: total concurrent workers capped at `workers`.
   - Workers auto-scale based on rate (floor(rate / 5) workers, min 1), but
     never exceed the explicit --workers cap.
@@ -22,6 +23,7 @@ import math
 import multiprocessing
 import re
 import signal
+import threading
 import time
 import urllib.parse
 from collections import defaultdict
@@ -107,12 +109,44 @@ def _work_item_key(kind: str, item: Any) -> str:
 # ---------------------------------------------------------------------------
 
 _LIVENESS_TIMEOUT = 5          # seconds per HEAD/GET
-_LIVENESS_WORKERS = 50         # concurrent connections
+_LIVENESS_WORKERS = 50         # max concurrent connections (further capped by rate)
 _LIVENESS_MIN_LIST  = 2        # skip check for tiny lists
+
+
+class _GlobalRateLimiter:
+    """Thread-safe leaky-bucket rate limiter shared across all phases.
+
+    Calling acquire() blocks until the caller is allowed to send a request.
+    rate=0 means uncapped — acquire() returns immediately.
+    """
+
+    def __init__(self, rate: float) -> None:
+        self._interval = (1.0 / rate) if rate > 0 else 0.0
+        self._lock = threading.Lock()
+        self._next_allowed = time.monotonic()
+
+    def acquire(self) -> None:
+        if self._interval == 0:
+            return
+        with self._lock:
+            now = time.monotonic()
+            wait = self._next_allowed - now
+            if wait > 0:
+                self._next_allowed += self._interval
+            else:
+                self._next_allowed = now + self._interval
+        if wait > 0:
+            time.sleep(wait)
+
+    @property
+    def uncapped(self) -> bool:
+        return self._interval == 0
+
 
 def _filter_live_urls(
     url_list: list[str],
     auth_headers: dict[str, str] | None = None,
+    rate_limiter: _GlobalRateLimiter | None = None,
 ) -> list[str]:
     """HEAD-check every URL concurrently; drop only URLs that are provably gone.
 
@@ -148,12 +182,16 @@ def _filter_live_urls(
     # Only these status codes mean the URL itself is gone
     _GONE_STATUSES = {404, 410}
 
+    limiter = rate_limiter or _GlobalRateLimiter(0)
+
     def _check(url: str) -> tuple[str, bool, str]:
+        limiter.acquire()
         try:
             r = requests.head(url, headers=req_headers,
                               timeout=_LIVENESS_TIMEOUT, allow_redirects=True)
             if r.status_code == 405:
                 # Server doesn't support HEAD — try a streaming GET
+                limiter.acquire()
                 r = requests.get(url, headers=req_headers,
                                  timeout=_LIVENESS_TIMEOUT,
                                  allow_redirects=True, stream=True)
@@ -163,8 +201,15 @@ def _filter_live_urls(
         except RequestException as exc:
             return url, False, str(exc)
 
+    # Cap concurrent connections to rate when rate-limited so we never
+    # burst more threads than the token bucket allows per second.
+    if limiter.uncapped:
+        n_workers = min(_LIVENESS_WORKERS, len(url_list))
+    else:
+        rate_ceil = math.ceil(1.0 / limiter._interval)
+        n_workers = min(rate_ceil, _LIVENESS_WORKERS, len(url_list))
+
     step(f"Pre-flight liveness check: probing {len(url_list)} URL(s)…")
-    n_workers = min(_LIVENESS_WORKERS, len(url_list))
     results: list[tuple[str, bool, str]] = []
     with ThreadPoolExecutor(max_workers=n_workers) as pool:
         futures = {pool.submit(_check, u): u for u in url_list}
@@ -317,10 +362,17 @@ def run_active_scan(
     upload_target_list = list(upload_targets)
     crawled_pages_list = list(crawled_pages)
 
+    # Single rate limiter shared across ALL phases of this scan session
+    rate_limiter = _GlobalRateLimiter(config.rate)
+
     # Pre-flight: deduplicate parametric path variants, then drop dead URLs
     if url_list:
         url_list = _dedup_urls_by_path_shape(url_list)
-        url_list = _filter_live_urls(url_list, auth_headers=config.auth_headers)
+        url_list = _filter_live_urls(
+            url_list,
+            auth_headers=config.auth_headers,
+            rate_limiter=rate_limiter,
+        )
 
     # Build work items filtered by enabled scan types
     work_items: list[tuple[str, Any]] = []
