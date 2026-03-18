@@ -76,9 +76,7 @@ class ActiveScanConfig:
     cli_tool: str = "claude"      # "claude" | "codex" (when ai_backend="cli")
     cli_model: str | None = None  # model passed to CLI (None = CLI default)
     cloud_attempts: int = 1       # recursive cloud reasoning rounds per context
-    deep: bool = False
-    fast: bool = False            # skip local triage, run cloud Gen XSS directly
-    obliterate: bool = False      # fast + deep: skip probe, 3-phase broad-spectrum generation
+    mode: str = "normal"          # "fast" | "normal" | "deep"
     fresh: bool = False           # ignore all caches, re-collect from scratch
     blind_callback: str | None = None  # OOB callback URL for blind XSS payloads
     waf_source: str | None = None # local path to open-source WAF/filter code for planning hints
@@ -405,7 +403,7 @@ def run_active_scan(
     # Fast mode: generate one payload batch upfront for all workers to share.
     # Obliterate keeps per-URL 3-phase generation; fast alone uses the batch.
     fast_batch: list[Any] = []
-    if config.fast and not config.obliterate and url_list:
+    if config.mode == "fast" and url_list:
         from ai_xss_generator.models import generate_fast_batch
         step("Fast mode: generating payload batch…")
         fast_batch = generate_fast_batch(
@@ -668,7 +666,7 @@ def run_active_scan(
                     "cli_tool": config.cli_tool,
                     "cli_model": config.cli_model,
                     "cloud_attempts": config.cloud_attempts,
-                    "deep": config.deep,
+                    "mode": config.mode,
                 }
                 while len(active_procs) < n_workers:
                     try:
@@ -695,9 +693,6 @@ def run_active_scan(
                                 "auth_headers": config.auth_headers,
                                 "sink_url": config.sink_url,
                                 "crawled_pages": crawled_pages_list,
-                                "deep": config.deep,
-                                "fast": config.fast,
-                                "obliterate": config.obliterate,
                                 "fresh": config.fresh,
                                 "waf_source": config.waf_source,
                                 "keep_searching": config.keep_searching,
@@ -724,8 +719,6 @@ def run_active_scan(
                                 "dedup_registry": dedup_registry,
                                 "dedup_lock": dedup_lock,
                                 "auth_headers": config.auth_headers,
-                                "fast": config.fast,
-                                "obliterate": config.obliterate,
                                 "waf_source": config.waf_source,
                                 "keep_searching": config.keep_searching,
                                 "extreme": config.extreme,
@@ -770,9 +763,6 @@ def run_active_scan(
                                 "auth_headers": config.auth_headers,
                                 "crawled_pages": crawled_pages_list,
                                 "sink_url": config.sink_url,
-                                "deep": config.deep,
-                                "fast": config.fast,
-                                "obliterate": config.obliterate,
                                 "fresh": config.fresh,
                                 "waf_source": config.waf_source,
                                 "keep_searching": config.keep_searching,

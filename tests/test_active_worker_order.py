@@ -543,6 +543,7 @@ def test_get_worker_marks_dead_target_when_no_reflection() -> None:
             ai_backend="api",
             cli_tool="claude",
             cli_model=None,
+            mode="deep",
         )
 
     assert results and results[0].status == "no_reflection"
@@ -721,6 +722,7 @@ def test_dom_worker_runs_local_model_per_taint_path_before_any_fallback():
             ai_backend="api",
             cli_tool="claude",
             cli_model=None,
+            mode="deep",
         )
 
     assert local_calls == [("fragment", "hash", "eval"), ("query_param", "q", "innerHTML")]

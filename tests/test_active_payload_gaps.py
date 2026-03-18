@@ -324,6 +324,7 @@ def test_get_worker_runs_coordinated_split_payload_fallback_for_reflected_only_p
             ai_backend="api",
             cli_tool="claude",
             cli_model=None,
+            mode="deep",
         )
 
     assert fire_overrides

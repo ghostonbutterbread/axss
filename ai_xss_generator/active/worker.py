@@ -908,9 +908,7 @@ def run_worker(
     cli_tool: str = "claude",
     cli_model: str | None = None,
     cloud_attempts: int = 1,
-    deep: bool = False,
-    fast: bool = False,
-    obliterate: bool = False,
+    mode: str = "normal",
     fresh: bool = False,
     waf_source: str | None = None,
     keep_searching: bool = False,
@@ -952,9 +950,7 @@ def run_worker(
             cli_tool=cli_tool,
             cli_model=cli_model,
             cloud_attempts=cloud_attempts,
-            deep=deep,
-            fast=fast,
-            obliterate=obliterate,
+            mode=mode,
             fresh=fresh,
             waf_source=waf_source,
             keep_searching=keep_searching,
@@ -989,9 +985,7 @@ def _run(
     cli_tool: str = "claude",
     cli_model: str | None = None,
     cloud_attempts: int = 1,
-    deep: bool = False,
-    fast: bool = False,
-    obliterate: bool = False,
+    mode: str = "normal",
     fresh: bool = False,
     waf_source: str | None = None,
     keep_searching: bool = False,
@@ -1040,8 +1034,8 @@ def _run(
     coordinated_attempts: list[Any] = []
     target_disposition: Any = None
 
-    if fast or obliterate:
-        # Fast/obliterate mode: check probe cache first — if we have real probe
+    if mode in ("fast", "normal"):
+        # Fast/normal mode: check probe cache first — if we have real probe
         # data from a prior scan we use it instead of the synthetic fast_omni
         # broad-spectrum fallback, giving targeted context at no extra cost.
         from ai_xss_generator.cache import get_probe
@@ -1119,8 +1113,8 @@ def _run(
         log.debug("Pre-parse of %s failed (will retry per-param): %s", url, exc)
 
     session_lessons: list[Any] = []
-    if not fast and not obliterate:
-        # Behavior/disposition/lessons block — skipped in fast/obliterate mode.
+    if mode == "deep":
+        # Behavior/disposition/lessons block — skipped in fast/normal mode.
         try:
             from ai_xss_generator.behavior import (
                 attach_behavior_profile,
@@ -1292,7 +1286,7 @@ def _run(
                         model=model,
                         waf=waf_hint,
                         delivery_mode="get",
-                        fast_mode=fast,
+                        fast_mode=mode in ("fast", "normal"),
                     )
                     _triage_approved = _triage.should_escalate
                     _append_reason(escalation_reasons, f"[triage score={_triage.score}] {_triage.reason}")
@@ -1325,10 +1319,10 @@ def _run(
                     fast_reflected_count = 0
 
                     # fast_omni: use pre-generated batch if available, otherwise
-                    # fall back to per-URL cloud call (obliterate always uses per-URL).
+                    # fall back to per-URL cloud call (deep mode always uses per-URL).
                     if context_type == "fast_omni":
                         cloud_escalated = True
-                        if fast_batch and not obliterate:
+                        if fast_batch and mode != "deep":
                             # Filter the shared batch to payloads that make sense
                             # for this URL's param names — lightweight, no network.
                             filtered = _filter_batch_for_params(fast_batch, param_name, url)
@@ -1349,7 +1343,7 @@ def _run(
                                 cli_tool=cli_tool,
                                 cli_model=cli_model,
                                 session_lessons=session_lessons,
-                                deep=deep or obliterate,
+                                deep=mode == "deep",
                             ))
                             cloud_payloads, _ = _unique_new_payloads(cloud_plan.payloads, seen_cloud_payloads)
                         fast_generated_count += len(cloud_payloads)
@@ -1413,7 +1407,7 @@ def _run(
                             session_lessons=session_lessons,
                             feedback_lessons=cloud_feedback_lessons,
                             phase_profile=phase_profile,
-                            deep=deep,
+                            deep=mode == "deep",
                         ))
                         cloud_payloads, duplicate_payloads = _unique_new_payloads(
                             cloud_plan.payloads,
@@ -1477,7 +1471,7 @@ def _run(
                         if context_done or attempt_number >= attempt_limit:
                             break
 
-                    if not context_done and not deep and not _timed_out() and fast_generated_count > 0:
+                    if not context_done and mode != "deep" and not _timed_out() and fast_generated_count > 0:
                         _esc = _build_deep_escalation_plan(
                             url=url,
                             probe_result=context_probe_result,
@@ -2530,9 +2524,7 @@ def run_dom_worker(
     cli_tool: str = "claude",
     cli_model: str | None = None,
     cloud_attempts: int = 1,
-    deep: bool = False,
-    fast: bool = False,
-    obliterate: bool = False,
+    mode: str = "normal",
     waf_source: str | None = None,
     keep_searching: bool = False,
     extreme: bool = False,
@@ -2567,9 +2559,7 @@ def run_dom_worker(
             cli_tool=cli_tool,
             cli_model=cli_model,
             cloud_attempts=cloud_attempts,
-            deep=deep,
-            fast=fast,
-            obliterate=obliterate,
+            mode=mode,
             waf_source=waf_source,
             keep_searching=keep_searching,
             extreme=extreme,
@@ -2596,9 +2586,7 @@ def _run_dom(
     cli_tool: str = "claude",
     cli_model: str | None = None,
     cloud_attempts: int = 1,
-    deep: bool = False,
-    fast: bool = False,
-    obliterate: bool = False,
+    mode: str = "normal",
     waf_source: str | None = None,
     keep_searching: bool = False,
     extreme: bool = False,
@@ -2751,8 +2739,8 @@ def _run_dom(
                 ai_engine = ""
                 ai_note = ""
                 local_stage = None
-                # fast/obliterate mode: bypass local model — cloud fires immediately
-                local_done = (not escalation_policy.use_local) or fast or obliterate
+                # fast/normal mode: bypass local model — cloud fires immediately
+                local_done = (not escalation_policy.use_local) or mode in ("fast", "normal")
                 local_payloads: list[str] = []
                 local_payloads_tried = False
                 cloud_stage = None
@@ -2859,7 +2847,7 @@ def _run_dom(
                                 session_lessons=dom_session_lessons,
                                 feedback_lessons=cloud_feedback_lessons,
                                 phase_profile=phase_profile,
-                                deep=deep or obliterate,
+                                deep=mode == "deep",
                             ))
 
                     if cloud_stage is not None:
@@ -2899,7 +2887,7 @@ def _run_dom(
                         break
                     time.sleep(0.05)
 
-                if not confirmed and not deep and use_cloud and not _timed_out() and fast_generated_count > 0:
+                if not confirmed and mode != "deep" and use_cloud and not _timed_out() and fast_generated_count > 0:
                     _dom_strategy_hint = _analyze_fast_failure_strategy(
                         context=dom_context,
                         cloud_model=cloud_model,
@@ -3407,9 +3395,7 @@ def run_post_worker(
     cli_tool: str = "claude",
     cli_model: str | None = None,
     cloud_attempts: int = 1,
-    deep: bool = False,
-    fast: bool = False,
-    obliterate: bool = False,
+    mode: str = "normal",
     fresh: bool = False,
     waf_source: str | None = None,
     keep_searching: bool = False,
@@ -3445,9 +3431,7 @@ def run_post_worker(
             cli_tool=cli_tool,
             cli_model=cli_model,
             cloud_attempts=cloud_attempts,
-            deep=deep,
-            fast=fast,
-            obliterate=obliterate,
+            mode=mode,
             fresh=fresh,
             waf_source=waf_source,
             keep_searching=keep_searching,
@@ -3483,9 +3467,7 @@ def _run_post(
     cli_tool: str = "claude",
     cli_model: str | None = None,
     cloud_attempts: int = 1,
-    deep: bool = False,
-    fast: bool = False,
-    obliterate: bool = False,
+    mode: str = "normal",
     fresh: bool = False,
     waf_source: str | None = None,
     keep_searching: bool = False,
@@ -3534,8 +3516,8 @@ def _run_post(
     generation_context = _cached_context
     effective_sink_url = sink_url
 
-    if fast or obliterate:
-        # Fast/obliterate mode: check probe cache first — real context from a
+    if mode in ("fast", "normal"):
+        # Fast/normal mode: check probe cache first — real context from a
         # prior scan beats the synthetic fast_omni broad-spectrum fallback.
         from ai_xss_generator.cache import get_probe
         from ai_xss_generator.probe import make_fast_probe_result
@@ -3592,7 +3574,7 @@ def _run_post(
     post_session_lessons: list[Any] = []
     target_disposition: Any = None
     try:
-        if not fast and not obliterate and not _timed_out():
+        if mode == "deep" and not _timed_out():
             discovered_sink_url, sink_reflection, parsed_sink_context = _autodiscover_post_sink_context(
                 executor=executor,
                 post_form=post_form,
@@ -3617,7 +3599,7 @@ def _run_post(
                     parsed_sink_context = attach_waf_knowledge(parsed_sink_context, analyze_waf_source(waf_source))
                 generation_context = parsed_sink_context
 
-        if not fast and not obliterate:
+        if mode == "deep":
             from ai_xss_generator.behavior import (
                 attach_behavior_profile,
                 build_target_behavior_profile,
@@ -3772,7 +3754,7 @@ def _run_post(
                         model=model,
                         waf=waf_hint,
                         delivery_mode="post",
-                        fast_mode=fast,
+                        fast_mode=mode in ("fast", "normal"),
                     )
                     _triage_approved = _triage.should_escalate
                     _append_reason(escalation_reasons, f"[triage score={_triage.score}] {_triage.reason}")
@@ -3803,10 +3785,10 @@ def _run_post(
 
                     # fast_omni: use pre-generated batch if available (no LLM call),
                     # otherwise fall back to per-param cloud generation.
-                    # obliterate always uses per-param generation.
+                    # deep mode always uses per-param generation.
                     if context_type == "fast_omni":
                         cloud_escalated = True
-                        if fast_batch and not obliterate:
+                        if fast_batch and mode != "deep":
                             filtered = _filter_batch_for_params(fast_batch, param_name, post_form.action_url)
                             cloud_payloads, _ = _unique_new_payloads(filtered, seen_cloud_payloads)
                         else:
@@ -3826,7 +3808,7 @@ def _run_post(
                                 cli_model=cli_model,
                                 session_lessons=post_session_lessons,
                                 delivery_mode="post",
-                                deep=deep or obliterate,
+                                deep=mode == "deep",
                             ))
                             cloud_payloads, _ = _unique_new_payloads(cloud_plan.payloads, seen_cloud_payloads)
                         fast_generated_count += len(cloud_payloads)
@@ -3908,7 +3890,7 @@ def _run_post(
                             session_lessons=post_session_lessons,
                             feedback_lessons=cloud_feedback_lessons,
                             phase_profile=phase_profile,
-                            deep=deep,
+                            deep=mode == "deep",
                         ))
                         cloud_payloads, duplicate_payloads = _unique_new_payloads(
                             cloud_plan.payloads,
@@ -3973,7 +3955,7 @@ def _run_post(
                         if context_done or attempt_number >= attempt_limit:
                             break
 
-                    if not context_done and not deep and not _timed_out() and fast_generated_count > 0:
+                    if not context_done and mode != "deep" and not _timed_out() and fast_generated_count > 0:
                         _esc = _build_deep_escalation_plan(
                             url=post_form.source_page_url,
                             probe_result=context_probe_result,

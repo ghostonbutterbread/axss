@@ -1376,9 +1376,9 @@ def _run_active_scan(
         cli_tool=ai_config.cli_tool,
         cli_model=ai_config.cli_model,
         cloud_attempts=getattr(args, "attempts", 1),
-        deep=getattr(args, "deep", False),
-        fast=not getattr(args, "deep", False) and not getattr(args, "obliterate", False),
-        obliterate=getattr(args, "obliterate", False),
+        mode=("deep" if getattr(args, "deep", False) else
+              "normal" if getattr(args, "obliterate", False) else
+              "fast"),
         fresh=getattr(args, "fresh", False),
         waf_source=getattr(args, "waf_source", None),
         keep_searching=getattr(args, "keep_searching", False),
@@ -1414,8 +1414,7 @@ def _run_active_scan(
         f"rate={args.rate:g} req/s | workers={scan_config.workers} | "
         f"model={scan_config.model} | waf={waf or 'none'} | "
         f"cloud_attempts={scan_config.cloud_attempts}"
-        + (" | obliterate=true" if getattr(args, "obliterate", False) else
-           " | deep=true" if getattr(args, "deep", False) else "")
+        + (f" | mode={scan_config.mode}" if scan_config.mode != "fast" else "")
         + (" | profile=extreme" if getattr(args, "extreme", False) else "")
         + (" | profile=research" if getattr(args, "research", False) else "")
         + (" | keep_searching=true" if getattr(args, "keep_searching", False) else "")
