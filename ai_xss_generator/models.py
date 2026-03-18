@@ -1821,7 +1821,16 @@ def _extract_json_blob(text: str) -> dict[str, Any]:
     end = text.rfind("}")
     if start == -1 or end == -1 or end <= start:
         raise ValueError("Model response did not include JSON")
-    return json.loads(text[start: end + 1])
+    blob = text[start: end + 1]
+    try:
+        return json.loads(blob)
+    except json.JSONDecodeError:
+        # Models sometimes emit \x hex escapes or other non-standard escapes
+        # inside JSON strings (e.g. \x3c instead of \u003c). Sanitize and retry.
+        sanitized = re.sub(r'\\x([0-9a-fA-F]{2})', lambda m: chr(int(m.group(1), 16)), blob)
+        # Also escape any remaining lone backslashes that aren't valid JSON escapes
+        sanitized = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', sanitized)
+        return json.loads(sanitized)
 
 
 def _normalize_strategy(item: dict[str, Any]) -> StrategyProfile | None:
@@ -2994,10 +3003,26 @@ def generate_fast_batch(
         data = _extract_json_blob(content)
         return _normalize_payloads(data.get("payloads", []), source=source)
 
-    log.info("Generating fast batch (%d payloads) via %s …", count, cloud_model)
+    backend_label = f"{cli_tool}:{cli_model or 'default'}" if ai_backend == "cli" else cloud_model
+    log.info("Generating fast batch (%d payloads) via %s …", count, backend_label)
 
-    # The batch prompt is self-contained and uses the OpenAI-compat chat API directly.
-    # CLI backend doesn't fit this pattern, so we always use the API path here.
+    # CLI backend — send the raw batch prompt directly to the configured CLI tool
+    if ai_backend == "cli":
+        try:
+            from ai_xss_generator.cli_runner import generate_via_cli_with_tool
+            raw, used_tool = generate_via_cli_with_tool(
+                cli_tool,
+                prompt,
+                model=cli_model or None,
+                timeout_seconds=request_timeout_seconds,
+            )
+            data = _extract_json_blob(raw)
+            payloads = _normalize_payloads(data.get("payloads", []), source=used_tool)
+            log.info("Fast batch: %d payloads from CLI backend (%s)", len(payloads), used_tool)
+            return payloads
+        except Exception as exc:
+            log.warning("CLI batch generation failed, falling back to API: %s", exc)
+
     # Try OpenRouter first, then OpenAI
     api_key = os.environ.get("OPENROUTER_API_KEY", "") or load_api_key("openrouter_api_key")
     if api_key:
