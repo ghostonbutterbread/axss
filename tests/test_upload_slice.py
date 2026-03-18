@@ -203,7 +203,7 @@ def test_upload_only_batch_mode_crawls_each_seed(monkeypatch, tmp_path) -> None:
         verbose=0,
         workers=1,
         timeout=300,
-        json_out=None,
+        output=None,
         sink_url=None,
         attempts=1,
         header=[],

@@ -97,623 +97,581 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
-def build_parser(config_default_model: str) -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog=APP_NAME,
-        description=(
-            "Parse local or live HTML, identify likely XSS execution points, and rank payloads "
-            "with Ollama-first generation."
-        ),
-        epilog=(
-            "Common combos:\n"
-            "  axss -u https://example.com -t 10 -o list\n"
-            "  axss -u https://example.com --public --waf cloudflare -o heat\n"
-            "  axss --public --waf modsecurity -o list          (standalone — no target needed)\n"
-            "  axss --public -o list                            (all public payloads)\n"
-            "  axss --urls urls.txt -t 5 -o list\n"
-            "  axss --interesting urls.txt -o list\n"
-            "  axss --urls urls.txt --merge-batch -o json -j result.json\n"
-            f"  axss -u https://example.com -m {config_default_model} -o list -t 3\n"
-            "  axss -v -i sample_target.html -o heat\n"
-            "  axss -l\n"
-            "  axss -s qwen3.5\n"
-            "  axss -u https://example.com -m qwen3.5:4b -j result.json"
-        ),
-        formatter_class=_HelpFormatter,
-        add_help=False,
-    )
-    parser.add_argument("-h", "--help", action="help", help="Show this help message and exit.")
+# ---------------------------------------------------------------------------
+# Subcommand builder helpers
+# ---------------------------------------------------------------------------
 
-    # Action group — no longer required=True because --public can be standalone
-    action_group = parser.add_mutually_exclusive_group(required=False)
-    action_group.add_argument(
-        "-u",
-        "--url",
-        metavar="TARGET",
-        help="--url TARGET (fetch live HTML), e.g. -u https://example.com",
-    )
-    action_group.add_argument(
-        "--urls",
-        metavar="FILE",
-        help="--urls FILE (fetch one URL per line), e.g. --urls urls.txt",
-    )
-    action_group.add_argument(
-        "--interesting",
-        metavar="FILE",
-        help=(
-            "--interesting FILE  Use the configured AI backend to rank URLs from a file by how "
-            "promising they look for deeper XSS testing. Writes a markdown report and helps "
-            "narrow single-target runs."
-        ),
-    )
-    action_group.add_argument(
-        "-i",
-        "--input",
-        metavar="FILE_OR_SNIPPET",
-        help="--input FILE_OR_SNIPPET (parse a local file or raw HTML), e.g. -i sample_target.html",
-    )
-    action_group.add_argument(
-        "-l",
-        "--list-models",
-        action="store_true",
-        help="--list-models (show locally available Ollama models), e.g. -l",
-    )
-    action_group.add_argument(
-        "-s",
-        "--search-models",
-        metavar="QUERY",
-        help="--search-models QUERY (search Ollama model names), e.g. -s qwen3.5",
-    )
-    action_group.add_argument(
-        "--check-keys",
-        action="store_true",
-        help=(
-            "--check-keys  Validate all configured API keys (Ollama, OpenRouter, OpenAI). "
-            "Reads from ~/.axss/keys and environment variables, makes a lightweight "
-            "probe request to each service, and reports status."
-        ),
-    )
-    action_group.add_argument(
-        "--clear-reports",
-        action="store_true",
-        help="--clear-reports  Delete all saved reports from ~/.axss/reports/.",
-    )
-    action_group.add_argument(
-        "--memory-list",
-        action="store_true",
-        default=False,
-        help="--memory-list  Show all curated findings in the knowledge base.",
-    )
-    action_group.add_argument(
-        "--memory-stats",
-        action="store_true",
-        default=False,
-        help="--memory-stats  Show knowledge base entry counts.",
-    )
-    action_group.add_argument(
-        "--memory-export",
-        metavar="PATH",
-        help="--memory-export PATH  Export the curated knowledge base to a YAML file.",
-    )
-    action_group.add_argument(
-        "--memory-import",
-        metavar="PATH",
-        help="--memory-import PATH  Import curated findings from a YAML file.",
-    )
-
-    # Payload sourcing flags
-    parser.add_argument(
-        "--public",
-        action="store_true",
-        help=(
-            "--public  Fetch known XSS payloads from public/community sources and inject "
-            "them as reference context into the model prompt. Can be used standalone "
-            "(no target required) to dump a payload list."
-        ),
-    )
-    parser.add_argument(
-        "--waf",
-        metavar="NAME",
-        choices=SUPPORTED_WAFS,
-        help=(
-            f"--waf NAME  Target WAF ({', '.join(SUPPORTED_WAFS)}). "
-            "Auto-detected from response headers when -u/--urls is used; "
-            "use this flag to override or set manually. "
-            "Loads WAF-specific bypass payloads and primes the model."
-        ),
-    )
-    parser.add_argument(
-        "--waf-source",
-        metavar="PATH",
-        help=(
-            "--waf-source PATH  Analyze an open-source WAF/filter codebase and add a compact "
-            "knowledge profile to model reasoning. Accepts a local directory/file path or a Git "
-            "repository URL (cloned locally first)."
-        ),
-    )
-
-    parser.add_argument(
-        "-m",
-        "--model",
+def _add_shared_args(p: argparse.ArgumentParser, config_default_model: str) -> None:
+    """Flags available on both 'generate' and 'scan' subcommands."""
+    # ── AI / model ────────────────────────────────────────────────────────
+    p.add_argument(
+        "-m", "--model",
         default=None,
         help=(
-            "--model MODEL (override the Ollama model), e.g. -m qwen3.5:4b. "
-            f"Default comes from {CONFIG_PATH} or falls back to {DEFAULT_MODEL}."
+            f"Override the AI model. Default comes from {CONFIG_PATH} "
+            f"or falls back to {DEFAULT_MODEL}."
         ),
     )
-    parser.add_argument(
-        "-o",
-        "--output",
-        choices=["json", "list", "heat", "interactive"],
-        default="list",
-        help="--output {json,list,heat,interactive} (choose terminal format), e.g. -o interactive",
-    )
-    parser.add_argument(
-        "-t",
-        "--top",
-        metavar="N",
-        type=int,
-        default=20,
-        help="--top N (limit ranked payloads), e.g. -t 10",
-    )
-    parser.add_argument(
-        "-j",
-        "--json-out",
-        metavar="PATH",
-        help="--json-out PATH (always write the full JSON result), e.g. -j result.json",
-    )
-    parser.add_argument(
-        "--sarif",
-        metavar="PATH",
-        help=(
-            "--sarif PATH  Write a SARIF 2.1.0 report alongside the standard report. "
-            "Compatible with GitHub Advanced Security, DefectDojo, and most security pipelines."
-        ),
-    )
-    parser.add_argument(
-        "-r",
-        "--rate",
-        metavar="N",
-        type=float,
-        default=25.0,
-        help=(
-            "--rate N  Max requests per second against the target (default: 25). "
-            "Use 0 to run uncapped. Lower values help avoid rate-limit bans on strict platforms, "
-            "e.g. -r 5 for 5 req/sec, -r 0 for no limit."
-        ),
-    )
-    parser.add_argument(
-        "-v",
-        "--verbose",
-        action="count",
-        default=0,
-        help=(
-            "-v for verbose progress output; "
-            "-vv for full debug trace (all pipeline steps, AI reasoning, DOM XSS probes)"
-        ),
-    )
-    parser.add_argument(
-        "--merge-batch",
-        action="store_true",
-        help="--merge-batch (combine batch contexts into one payload set), e.g. --urls urls.txt --merge-batch",
-    )
-    parser.add_argument(
-        "--no-probe",
-        action="store_true",
-        help=(
-            "--no-probe  Skip active parameter probing. By default, axss sends two "
-            "probe requests per query parameter to confirm reflection contexts and "
-            "which characters survive filtering before generating payloads."
-        ),
-    )
-    parser.add_argument(
-        "--no-live",
-        action="store_true",
-        help=(
-            "--no-live  Run probing silently (no live output per parameter). "
-            "Probe results still enrich the final payload generation."
-        ),
-    )
-    parser.add_argument(
-        "--threshold",
-        metavar="N",
-        type=int,
-        default=60,
-        help=(
-            "--threshold N  Minimum risk_score to include in final output (default: 60). "
-            "Filters out generic payloads that don't match the detected context. "
-            "Always shows at least 5 payloads even if all are below threshold."
-        ),
-    )
-    parser.add_argument(
+    p.add_argument(
         "--no-cloud",
         action="store_true",
+        help="Never escalate to a cloud LLM. Guarantees offline-only operation.",
+    )
+    p.add_argument(
+        "--backend",
+        metavar="BACKEND",
+        choices=("api", "cli"),
+        default=None,
         help=(
-            "--no-cloud  Never escalate to a cloud LLM, even if an API key is set "
-            "and the local model output is weak. Use this to guarantee offline-only operation."
+            "AI backend for cloud escalation: 'api' (OpenRouter/OpenAI keys) or "
+            "'cli' (Claude/Codex subprocess — uses subscription auth, no per-token billing)."
         ),
     )
-    parser.add_argument("-V", "--version", action="version", version=f"%(prog)s {__version__}")
-
-    # ── Authentication ────────────────────────────────────────────────────────
-    parser.add_argument(
+    p.add_argument(
+        "--cli-tool",
+        metavar="TOOL",
+        choices=("claude", "codex"),
+        default=None,
+        help="CLI tool when --backend cli is set (default: claude).",
+    )
+    p.add_argument(
+        "--cli-model",
+        metavar="MODEL",
+        default=None,
+        help="Model passed to the CLI tool. Omit to use the tool's default.",
+    )
+    # ── Auth ─────────────────────────────────────────────────────────────
+    p.add_argument(
         "--header",
         metavar="'Name: Value'",
         dest="headers",
         action="append",
         default=[],
         help=(
-            "--header 'Name: Value'  Add a custom request header (repeatable). "
-            "Use for Authorization tokens, API keys, or any session header. "
+            "Add a custom request header (repeatable). "
             "e.g. --header 'Authorization: Bearer TOKEN' --header 'X-API-Key: secret'"
         ),
     )
-    parser.add_argument(
+    p.add_argument(
         "--cookies",
         metavar="FILE",
-        help=(
-            "--cookies FILE  Load session cookies from a Netscape-format cookies.txt file. "
-            "Combine with browser export tools (e.g. 'Export Cookies' extension) to scan "
-            "authenticated pages. e.g. --cookies cookies.txt"
-        ),
+        help="Load session cookies from a Netscape-format cookies.txt file.",
     )
-    parser.add_argument(
+    p.add_argument(
         "--profile",
         metavar="PROGRAM/NAME",
+        help="Use a saved auth profile. Explicit --header/--cookies values override on conflicts.",
+    )
+    # ── WAF ──────────────────────────────────────────────────────────────
+    p.add_argument(
+        "--waf",
+        metavar="NAME",
+        choices=SUPPORTED_WAFS,
         help=(
-            "--profile PROGRAM/NAME  Use a saved auth profile for the scan. "
-            "Explicit --header/--cookies values override the profile on conflicts."
+            f"Target WAF ({', '.join(SUPPORTED_WAFS)}). "
+            "Auto-detected when not set; use to override."
+        ),
+    )
+    p.add_argument(
+        "--waf-source",
+        metavar="PATH",
+        help=(
+            "Analyze a WAF/filter codebase and add a knowledge profile to model reasoning. "
+            "Accepts a local directory/file path or a Git repository URL."
+        ),
+    )
+    # ── Output ───────────────────────────────────────────────────────────
+    p.add_argument(
+        "--display",
+        choices=["list", "heat", "interactive"],
+        default="list",
+        help="Terminal display style (default: list).",
+    )
+    p.add_argument(
+        "--format",
+        choices=["json"],
+        default="json",
+        help="Output file format when saving with -o (default: json).",
+    )
+    p.add_argument(
+        "-o", "--output",
+        metavar="PATH",
+        help="Save results to a file. e.g. -o result.json",
+    )
+    p.add_argument(
+        "--sarif",
+        metavar="PATH",
+        help=(
+            "Write a SARIF 2.1.0 report. "
+            "Compatible with GitHub Advanced Security, DefectDojo, and most security pipelines."
+        ),
+    )
+    p.add_argument(
+        "-t", "--top",
+        metavar="N",
+        type=int,
+        default=20,
+        help="Limit ranked payloads in output (default: 20).",
+    )
+    p.add_argument(
+        "--threshold",
+        metavar="N",
+        type=int,
+        default=60,
+        help=(
+            "Minimum risk_score to include in output (default: 60). "
+            "Always shows at least 5 payloads even if all are below threshold."
+        ),
+    )
+    # ── Probe ────────────────────────────────────────────────────────────
+    p.add_argument(
+        "--no-probe",
+        action="store_true",
+        help=(
+            "Skip active parameter probing. By default, axss sends probe requests "
+            "per query parameter to confirm reflection contexts and char survival."
+        ),
+    )
+    p.add_argument(
+        "--no-live",
+        action="store_true",
+        help="Run probing silently. Probe results still enrich payload generation.",
+    )
+    # ── Misc ─────────────────────────────────────────────────────────────
+    p.add_argument(
+        "--fresh",
+        action="store_true",
+        default=False,
+        help="Ignore cached sitemap/probe results and re-collect from scratch.",
+    )
+    p.add_argument(
+        "-r", "--rate",
+        metavar="N",
+        type=float,
+        default=25.0,
+        help=(
+            "Max requests per second (default: 25). "
+            "Use 0 for uncapped. e.g. -r 5 for 5 req/sec."
+        ),
+    )
+    p.add_argument(
+        "-v", "--verbose",
+        action="count",
+        default=0,
+        help="-v for verbose output; -vv for full debug trace.",
+    )
+
+
+def _build_memory_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
+    mem = subparsers.add_parser(
+        "memory",
+        help="Manage the curated XSS knowledge base.",
+        description="View, import, and export the curated findings knowledge base.",
+        formatter_class=_HelpFormatter,
+        add_help=False,
+    )
+    mem.add_argument("-h", "--help", action="help", help="Show this help message and exit.")
+    actions = mem.add_subparsers(dest="memory_action", metavar="ACTION")
+    actions.add_parser("show",  help="List all knowledge base entries.")
+    actions.add_parser("stats", help="Show entry counts by category.")
+    imp = actions.add_parser("import", help="Import curated findings from a YAML file.")
+    imp.add_argument("path", metavar="PATH", help="YAML file to import.")
+    exp = actions.add_parser("export", help="Export the knowledge base to a YAML file.")
+    exp.add_argument("path", metavar="PATH", help="Destination YAML file.")
+    return mem
+
+
+def _build_models_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
+    mod = subparsers.add_parser(
+        "models",
+        help="Manage and inspect AI models.",
+        description="List available models, search Ollama, and validate API keys.",
+        formatter_class=_HelpFormatter,
+        add_help=False,
+    )
+    mod.add_argument("-h", "--help", action="help", help="Show this help message and exit.")
+    actions = mod.add_subparsers(dest="models_action", metavar="ACTION")
+    actions.add_parser("list",       help="Show locally available Ollama models.")
+    search = actions.add_parser("search", help="Search Ollama model names.")
+    search.add_argument("query", metavar="QUERY", help="Search term.")
+    actions.add_parser("check-keys", help="Validate all configured API keys.")
+    return mod
+
+
+def _build_generate_parser(
+    subparsers: argparse._SubParsersAction,
+    common: argparse.ArgumentParser,
+    config_default_model: str,
+) -> argparse.ArgumentParser:
+    gen = subparsers.add_parser(
+        "generate",
+        parents=[common],
+        help="Generate AI-ranked XSS payloads for a target.",
+        description=(
+            "Parse a target and produce a ranked list of XSS payloads. "
+            "Use 'axss scan' to actively inject and confirm them in a browser."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  axss generate -u https://example.com\n"
+            "  axss generate -u https://example.com --public --waf cloudflare\n"
+            "  axss generate --urls urls.txt --merge-batch -o payloads.json\n"
+            "  axss generate -i page.html --display heat\n"
+            "  axss generate --public --waf modsecurity         (no target — dump public payloads)\n"
+            f"  axss generate -u https://example.com -m {config_default_model} -t 15"
+        ),
+        formatter_class=_HelpFormatter,
+        add_help=False,
+    )
+    gen.add_argument("-h", "--help", action="help", help="Show this help message and exit.")
+
+    target = gen.add_mutually_exclusive_group()
+    target.add_argument(
+        "-u", "--url",
+        metavar="TARGET",
+        help="Fetch and parse a live URL. e.g. -u https://example.com",
+    )
+    target.add_argument(
+        "--urls",
+        metavar="FILE",
+        help="Fetch one URL per line from a file.",
+    )
+    target.add_argument(
+        "-i", "--input",
+        metavar="FILE_OR_SNIPPET",
+        help="Parse a local HTML file or raw HTML snippet.",
+    )
+    gen.add_argument(
+        "--public",
+        action="store_true",
+        help=(
+            "Fetch known XSS payloads from public/community sources and inject them as "
+            "reference context. Can be used standalone (no target) to dump a payload list."
+        ),
+    )
+    gen.add_argument(
+        "--merge-batch",
+        action="store_true",
+        help="Combine all URLs from --urls into one payload set.",
+    )
+    return gen
+
+
+def _build_scan_parser(
+    subparsers: argparse._SubParsersAction,
+    common: argparse.ArgumentParser,
+) -> argparse.ArgumentParser:
+    scan = subparsers.add_parser(
+        "scan",
+        parents=[common],
+        help="Actively scan a target and confirm XSS execution.",
+        description=(
+            "Crawl a target, inject payloads into a real browser, and confirm XSS execution. "
+            "Defaults to testing all XSS types: reflected, stored, DOM, and uploads."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  axss scan -u https://example.com\n"
+            "  axss scan -u https://example.com --deep\n"
+            "  axss scan --urls urls.txt --reflected --stored\n"
+            "  axss scan --interesting targets.txt\n"
+            "  axss scan -u https://example.com --dry-run\n"
+            "  axss scan -u https://example.com --scope h1:myprogram\n"
+            "  axss scan -u https://example.com --blind-callback https://oast.pro/abc123"
+        ),
+        formatter_class=_HelpFormatter,
+        add_help=False,
+    )
+    scan.add_argument("-h", "--help", action="help", help="Show this help message and exit.")
+
+    target = scan.add_mutually_exclusive_group()
+    target.add_argument(
+        "-u", "--url",
+        metavar="TARGET",
+        help="Single target URL to crawl and scan.",
+    )
+    target.add_argument(
+        "--urls",
+        metavar="FILE",
+        help="Scan one URL per line from a file (assumes pre-enumerated endpoints, skips crawl).",
+    )
+    target.add_argument(
+        "--interesting",
+        metavar="FILE",
+        help=(
+            "Rank URLs from a file by XSS potential using the AI backend. "
+            "Writes a markdown triage report to help narrow targets before a full scan."
         ),
     )
 
-    # ── Active scanner ────────────────────────────────────────────────────────
-    parser.add_argument(
-        "--generate",
-        action="store_true",
-        help=(
-            "--generate  Generate AI-ranked XSS payloads without active browser testing. "
-            "Parses the target, identifies XSS surface, and returns a ranked payload list. "
-            "Works with -u, --urls, and -i/--input. "
-            "Pass this flag when you want payloads only, not active confirmation."
-        ),
-    )
-    parser.add_argument(
-        "--reflected",
-        action="store_true",
-        help=(
-            "--reflected  Test for reflected XSS. Injects payloads into GET query "
-            "parameters and confirms JS execution in a real Playwright browser. "
-            "Implies active scanning. Combine with --stored/--dom to test multiple types."
-        ),
-    )
-    parser.add_argument(
-        "--stored",
-        action="store_true",
-        help=(
-            "--stored  Test for stored/POST XSS. Injects payloads into POST form fields "
-            "and checks follow-up pages for confirmed execution. "
-            "Requires a crawlable target. Implies active scanning."
-        ),
-    )
-    parser.add_argument(
-        "--uploads",
-        action="store_true",
-        help=(
-            "--uploads  Test file-upload and artifact workflows. Discovers multipart forms, "
-            "submits crafted files, and checks follow-up pages for stored execution. "
-            "Requires a crawlable target or explicit upload targets. Implies active scanning."
-        ),
-    )
-    parser.add_argument(
-        "--dom",
-        action="store_true",
-        help=(
-            "--dom  Test for DOM-based XSS. Analyzes client-side JS for "
-            "source→sink flows and confirms execution/taint in a real browser via "
-            "runtime sink hooking and DOM source payload injection. "
-            "Implies active scanning."
-        ),
-    )
-    parser.add_argument(
-        "-a",
-        "--active",
-        action="store_true",
-        help=(
-            "--active  Enable active scanning of all XSS types (reflected + stored + uploads + DOM). "
-            "Equivalent to passing --reflected --stored --uploads --dom together. "
-            "Fires payloads into a real Playwright browser and detects confirmed execution "
-            "(alert() dialogs, console output, network beacons). Requires -u or --urls. "
-            "Writes a markdown report to ~/.axss/reports/. "
-            "Legacy flag — prefer using --reflected/--stored/--uploads/--dom directly, "
-            "or omit all flags to default to testing all types."
-        ),
-    )
-    parser.add_argument(
-        "--workers",
-        metavar="N",
-        type=int,
-        default=1,
-        help=(
-            "--workers N  Maximum parallel active-scan workers (default: 1). "
-            "Each worker is an isolated process scanning one URL at a time. "
-            "Workers also auto-scale with --rate (floor(rate/5)), but never exceed N. "
-            "Increase only when scanning multiple distinct domains simultaneously."
-        ),
-    )
-    parser.add_argument(
-        "--timeout",
-        metavar="N",
-        type=int,
-        default=300,
-        help=(
-            "--timeout N  Per-URL timeout in seconds for active scan workers (default: 300). "
-            "Workers that exceed this are marked inconclusive and terminated cleanly."
-        ),
-    )
-    parser.add_argument(
-        "--attempts",
-        metavar="N",
-        type=int,
-        default=1,
-        help=(
-            "--attempts N  Cloud reasoning rounds per reflection/source->sink context "
-            "(default: 1). After each cloud round, axss tests the returned payloads "
-            "and feeds the execution outcome into the next cloud prompt before "
-            "falling back to deterministic transforms."
-        ),
-    )
-    parser.add_argument(
+    # ── Scan mode ─────────────────────────────────────────────────────────
+    scan.add_argument(
         "--fast",
         action="store_true",
         default=False,
-        help=(
-            "--fast  (default) Skip probe, run broad-spectrum Gen XSS directly. "
-            "No char-survival analysis — payloads cover all contexts at once. "
-            "Fastest mode. Explicit flag is a no-op since this is the default behavior."
-        ),
+        help="(default) Skip probe, run broad-spectrum payload generation. Fastest mode.",
     )
-    parser.add_argument(
+    scan.add_argument(
         "--deep",
         action="store_true",
         default=False,
         help=(
-            "--deep  Full probe + 3-phase targeted generation. Probes each parameter "
-            "first (char-survival analysis, reflection context detection) then runs "
-            "all three AI phases (scout → contextual → research) using that real context. "
-            "Slower but finds context-specific injections (JS string escapes, "
-            "attribute breakouts, href/formaction bypasses) that the default mode misses."
+            "Full probe + 3-phase targeted generation (scout → contextual → research). "
+            "Probes each parameter for char-survival and reflection context first. "
+            "Slower but finds context-specific bypasses that fast mode misses."
         ),
     )
-    parser.add_argument(
-        "--deep-model",
-        metavar="MODEL",
-        default=None,
-        help=(
-            "--deep-model MODEL  Override the reasoning model used in --deep mode. "
-            "Defaults to the configured cloud_model. "
-            "Examples: openai/o3-mini  anthropic/claude-opus-4"
-        ),
-    )
-    parser.add_argument(
-        "--deep-limit",
-        metavar="N",
-        type=int,
-        default=None,
-        help=(
-            "--deep-limit N  Cap deep reasoning to the top N injection points ranked by "
-            "local triage score. Keeps --deep affordable on large target lists. "
-            "0 = unlimited (default)."
-        ),
-    )
-    parser.add_argument(
-        "--fresh",
-        action="store_true",
-        default=False,
-        help=(
-            "--fresh  Ignore any cached sitemap or probe results and re-collect from scratch. "
-            "By default axss reuses crawl/probe data cached within the last 24 hours."
-        ),
-    )
-    parser.add_argument(
+    scan.add_argument(
         "--obliterate",
         action="store_true",
         default=False,
         help=(
-            "--obliterate  Maximum coverage mode: combines --fast (skip probe, assume all "
-            "params injectable) with full 3-phase deep generation (scout → contextual → "
-            "research), each using a broad-spectrum multi-context prompt. No probe delay, "
-            "maximum AI payload breadth. Higher API spend than either --fast or --deep alone."
+            "Maximum coverage: broad-spectrum prompt across all 3 AI phases with no probe delay. "
+            "Higher API spend than --fast or --deep alone."
         ),
     )
-    parser.add_argument(
-        "--extreme",
-        action="store_true",
-        default=False,
-        help=(
-            "--extreme  Use a more aggressive active-scan profile. "
-            "Raises cloud reasoning rounds and timeout defaults for deeper, slower scans. "
-            "Only changes values you did not override explicitly."
-        ),
+
+    # ── XSS type selectors ────────────────────────────────────────────────
+    scan.add_argument("--reflected", action="store_true", help="Test for reflected XSS (GET params).")
+    scan.add_argument("--stored",    action="store_true", help="Test for stored/POST XSS (form fields).")
+    scan.add_argument("--uploads",   action="store_true", help="Test file-upload and artifact workflows.")
+    scan.add_argument("--dom",       action="store_true", help="Test for DOM-based XSS (source→sink analysis + runtime hooking).")
+
+    # ── Crawl control ─────────────────────────────────────────────────────
+    scan.add_argument(
+        "--depth",
+        metavar="N",
+        type=int,
+        default=2,
+        help="BFS crawl depth (default: 2). depth=1 follows links from the seed only.",
     )
-    parser.add_argument(
-        "--research",
-        "--patient",
-        dest="research",
-        action="store_true",
-        default=False,
-        help=(
-            "--research  Use a patient, outcome-first scan profile. Keeps the phased remote workflow "
-            "but gives later contextual/research passes much longer budgets. Raises attempts and "
-            "timeout defaults when you did not override them explicitly."
-        ),
-    )
-    parser.add_argument(
-        "--keep-searching",
-        action="store_true",
-        default=False,
-        help=(
-            "--keep-searching  After the first confirmed hit on a context, keep searching for "
-            "additional distinct exploit classes within a bounded per-context budget."
-        ),
-    )
-    parser.add_argument(
+    scan.add_argument(
         "--no-crawl",
         action="store_true",
         default=False,
-        help=(
-            "--no-crawl  Skip site crawling and only test the provided URL directly. "
-            "By default, --active crawls the site first to discover all endpoints "
-            "with testable query parameters before scanning."
-        ),
+        help="Skip crawling and test only the provided URL directly.",
     )
-    parser.add_argument(
+    scan.add_argument(
         "--scope",
         nargs="?",
         const="auto",
         default=None,
         metavar="SPEC",
         help=(
-            "--scope [SPEC]  Control crawl/scan scope. Without SPEC, auto-derives scope "
-            "from the seed URL. SPEC can be:\n"
-            "  h1:HANDLE / hackerone:HANDLE  — pull scope from HackerOne API "
-            "(needs H1_API_USERNAME + H1_API_TOKEN)\n"
-            "  bc:SLUG / bugcrowd:SLUG       — pull scope from Bugcrowd API "
-            "(needs BUGCROWD_API_KEY)\n"
-            "  ig:HANDLE / intigriti:HANDLE  — pull scope from Intigriti API "
-            "(needs INTIGRITI_API_TOKEN)\n"
-            "  https://...                   — fetch page, LLM-parse scope "
-            "(needs OPENROUTER_API_KEY or OPENAI_API_KEY)\n"
-            "  domain.com,*.other.com        — manual comma-separated domain list"
+            "Control crawl scope. Without SPEC, auto-derives from seed URL. SPEC options:\n"
+            "  h1:HANDLE / hackerone:HANDLE   — HackerOne scope (needs H1_API_USERNAME + H1_API_TOKEN)\n"
+            "  bc:SLUG / bugcrowd:SLUG        — Bugcrowd scope (needs BUGCROWD_API_KEY)\n"
+            "  ig:HANDLE / intigriti:HANDLE   — Intigriti scope (needs INTIGRITI_API_TOKEN)\n"
+            "  https://...                    — LLM-parse a scope page\n"
+            "  domain.com,*.other.com         — manual comma-separated domain list"
         ),
     )
-    parser.add_argument(
-        "--browser-crawl",
-        action="store_true",
-        default=False,
-        help=(
-            "--browser-crawl  Use a real Playwright browser for crawling instead of "
-            "the default HTTP crawler. Renders JavaScript so Angular/React/Vue "
-            "client-side routes are discovered. Also intercepts XHR/fetch requests "
-            "to surface API endpoints with injectable query parameters. "
-            "Slower than the default crawler but finds far more surface on SPAs."
-        ),
-    )
-    parser.add_argument(
-        "--depth",
+
+    # ── Active scan tuning ────────────────────────────────────────────────
+    scan.add_argument(
+        "--workers",
         metavar="N",
         type=int,
-        default=2,
+        default=1,
+        help="Maximum parallel scan workers (default: 1). Also auto-scales with --rate.",
+    )
+    scan.add_argument(
+        "--timeout",
+        metavar="N",
+        type=int,
+        default=300,
+        help="Per-URL timeout in seconds (default: 300).",
+    )
+    scan.add_argument(
+        "--attempts",
+        metavar="N",
+        type=int,
+        default=1,
         help=(
-            "--depth N  BFS crawl depth when crawling is enabled (default: 2). "
-            "depth=1 follows links from the seed page only; depth=2 follows "
-            "links from those pages too. Higher values discover more surface "
-            "but take longer."
+            "Cloud reasoning rounds per injection context (default: 1). "
+            "Each round tests returned payloads and feeds execution outcome into the next prompt."
         ),
     )
-    parser.add_argument(
+    scan.add_argument(
+        "--keep-searching",
+        action="store_true",
+        default=False,
+        help="After the first confirmed hit, keep searching for additional exploit classes.",
+    )
+    scan.add_argument(
+        "--deep-model",
+        metavar="MODEL",
+        default=None,
+        help="Override the reasoning model used in --deep mode. e.g. openai/o3-mini",
+    )
+    scan.add_argument(
+        "--deep-limit",
+        metavar="N",
+        type=int,
+        default=None,
+        help="Cap deep reasoning to the top N injection points. 0 = unlimited.",
+    )
+
+    # ── Stored XSS / blind ────────────────────────────────────────────────
+    scan.add_argument(
         "--sink-url",
         metavar="URL",
         default=None,
-        help=(
-            "--sink-url URL  After each injection, navigate to URL to check for "
-            "XSS execution there. Use when the injected value is stored server-side "
-            "and rendered on a different page (e.g. username shown on /profile after "
-            "being set via a POST form). Checked before auto-discovered follow-up pages."
-        ),
+        help="After each injection, navigate to URL to check for stored XSS execution.",
     )
-    parser.add_argument(
+    scan.add_argument(
         "--blind-callback",
         metavar="URL",
         default=None,
         help=(
-            "--blind-callback URL  Enable blind XSS detection (OFF by default — "
-            "this flag is required to activate it). After the main scan, every "
-            "injection point receives OOB payloads that call back to URL when "
-            "executed in a browser. Without this flag, no blind XSS payloads are "
-            "sent and no token manifest is written. "
-            "URL must be a server you control: Interactsh (oast.pro), "
-            "Burp Collaborator, xsshunter, webhook.site, or your own endpoint. "
-            "A blind_tokens.json manifest is saved alongside the report mapping "
-            "each token back to its injection point."
+            "Enable blind XSS detection. Injects OOB payloads that call back to URL when "
+            "executed. URL must be a server you control (Interactsh, Burp Collaborator, "
+            "xsshunter, webhook.site). Saves a blind_tokens.json manifest."
         ),
     )
-    parser.add_argument(
+    scan.add_argument(
         "--poll-blind",
         metavar="FILE",
         default=None,
-        help=(
-            "--poll-blind FILE  Poll a previously saved blind_tokens.json for "
-            "any callbacks that have fired since the scan. Prints confirmed tokens "
-            "with their originating injection points. Requires --blind-callback "
-            "to point to an Interactsh-compatible endpoint that supports "
-            "GET /poll?t=TOKEN."
-        ),
-    )
-    parser.add_argument(
-        "--resume",
-        action="store_true",
-        default=False,
-        help=(
-            "--resume  Automatically resume a previous interrupted or paused scan "
-            "for the same target without prompting. If no prior session exists, "
-            "starts a new scan."
-        ),
-    )
-    parser.add_argument(
-        "--backend",
-        metavar="BACKEND",
-        choices=("api", "cli"),
-        default=None,
-        help=(
-            "--backend api|cli  AI backend for cloud escalation. "
-            "'api' uses OpenRouter/OpenAI API keys (default). "
-            "'cli' invokes the claude or codex CLI subprocess — uses subscription auth, "
-            "no per-token billing. Overrides the config.json value."
-        ),
-    )
-    parser.add_argument(
-        "--cli-tool",
-        metavar="TOOL",
-        choices=("claude", "codex"),
-        default=None,
-        help=(
-            "--cli-tool claude|codex  Which CLI tool to use when --backend cli is set. "
-            "Defaults to 'claude'. Requires the tool to be on PATH and logged in."
-        ),
-    )
-    parser.add_argument(
-        "--cli-model",
-        metavar="MODEL",
-        default=None,
-        help=(
-            "--cli-model MODEL  Model passed to the CLI tool (e.g. claude-opus-4-6). "
-            "Omit to use the CLI tool's default model."
-        ),
+        help="Poll a previously saved blind_tokens.json for callbacks that have fired.",
     )
 
-    # ── Dry-run / session guard ───────────────────────────────────────────────
-    parser.add_argument(
+    # ── Session / lifecycle ───────────────────────────────────────────────
+    scan.add_argument(
         "--dry-run",
         action="store_true",
         default=False,
-        help=(
-            "--dry-run  Crawl and discover attack surface without firing any payloads. "
-            "Prints discovered GET endpoints (with params), POST forms, and upload targets, "
-            "then exits. No Playwright browser is launched. Useful for scoping an engagement "
-            "before committing to a full active scan."
-        ),
+        help="Discover attack surface without firing payloads. Prints endpoints then exits.",
     )
-    parser.add_argument(
+    scan.add_argument(
+        "--resume",
+        action="store_true",
+        default=False,
+        help="Resume a previous interrupted scan for the same target.",
+    )
+    scan.add_argument(
         "--session-check-url",
         metavar="URL",
         default=None,
-        help=(
-            "--session-check-url URL  Before scanning, probe URL with the provided auth "
-            "credentials to verify the session is still valid. Emits a warning (and aborts "
-            "by default) if the response is 401/403 or redirects to a login page. "
-            "Useful for long scans where cookie expiry is a concern."
-        ),
+        help="Probe URL before scanning to verify the session is still valid.",
     )
+
+    # ── Suppressed legacy flags ───────────────────────────────────────────
+    scan.add_argument("--extreme", action="store_true", default=False, help=argparse.SUPPRESS)
+    scan.add_argument("--research", "--patient", dest="research", action="store_true", default=False, help=argparse.SUPPRESS)
+    scan.add_argument("--browser-crawl", action="store_true", default=False, help=argparse.SUPPRESS)
+    scan.add_argument("-a", "--active", action="store_true", default=False, help=argparse.SUPPRESS)
+
+    return scan
+
+
+# Defaults injected into args when a flag belongs to a different subcommand.
+_ARG_DEFAULTS: dict[str, object] = {
+    "generate": False,
+    "url": None,
+    "urls": None,
+    "input": None,
+    "interesting": None,
+    "public": False,
+    "merge_batch": False,
+    "reflected": False,
+    "stored": False,
+    "dom": False,
+    "uploads": False,
+    "active": False,
+    "fast": False,
+    "deep": False,
+    "obliterate": False,
+    "deep_model": None,
+    "deep_limit": None,
+    "dry_run": False,
+    "resume": False,
+    "no_crawl": False,
+    "scope": None,
+    "depth": 2,
+    "workers": 1,
+    "timeout": 300,
+    "attempts": 1,
+    "keep_searching": False,
+    "sink_url": None,
+    "blind_callback": None,
+    "poll_blind": None,
+    "session_check_url": None,
+    "extreme": False,
+    "research": False,
+    "browser_crawl": False,
+    "no_probe": False,
+    "no_live": False,
+    "threshold": 60,
+    "waf": None,
+    "waf_source": None,
+    "fresh": False,
+    "display": "list",
+    "format": "json",
+    "output": None,
+    "sarif": None,
+    "top": 20,
+    "model": None,
+    "no_cloud": False,
+    "backend": None,
+    "cli_tool": None,
+    "cli_model": None,
+    "headers": [],
+    "cookies": None,
+    "profile": None,
+    "rate": 25.0,
+    "verbose": 0,
+    # Legacy utility flags (always False/None after subcommand dispatch)
+    "list_models": False,
+    "search_models": None,
+    "check_keys": False,
+    "clear_reports": False,
+    "memory_list": False,
+    "memory_stats": False,
+    "memory_export": None,
+    "memory_import": None,
+}
+
+
+def _normalize_args(args: argparse.Namespace) -> None:
+    """Fill in defaults for attributes not defined by the active subcommand."""
+    for key, default in _ARG_DEFAULTS.items():
+        if not hasattr(args, key):
+            setattr(args, key, default)
+
+
+def build_parser(config_default_model: str) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=APP_NAME,
+        description=(
+            "AI-assisted XSS scanner.\n"
+            "Run 'axss COMMAND --help' for detailed usage of each command."
+        ),
+        formatter_class=_HelpFormatter,
+        add_help=False,
+    )
+    parser.add_argument("-h", "--help", action="help", help="Show this help message and exit.")
+    parser.add_argument("-V", "--version", action="version", version=f"%(prog)s {__version__}")
+    parser.add_argument(
+        "--clear-reports",
+        action="store_true",
+        help="Delete all saved scan reports from ~/.axss/reports/.",
+    )
+
+    subparsers = parser.add_subparsers(
+        dest="command",
+        metavar="COMMAND",
+        title="commands",
+        description="",
+    )
+
+    _common = argparse.ArgumentParser(add_help=False)
+    _add_shared_args(_common, config_default_model)
+
+    _build_memory_parser(subparsers)
+    _build_generate_parser(subparsers, _common, config_default_model)
+    _build_scan_parser(subparsers, _common)
+    _build_models_parser(subparsers)
 
     return parser
 
@@ -1395,7 +1353,7 @@ def _run_active_scan(
         use_cloud=ai_config.use_cloud,
         waf=waf,
         timeout_seconds=getattr(args, "timeout", 300),
-        output_path=getattr(args, "json_out", None),
+        output_path=getattr(args, "output", None),
         auth_headers=auth_headers or {},
         sink_url=sink_url,
         scan_reflected=scan_reflected,
@@ -1508,7 +1466,7 @@ def _print_dry_run_surface(
 
     total = len(urls) + len(post_forms) + len(upload_targets)
     if total == 0:
-        warn("No testable attack surface discovered. Try --browser-crawl for SPA targets.")
+        warn("No testable attack surface discovered. Try --deep on the seed URL for SPA targets.")
     else:
         success(
             f"Dry-run complete: {len(urls)} GET endpoint(s), "
@@ -1621,17 +1579,107 @@ def main(argv: list[str] | None = None) -> int:
     config = load_config()
     parser = build_parser(config.default_model)
     args = parser.parse_args(argv)
+
+    # ── No subcommand → show help ─────────────────────────────────────────
+    if not args.command:
+        # Still handle --clear-reports at top level even with no subcommand
+        if args.clear_reports:
+            from ai_xss_generator.config import CONFIG_DIR
+            reports_dir = CONFIG_DIR / "reports"
+            if not reports_dir.exists():
+                info("No reports directory found — nothing to clear.")
+                return 0
+            files = sorted(reports_dir.glob("*.md"))
+            if not files:
+                info("No reports found.")
+                return 0
+            for f in files:
+                f.unlink()
+            success(f"Cleared {len(files)} report(s) from {reports_dir}")
+            return 0
+        parser.print_help()
+        return 0
+
+    # ── memory subcommand ─────────────────────────────────────────────────
+    if args.command == "memory":
+        if not args.memory_action:
+            # print memory subparser help
+            for action in parser._subparsers._group_actions:
+                sub = action.choices.get("memory")
+                if sub:
+                    sub.print_help()
+                    break
+            return 0
+        if args.memory_action == "show":
+            return _handle_memory_list()
+        if args.memory_action == "stats":
+            return _handle_memory_stats()
+        if args.memory_action == "export":
+            return _handle_memory_export(args.path)
+        if args.memory_action == "import":
+            return _handle_memory_import(args.path)
+        return 0
+
+    # ── models subcommand ─────────────────────────────────────────────────
+    if args.command == "models":
+        if not args.models_action:
+            for action in parser._subparsers._group_actions:
+                sub = action.choices.get("models")
+                if sub:
+                    sub.print_help()
+                    break
+            return 0
+        if args.models_action == "list":
+            try:
+                rows, source = list_ollama_models()
+            except Exception as exc:
+                parser.exit(1, f"Error: {exc}\n")
+            print(f"Local Ollama models ({source})")
+            print(_render_table(rows))
+            return 0
+        if args.models_action == "search":
+            try:
+                rows, source = search_ollama_models(args.query)
+            except Exception as exc:
+                parser.exit(1, f"Error: {exc}\n")
+            print(f"Ollama model search for {args.query!r} ({source})")
+            print(_render_table(rows))
+            return 0
+        if args.models_action == "check-keys":
+            from ai_xss_generator.config import KEYS_PATH
+            print(f"Checking API keys (keys file: {KEYS_PATH})\n")
+            results = check_api_keys()
+            _STATUS_ICON = {"ok": "[+]", "invalid": "[!]", "missing": "[-]", "error": "[!]", "unreachable": "[!]"}
+            col_w = max(len(r["service"]) for r in results)
+            src_w = max(len(r["source"]) for r in results)
+            for r in results:
+                icon = _STATUS_ICON.get(r["status"], "[?]")
+                print(f"  {icon}  {r['service']:<{col_w}}  {r['source']:<{src_w}}  {r['detail']}")
+            print()
+            any_invalid = any(r["status"] in {"invalid", "error"} for r in results)
+            return 1 if any_invalid else 0
+        return 0
+
+    # ── generate / scan subcommands ───────────────────────────────────────
+    # Normalize: fill in defaults for attributes defined only on the other subcommand.
+    _normalize_args(args)
+
+    # generate command always routes to payload generation mode.
+    if args.command == "generate":
+        args.generate = True
+
+    # Apply suppressed profile modifiers (--extreme / --research).
     if getattr(args, "extreme", False):
-        if getattr(args, "attempts", 1) == 1:
+        if args.attempts == 1:
             args.attempts = 3
-        if getattr(args, "timeout", 300) == 300:
+        if args.timeout == 300:
             args.timeout = 600
     if getattr(args, "research", False):
-        if getattr(args, "attempts", 1) <= 3:
+        if args.attempts <= 3:
             args.attempts = 5
-        if getattr(args, "timeout", 300) <= 600:
+        if args.timeout <= 600:
             args.timeout = 1200
-    if getattr(args, "attempts", 1) < 1:
+    if args.attempts < 1:
         parser.error("--attempts must be >= 1")
 
     verbose_level: int = getattr(args, "verbose", 0) or 0
@@ -1642,81 +1690,13 @@ def main(argv: list[str] | None = None) -> int:
     _configure_logging(verbose_level)
 
     has_target = bool(args.url or args.urls or args.input or args.interesting)
-    is_utility = (
-        args.list_models or args.search_models or args.check_keys or args.clear_reports
-        or args.memory_list or args.memory_stats
-        or args.memory_export or args.memory_import
-    )
 
-    # Validate: need at least one of: target, --public, or a utility action
-    if not has_target and not args.public and not is_utility:
-        parser.error(
-            "one of the arguments -u/--url --urls -i/--input -l/--list-models "
-            "--interesting -s/--search-models --check-keys --public --memory-list --memory-stats "
-            "--memory-export --memory-import is required"
-        )
-
-    # --- Utility: check API keys ---
-    if args.check_keys:
-        from ai_xss_generator.config import KEYS_PATH
-        print(f"Checking API keys (keys file: {KEYS_PATH})\n")
-        results = check_api_keys()
-        _STATUS_ICON = {"ok": "[+]", "invalid": "[!]", "missing": "[-]", "error": "[!]", "unreachable": "[!]"}
-        col_w = max(len(r["service"]) for r in results)
-        src_w = max(len(r["source"]) for r in results)
-        for r in results:
-            icon = _STATUS_ICON.get(r["status"], "[?]")
-            print(f"  {icon}  {r['service']:<{col_w}}  {r['source']:<{src_w}}  {r['detail']}")
-        print()
-        any_invalid = any(r["status"] in {"invalid", "error"} for r in results)
-        return 1 if any_invalid else 0
-
-    # --- Utility: clear reports ---
-    if args.clear_reports:
-        from ai_xss_generator.config import CONFIG_DIR
-        reports_dir = CONFIG_DIR / "reports"
-        if not reports_dir.exists():
-            info("No reports directory found — nothing to clear.")
-            return 0
-        files = sorted(reports_dir.glob("*.md"))
-        if not files:
-            info("No reports found.")
-            return 0
-        for f in files:
-            f.unlink()
-        success(f"Cleared {len(files)} report(s) from {reports_dir}")
-        return 0
-
-    # --- Utility: list / search models ---
-    if args.list_models:
-        try:
-            rows, source = list_ollama_models()
-        except Exception as exc:
-            parser.exit(1, f"Error: {exc}\n")
-        print(f"Local Ollama models ({source})")
-        print(_render_table(rows))
-        return 0
-
-    if args.search_models:
-        try:
-            rows, source = search_ollama_models(args.search_models)
-        except Exception as exc:
-            parser.exit(1, f"Error: {exc}\n")
-        print(f"Ollama model search for {args.search_models!r} ({source})")
-        print(_render_table(rows))
-        return 0
-
-    if args.memory_stats:
-        return _handle_memory_stats()
-
-    if args.memory_list:
-        return _handle_memory_list()
-
-    if args.memory_export:
-        return _handle_memory_export(args.memory_export)
-
-    if args.memory_import:
-        return _handle_memory_import(args.memory_import)
+    # Validate: need at least a target or --public
+    if not has_target and not args.public:
+        if args.command == "generate":
+            parser.error("axss generate requires -u/--url, --urls, -i/--input, or --public")
+        else:
+            parser.error("axss scan requires -u/--url, --urls, or --interesting")
 
     # --- Validate rate ---
     if not math.isfinite(args.rate) or args.rate < 0:
@@ -1793,7 +1773,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.public and not has_target:
         if fetch_result is None:
             parser.error("--public fetch produced no result; check network connectivity")
-        return _handle_public_payloads(fetch_result, args.output, args.top, args.json_out)
+        return _handle_public_payloads(fetch_result, args.display, args.top, args.output)
 
     # --- Target-based modes below ---
     ai_config = resolve_ai_config(config, args=args)
@@ -1888,7 +1868,7 @@ def main(argv: list[str] | None = None) -> int:
 
         success(f"Interesting triage complete. {len(interesting_results)} URL(s) scored.")
         print()
-        _print_interesting_results(interesting_results, args.output, args.top)
+        _print_interesting_results(interesting_results, args.display, args.top)
 
         report_path = write_interesting_report(
             interesting_results,
@@ -1897,14 +1877,14 @@ def main(argv: list[str] | None = None) -> int:
         )
         success(f"Report written to: {report_path}")
 
-        if args.json_out:
+        if args.output:
             import json as _json
 
-            Path(args.json_out).write_text(
+            Path(args.output).write_text(
                 _json.dumps([item.to_dict() for item in interesting_results], indent=2),
                 encoding="utf-8",
             )
-            success(f"JSON written to {args.json_out}")
+            success(f"JSON written to {args.output}")
         return 0
 
     # --- Determine effective scan mode ---
@@ -2040,37 +2020,29 @@ def main(argv: list[str] | None = None) -> int:
         print()
 
         if args.merge_batch and merged_result is not None:
-            if args.output == "json":
-                rendered = render_batch_json(
-                    results,
-                    errors=[error.to_dict() for error in errors],
-                    merged_result=merged_result,
-                )
-                print(rendered)
-            else:
-                _print_single_result(merged_result, args.output, args.top, waf=resolved_waf)
-                if errors:
-                    print()
-                    print("Errors:")
-                    for error in errors:
-                        print(f"- {error.url}: {error.error}")
+            _print_single_result(merged_result, args.display, args.top, waf=resolved_waf)
+            if errors:
+                print()
+                print("Errors:")
+                for error in errors:
+                    print(f"- {error.url}: {error.error}")
         else:
             _print_batch_results(
                 results,
-                output_mode=args.output,
+                output_mode=args.display,
                 top=args.top,
                 errors=errors,
                 waf=resolved_waf,
             )
 
-        if args.json_out:
+        if args.output:
             json_body = render_batch_json(
                 results,
                 errors=[error.to_dict() for error in errors],
                 merged_result=merged_result,
             )
-            Path(args.json_out).write_text(json_body, encoding="utf-8")
-            success(f"JSON written to {args.json_out}")
+            Path(args.output).write_text(json_body, encoding="utf-8")
+            success(f"JSON written to {args.output}")
         return 0
 
     # --- Single target mode (-u / -i) ---
@@ -2109,8 +2081,8 @@ def main(argv: list[str] | None = None) -> int:
 
         live_cb = (
             None
-            if args.no_live or args.output == "json"
-            else _make_live_callback(args.threshold, args.output)
+            if args.no_live
+            else _make_live_callback(args.threshold, args.display)
         )
 
         from ai_xss_generator.probe import enrich_context, probe_url
@@ -2172,11 +2144,11 @@ def main(argv: list[str] | None = None) -> int:
 
     from dataclasses import replace as _dc_replace
     result = _dc_replace(result, payloads=filtered_payloads)
-    _print_single_result(result, args.output, args.top, waf=resolved_waf)
+    _print_single_result(result, args.display, args.top, waf=resolved_waf)
 
-    if args.json_out:
-        Path(args.json_out).write_text(render_json(result), encoding="utf-8")
-        success(f"JSON written to {args.json_out}")
+    if args.output:
+        Path(args.output).write_text(render_json(result), encoding="utf-8")
+        success(f"JSON written to {args.output}")
     return 0
 
 
