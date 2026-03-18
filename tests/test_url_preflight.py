@@ -336,3 +336,15 @@ class TestStripTrackingParams:
 
     def test_empty_list(self):
         assert _strip_tracking_params([]) == []
+
+    def test_keeps_underscore_prefixed_non_tracking_param(self):
+        # _token, _csrf etc. must NOT be stripped — only known tracking params
+        urls = ["http://example.com/?_token=abc&fbclid=X"]
+        result = _strip_tracking_params(urls)
+        assert result == ["http://example.com/?_token=abc"]
+
+    def test_preserves_fragment(self):
+        # URL fragment must survive stripping
+        urls = ["http://example.com/page?utm_source=x#anchor"]
+        result = _strip_tracking_params(urls)
+        assert result == ["http://example.com/page#anchor"]

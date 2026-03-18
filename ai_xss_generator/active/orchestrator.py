@@ -47,6 +47,7 @@ from ai_xss_generator.console import (
     teardown_panel, update_panel, warn,
     BOLD, CYAN, DIM, GREEN, RESET,
 )
+from ai_xss_generator.probe import _TRACKING_PARAM_BLOCKLIST
 
 log = logging.getLogger(__name__)
 
@@ -349,8 +350,6 @@ def _strip_tracking_params(url_list: list[str]) -> list[str]:
     If stripping produces a duplicate URL already seen, the duplicate is dropped
     (preserving first-seen order).
     """
-    from ai_xss_generator.probe import _TRACKING_PARAM_BLOCKLIST
-
     seen: set[str] = set()
     result: list[str] = []
     for url in url_list:
@@ -362,6 +361,9 @@ def _strip_tracking_params(url_list: list[str]) -> list[str]:
         if stripped_url not in seen:
             seen.add(stripped_url)
             result.append(stripped_url)
+    if len(result) < len(url_list):
+        dropped = len(url_list) - len(result)
+        info(f"Tracking-param strip: {dropped} URL(s) collapsed → {len(result)} remaining")
     return result
 
 
