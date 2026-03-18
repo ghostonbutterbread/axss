@@ -2867,13 +2867,14 @@ def generate_payloads(
 # ---------------------------------------------------------------------------
 
 _FAST_BATCH_PROMPT = """\
-You are generating a large, diverse XSS payload set for authorized penetration testing.
+You are generating a high-quality XSS payload set for authorized penetration testing.
 This is application-agnostic: generate payloads purely from XSS theory — no knowledge of \
 the specific target is needed.
 
-Generate exactly {count} payloads covering the full context matrix below.
-Distribute payloads roughly evenly across all context classes.
-Include multiple encoding variants per payload class.
+Generate exactly {count} payloads. Prioritise quality and edge-case coverage over quantity.
+Every payload must be distinct and purposeful — no filler, no near-duplicates.
+Cover each context class and bypass family with the single best representative payload for that class.
+One payload should do one thing exceptionally well.
 
 CONTEXT CLASSES (tag each payload with one primary context tag):
   context:html_body        — injected directly into HTML document body
@@ -2928,7 +2929,7 @@ _WAF_BYPASS_ADDENDUM = """
 def generate_fast_batch(
     cloud_model: str,
     waf: str | None = None,
-    count: int = 250,
+    count: int = 50,
     ai_backend: str = "api",
     cli_tool: str = "claude",
     cli_model: str | None = None,
