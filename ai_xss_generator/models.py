@@ -2935,7 +2935,7 @@ def generate_fast_batch(
     cli_model: str | None = None,
     request_timeout_seconds: int = 180,
 ) -> list[PayloadCandidate]:
-    """Generate a large application-agnostic payload batch in a single LLM call.
+    """Generate a high-quality application-agnostic payload batch in a single LLM call.
 
     Used by fast mode to produce the batch upfront before workers start,
     replacing per-URL/per-parameter cloud calls entirely.
@@ -2943,10 +2943,10 @@ def generate_fast_batch(
     Args:
         cloud_model:   Cloud model identifier (OpenRouter / OpenAI format).
         waf:           Known/detected WAF name — adds WAF-specific bypass instructions.
-        count:         Number of payloads to request (default 250).
-        ai_backend:    "api" (OpenRouter/OpenAI) or "cli" (claude/codex subprocess).
-        cli_tool:      CLI tool name when ai_backend="cli".
-        cli_model:     Model override for CLI backend.
+        count:         Number of payloads to request (default 50).
+        ai_backend:    Accepted for interface compatibility; batch always uses API path.
+        cli_tool:      Accepted for interface compatibility; unused in batch path.
+        cli_model:     Accepted for interface compatibility; unused in batch path.
         request_timeout_seconds: HTTP timeout for the LLM call.
 
     Returns:
@@ -2996,24 +2996,8 @@ def generate_fast_batch(
 
     log.info("Generating fast batch (%d payloads) via %s …", count, cloud_model)
 
-    if ai_backend == "cli":
-        try:
-            from ai_xss_generator.models import _generate_with_cli  # noqa: F401 — used below
-            # Build a minimal stub context for the CLI path
-            from ai_xss_generator.types import ParsedContext
-            stub = ParsedContext.__new__(ParsedContext)
-            candidates = _generate_with_cli(
-                context=stub,
-                tool=cli_tool,
-                model_override=cli_model,
-                strategy_hint=prompt,
-                request_timeout_seconds=request_timeout_seconds,
-            )
-            log.info("Fast batch: %d payloads from CLI backend", len(candidates))
-            return candidates
-        except Exception as exc:
-            log.warning("CLI batch generation failed, falling back to API: %s", exc)
-
+    # The batch prompt is self-contained and uses the OpenAI-compat chat API directly.
+    # CLI backend doesn't fit this pattern, so we always use the API path here.
     # Try OpenRouter first, then OpenAI
     api_key = os.environ.get("OPENROUTER_API_KEY", "") or load_api_key("openrouter_api_key")
     if api_key:
