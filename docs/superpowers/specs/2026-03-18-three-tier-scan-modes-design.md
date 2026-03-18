@@ -36,7 +36,10 @@ Designed for speed over coverage. Reflected XSS only.
 - **Per-param targeting:** Each payload is injected into one parameter at a time (not all params simultaneously). The pre-filter fires `len(params) × len(batch)` HTTP requests, then Playwright only opens pages for the subset that reflected.
 - **Response body:** Full response body is read (no size cap). Streaming is handled by Scrapling's existing response handling.
 - **Playwright:** Only launched when a payload reflects. Confirms actual JS execution (alert / console / network beacon) via `ActiveExecutor`. The executor's existing browser-reuse behavior is unchanged — one Chromium instance per worker process.
-- **WAF handling:** curl_cffi already impersonates Chrome TLS fingerprint. If curl gets a blocking error (HTTP/2 RST, silent timeout), fall back to Playwright for that URL — same pattern as `spiders.py`. No regression for WAF-protected targets.
+- **WAF handling:** curl_cffi already impersonates Chrome TLS fingerprint, bypassing most WAFs transparently. Two fallback triggers:
+  1. **Connection-level block** — HTTP/2 RST stream or silent timeout: fall back to Playwright for that URL.
+  2. **Bot-detection HTTP response** — any 403 or similar response whose body contains JS-challenge markers (Cloudflare, Akamai, etc.): fall back to Playwright for that URL.
+  In both cases the Playwright fallback is used for the full URL (pre-filter + execution confirmation), same pattern as `spiders.py`. No regression for WAF-protected targets.
 - **Single worker pool, full rate.**
 
 ### Deep (`--deep`)
@@ -145,6 +148,24 @@ In Normal mode the DOM worker receives `fast_batch` (existing behavior — it is
 
 ---
 
+## Pre-flight URL Processing Addition: Tracking Param Stripping
+
+The existing pre-flight pipeline in `orchestrator.py` runs `_dedup_urls_by_path_shape` then `_filter_live_urls`. A new step runs **before deduplication**:
+
+```
+_strip_tracking_params(url_list) → _dedup_urls_by_path_shape → _filter_live_urls
+```
+
+**`_strip_tracking_params(url_list)`** — for each URL, removes any query parameters whose lowercased name appears in `_TRACKING_PARAM_BLOCKLIST` (already defined in `probe.py`). If stripping leaves a URL with no query params and the original had some, the stripped URL is kept (it may still have path-based injection surface or forms). If stripping produces a duplicate of another URL already in the list, the duplicate is dropped.
+
+This runs at the orchestrator level, before any workers are dispatched, so tracking params are never tested by any scan type in any mode. The existing per-param blocklist check in `probe.py` (which catches params that slip through) remains as a safety net.
+
+**`_TRACKING_PARAM_BLOCKLIST` stays in `probe.py`** — `orchestrator.py` imports it from there. No duplication.
+
+**Affected file:** `ai_xss_generator/active/orchestrator.py` — add `_strip_tracking_params()` helper and insert into the pre-flight chain.
+
+---
+
 ## What Does Not Change
 
 - `ActiveExecutor` browser reuse — one Chromium instance per worker process, already in place
@@ -161,7 +182,7 @@ In Normal mode the DOM worker receives `fast_batch` (existing behavior — it is
 | File | Change |
 |------|--------|
 | `ai_xss_generator/cli.py` | Add `--fast` flag (was default, now explicit), make Normal the default, hide `--obliterate` with deprecation warning, set `config.mode` |
-| `ai_xss_generator/active/orchestrator.py` | Launch two concurrent pools for Normal mode; split rate; pass `findings_lock` to `run_dom_worker`; expand `fast_batch` gate to Normal |
+| `ai_xss_generator/active/orchestrator.py` | Launch two concurrent pools for Normal mode; split rate; pass `findings_lock` to `run_dom_worker`; expand `fast_batch` gate to Normal; add `_strip_tracking_params()` to pre-flight chain |
 | `ai_xss_generator/active/executor.py` | Add HTTP pre-filter step in `fire()` for Fast mode |
 | `ai_xss_generator/active/worker.py` | Replace `fast`/`deep`/`obliterate` bool guards with `config.mode` checks; Fast mode skips DOM and stored dispatch; add `findings_lock` parameter to `run_dom_worker` signature |
 | `ai_xss_generator/active/dom_xss.py` | Add `sources: list[tuple[str, str]] | None = None` parameter to `discover_dom_taint_paths()`; `None` = all sources (Deep), explicit list = URL params only (Normal) |
@@ -177,3 +198,5 @@ In Normal mode the DOM worker receives `fast_batch` (existing behavior — it is
 - `--rate 5` results in ≤5 req/s combined across all parallel streams
 - `--obliterate` still works but prints a deprecation warning and behaves as Normal
 - DOM findings from parallel Normal mode scans are written correctly with no data races
+- `axss scan --fast` on a WAF-protected target still scans successfully — falls back to Playwright when curl_cffi is blocked or receives a JS-challenge response
+- URLs with tracking-only params (e.g. `?utm_source=google&gclid=abc`) have those params stripped before any worker is dispatched — no tracking params appear in fired payloads
