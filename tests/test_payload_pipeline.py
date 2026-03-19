@@ -182,3 +182,12 @@ class TestSkipTriageWorkerPath:
         from ai_xss_generator.active.worker import run_worker
         sig = inspect.signature(run_worker)
         assert "skip_triage" in sig.parameters
+
+
+class TestPhase1DeterministicLabel:
+    def test_phase1_deterministic_has_display_label(self):
+        """reporter must have a display label for phase1_deterministic findings."""
+        import inspect
+        from ai_xss_generator.active import reporter
+        src = inspect.getsource(reporter)
+        assert "phase1_deterministic" in src

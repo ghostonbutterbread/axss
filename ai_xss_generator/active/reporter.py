@@ -466,6 +466,7 @@ def _source_label(source: str) -> str:
     return {
         "phase1_transform": "Deterministic fallback transform",
         "phase1_waf_fallback": "WAF-specific deterministic fallback",
+        "phase1_deterministic": "Deterministic (context-matched)",
         "local_model": "Local AI model payload",
         "cloud_model": "Cloud model payload (escalated)",
         "dom_xss_runtime": "DOM XSS runtime sink hooking",
