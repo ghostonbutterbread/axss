@@ -279,6 +279,17 @@ reason is less actionable for mutation.
   normal scout vs deep mutation in the config. Normal mode benefits from a
   cheap/fast model (Haiku, GPT-4o-mini); deep mutation benefits from a
   frontier model. To be added as a config feature after core pipeline is stable.
+
 - **Normal mode triage gate:** Not added now due to scale (3,000-5,000 URLs
   would serialize on local model latency). Revisit if normal mode scan times
   become a concern at smaller URL set sizes.
+
+- **Active recon mode (`--interesting --fetch`):** Enhance `--interesting` from
+  static URL string analysis to a lightweight active recon pass. For each URL:
+  fetch the page (HTTP, no Playwright), run `parser.py` for sink/param detection,
+  optionally fire a canary string per param to confirm reflection, then feed real
+  page context to the AI scorer instead of raw URL strings. This would produce
+  dramatically more accurate interesting scores and serve a dual purpose: automated
+  pre-filtering for normal/deep mode AND a recon report for manual researchers
+  providing full contextual understanding of the application (frameworks, sinks,
+  reflected params, form surfaces). Designed as a standalone spec.
