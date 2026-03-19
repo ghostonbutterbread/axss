@@ -172,7 +172,7 @@ class TestBlockedOnAssembly:
         from ai_xss_generator.active.worker import _blocked_on_char
         result = _blocked_on_char("alert(1)", frozenset())
         # Can't determine — no surviving chars to diff against
-        assert result is None or isinstance(result, str)
+        assert result is None
 
 
 class TestSkipTriageWorkerPath:
