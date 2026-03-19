@@ -2,7 +2,7 @@
 
 **Date:** 2026-03-19
 **Status:** Approved
-**Scope:** `active/worker.py`, `models.py`, `active/generator.py`, `cli.py`
+**Scope:** `active/worker.py`, `models.py`, `active/generator.py`, `active/orchestrator.py`, `cli.py`
 
 ---
 
@@ -37,12 +37,14 @@ help users validate and bypass the local triage gate.
 
 - Entry point: new `payloads_for_context(context_type, surviving_chars)` dispatch
   function added to `generator.py`
+- Signature: `def payloads_for_context(context_type: str, surviving_chars: frozenset[str] | None) -> list[PayloadCandidate]`
 - Routes to the correct context generator:
   `html_body_payloads`, `html_attr_url_payloads`, `html_attr_value_payloads`,
   `js_string_payloads`, `js_code_payloads`, `html_attr_event_payloads`
-- All output filtered by `surviving_chars` (deep mode has probe data; normal mode
-  uses parser-detected context without confirmed surviving chars — full set fires)
-- Payloads ranked by confidence tier, highest first
+- When `surviving_chars` is `None`, filtering is bypassed and the full candidate
+  list is returned (equivalent to treating all chars as surviving). Normal mode
+  passes `None`; deep mode passes the probe-confirmed frozenset.
+- Payloads sorted by `risk_score` descending (existing field on `PayloadCandidate`)
 - If any payload confirms execution → `ConfirmedFinding(source="phase1_deterministic")`, pipeline stops
 
 **Normal mode:** Tier 1 only proceeds to cloud if deterministic misses.
@@ -64,6 +66,10 @@ See Section 4 for prompt designs per mode.
 
 ### Normal Mode Pipeline (per injectable param)
 
+The upfront `generate_fast_batch` call in `orchestrator.py` is **removed from
+the normal mode path** — it is retained for fast mode only. Normal mode AI
+generation moves entirely to per-param scout calls in `worker.py`.
+
 ```
 Parser-detected context_type
         ↓
@@ -71,10 +77,8 @@ Parser-detected context_type
          fire via executor
         ↓ hit → ConfirmedFinding(source="phase1_deterministic"), done
         ↓ miss
-[Tier 3] Lightweight cloud scout call
-         input: context_type, waf, frameworks
+[Tier 3] generate_normal_scout(context_type, waf, frameworks) → 3 payloads
          instruction: encoding-biased, assume angle brackets blocked
-         output: 3 payloads
          fire via executor
         ↓ hit → ConfirmedFinding(source="cloud_model"), done
         ↓ miss → no finding for this param
@@ -127,6 +131,16 @@ Probe result (context_type, surviving_chars confirmed, waf)
 
 `reflection_snippet` is removed entirely. The probe already classifies context
 into structured labels — the local model should not re-parse raw HTML.
+`param_name` is also removed from the prompt input; it added no value to scoring.
+
+The existing `triage_probe_result()` in `models.py` has its signature changed:
+`reflection_snippet: str` and `param_name: str` are dropped as parameters.
+The call site in `_triage_with_local_model` (`worker.py:213–238`) is updated
+to stop collecting `snippet` and `param_name` before calling `triage_probe_result`.
+
+The existing prompt's scoring guide table is also removed — with structured label
+input, the local model does not need a rubric to interpret raw HTML; the simpler
+instruction is sufficient and performs better on small models.
 
 ### New triage prompt instruction
 
@@ -195,8 +209,17 @@ class LocalTriageResult:
 > Mutate aggressively — generate 8 novel variants that avoid blocked chars
 > while preserving execution. Return only valid JSON array."
 
+**`blocked_on` assembly:** `blocked_on` is inferred statically in `worker.py`
+by intersecting each Tier 1 payload's character set with the known blocked chars
+(complement of `surviving_chars` from the probe). The first blocked required
+character is used as the `blocked_on` value. `null` means no blocked character
+was identified in the payload — the failure was not char-based (e.g. WAF pattern
+match or sanitizer stripping the whole construct).
+
 **Failure ranking:** Top 5 from Tier 1 ranked by fewest blocked chars
-(payloads that came closest to clearing the filter rank highest).
+(payloads that came closest to clearing the filter rank highest). Payloads with
+`blocked_on=null` rank below those with an identified blocker since the failure
+reason is less actionable for mutation.
 
 **Output:** 8 payloads, fired in confidence order.
 
@@ -226,10 +249,14 @@ class LocalTriageResult:
 | Value | Meaning |
 |-------|---------|
 | `"phase1_transform"` | Existing transform-based hit (unchanged) |
+| `"phase1_waf_fallback"` | Existing WAF fallback hit (unchanged) |
 | `"phase1_deterministic"` | New — context-specific generator hit (Tier 1) |
 | `"local_model"` | Local model generation hit (existing, deep mode) |
 | `"cloud_model"` | Cloud generation hit (existing label, now used by both normal scout and deep mutation) |
 | `"dom_xss_runtime"` | DOM taint analysis hit (unchanged) |
+
+`reporter.py` source-label display mapping must be updated to include
+`"phase1_deterministic"` alongside the existing entries.
 
 ---
 
@@ -237,9 +264,11 @@ class LocalTriageResult:
 
 | File | Change |
 |------|--------|
-| `ai_xss_generator/active/generator.py` | Add `payloads_for_context()` dispatch function |
-| `ai_xss_generator/active/worker.py` | Wire Tier 1 for normal + deep; simplify triage input; add `--skip-triage` path |
-| `ai_xss_generator/models.py` | Add `generate_normal_scout()`; restructure deep cloud prompt to mutation framing; simplify `triage_probe_result()` input |
+| `ai_xss_generator/active/generator.py` | Add `payloads_for_context(context_type, surviving_chars)` dispatch function |
+| `ai_xss_generator/active/worker.py` | Wire Tier 1 for normal + deep; drop `snippet`/`param_name` from `_triage_with_local_model`; add `skip_triage` path; assemble `blocked_on` for failure set |
+| `ai_xss_generator/models.py` | Add `generate_normal_scout(context_type: str, waf: str \| None, frameworks: list[str]) -> list[str]`; restructure deep cloud prompt to mutation framing; drop `reflection_snippet` and `param_name` from `triage_probe_result()` signature |
+| `ai_xss_generator/active/orchestrator.py` | Add `skip_triage: bool = False` to `ActiveScanConfig`; pass through to worker kwargs; remove `generate_fast_batch` from `mode == "normal"` path (retain for `mode == "fast"` only) |
+| `ai_xss_generator/active/reporter.py` | Add `"phase1_deterministic"` to source-label display mapping |
 | `ai_xss_generator/cli.py` | Add `--skip-triage` to `axss scan`; add `--test-triage` to `axss models` |
 
 ---
