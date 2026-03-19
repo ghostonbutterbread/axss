@@ -28,3 +28,19 @@ class TestActiveScanConfigMode:
     def test_no_obliterate_field(self):
         cfg = ActiveScanConfig()
         assert not hasattr(cfg, "obliterate"), "obliterate boolean field should be removed"
+
+
+class TestDomWorkerSignature:
+    def test_run_dom_worker_accepts_findings_lock(self):
+        """run_dom_worker must accept a findings_lock parameter."""
+        import inspect
+        from ai_xss_generator.active.worker import run_dom_worker
+        sig = inspect.signature(run_dom_worker)
+        assert "findings_lock" in sig.parameters
+
+    def test_run_dom_worker_accepts_dom_sources(self):
+        """run_dom_worker must accept a dom_sources parameter."""
+        import inspect
+        from ai_xss_generator.active.worker import run_dom_worker
+        sig = inspect.signature(run_dom_worker)
+        assert "dom_sources" in sig.parameters

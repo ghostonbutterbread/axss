@@ -706,6 +706,11 @@ def run_active_scan(
                         log_label = next_url
                     elif kind == "dom":
                         next_url = item
+                        # Build URL-param-only sources list for Normal mode
+                        _dom_sources: "list[tuple[str, str]] | None" = None
+                        if config.mode == "normal":
+                            _qp = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(next_url).query, keep_blank_values=True))
+                            _dom_sources = [("query_param", k) for k in _qp] if _qp else []
                         proc = multiprocessing.Process(
                             target=run_dom_worker,
                             kwargs={
@@ -724,6 +729,8 @@ def run_active_scan(
                                 "extreme": config.extreme,
                                 "research": config.research,
                                 "fast_batch": fast_batch or None,
+                                "findings_lock": findings_lock,
+                                "dom_sources": _dom_sources,
                                 **_cli_kwargs,
                             },
                             daemon=True,

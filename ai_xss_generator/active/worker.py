@@ -2530,6 +2530,8 @@ def run_dom_worker(
     extreme: bool = False,
     research: bool = False,
     fast_batch: "list[Any] | None" = None,
+    findings_lock: Any = None,  # passed for parallel Normal mode safety
+    dom_sources: "list[tuple[str, str]] | None" = None,  # None = all sources (Deep)
 ) -> None:
     """Worker entry point for DOM XSS runtime scanning.
 
@@ -2564,6 +2566,8 @@ def run_dom_worker(
             keep_searching=keep_searching,
             extreme=extreme,
             research=research,
+            findings_lock=findings_lock,
+            dom_sources=dom_sources,
         )
     except Exception as exc:
         log.exception("DOM worker crashed for %s", url)
@@ -2591,6 +2595,8 @@ def _run_dom(
     keep_searching: bool = False,
     extreme: bool = False,
     research: bool = False,
+    findings_lock: Any = None,
+    dom_sources: "list[tuple[str, str]] | None" = None,
 ) -> None:
     from playwright.sync_api import sync_playwright
     from ai_xss_generator.active.dom_xss import (
@@ -2639,7 +2645,7 @@ def _run_dom(
             args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
         )
         try:
-            dom_hits = discover_dom_taint_paths(url, browser, auth_headers, timeout_ms=nav_timeout_ms)
+            dom_hits = discover_dom_taint_paths(url, browser, auth_headers, timeout_ms=nav_timeout_ms, sources=dom_sources)
             dom_hits = sorted(dom_hits, key=_dom_hit_priority)
         finally:
             browser.close()
