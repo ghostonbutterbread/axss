@@ -291,6 +291,16 @@ def _build_models_parser(subparsers: argparse._SubParsersAction) -> argparse.Arg
         add_help=False,
     )
     mod.add_argument("-h", "--help", action="help", help="Show this help message and exit.")
+    mod.add_argument(
+        "--test-triage",
+        action="store_true",
+        default=False,
+        help=(
+            "Fire a synthetic example through the local model triage prompt and "
+            "print the raw response and parsed result. "
+            "Use to verify your local model handles the triage input correctly."
+        ),
+    )
     actions = mod.add_subparsers(dest="models_action", metavar="ACTION")
     actions.add_parser("list",       help="Show locally available Ollama models.")
     search = actions.add_parser("search", help="Search Ollama model names.")
@@ -569,6 +579,18 @@ def _build_scan_parser(
         help="Probe URL before scanning to verify the session is still valid.",
     )
 
+    # ── Debug / triage ────────────────────────────────────────────────────
+    scan.add_argument(
+        "--skip-triage",
+        action="store_true",
+        default=False,
+        help=(
+            "Deep mode only: bypass the local model triage gate and escalate directly "
+            "to cloud mutation after Tier 1 + Tier 1.5 miss. "
+            "Use when the local model is unavailable or producing unreliable decisions."
+        ),
+    )
+
     # ── Suppressed legacy flags ───────────────────────────────────────────
     scan.add_argument("--extreme", action="store_true", default=False, help=argparse.SUPPRESS)
     scan.add_argument("--research", "--patient", dest="research", action="store_true", default=False, help=argparse.SUPPRESS)
@@ -634,6 +656,7 @@ _ARG_DEFAULTS: dict[str, object] = {
     "profile": None,
     "rate": 25.0,
     "verbose": 0,
+    "skip_triage": False,
     # Legacy utility flags (always False/None after subcommand dispatch)
     "list_models": False,
     "search_models": None,
@@ -1397,6 +1420,7 @@ def _run_active_scan(
         # --urls = pre-enumerated list: skip liveness by default, --live overrides
         # -u     = crawler-discovered: always check (list is small and fresh)
         skip_liveness=bool(args.urls) and not getattr(args, "live", False),
+        skip_triage=getattr(args, "skip_triage", False),
     )
 
     # ── Pre-scan session validity check ──────────────────────────────────────
@@ -1646,6 +1670,36 @@ def main(argv: list[str] | None = None) -> int:
 
     # ── models subcommand ─────────────────────────────────────────────────
     if args.command == "models":
+        if getattr(args, "test_triage", False):
+            import json as _json
+            from ai_xss_generator.models import triage_probe_result
+
+            _triage_input = {
+                "context_type": "html_attr_url",
+                "surviving_chars": ['"', " ", "javascript:"],
+                "waf": None,
+                "delivery_mode": "get",
+            }
+            _triage_model = config.default_model
+            print("=== Triage Test ===")
+            print("Input:", _json.dumps(_triage_input, indent=2))
+            try:
+                _triage_result = triage_probe_result(
+                    context_type=_triage_input["context_type"],
+                    surviving_chars=frozenset(_triage_input["surviving_chars"]),
+                    waf=_triage_input["waf"],
+                    delivery_mode=_triage_input["delivery_mode"],
+                    model=_triage_model,
+                )
+            except Exception as _triage_exc:
+                print(f"Error: {_triage_exc}")
+                return 1
+            print("Result:", _json.dumps(_triage_result, indent=2))
+            _score = _triage_result.get("score")
+            if not isinstance(_score, int) or not (1 <= _score <= 10):
+                print(f"WARNING: score {_score!r} is outside valid range 1-10 — local model may be misconfigured.")
+                return 1
+            return 0
         if not args.models_action:
             for action in parser._subparsers._group_actions:
                 sub = action.choices.get("models")

@@ -209,5 +209,25 @@ class CliHelpTest(unittest.TestCase):
         self.assertEqual(captured["timeout"], 1200)
 
 
+class TestNewFlags(unittest.TestCase):
+    def test_skip_triage_in_scan_help(self):
+        import subprocess, sys
+        result = subprocess.run(
+            ["venv/bin/python3", "axss.py", "scan", "--help"],
+            capture_output=True, text=True,
+            cwd="/home/ryushe/tools/axss"
+        )
+        self.assertIn("--skip-triage", result.stdout)
+
+    def test_test_triage_in_models_help(self):
+        import subprocess, sys
+        result = subprocess.run(
+            ["venv/bin/python3", "axss.py", "models", "--help"],
+            capture_output=True, text=True,
+            cwd="/home/ryushe/tools/axss"
+        )
+        self.assertIn("--test-triage", result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
