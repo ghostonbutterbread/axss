@@ -409,26 +409,26 @@ def _build_scan_parser(
         "--fast",
         action="store_true",
         default=False,
-        help="(default) Skip probe, run broad-spectrum payload generation. Fastest mode.",
+        help=(
+            "Reflected XSS only. HTTP pre-filter fires payloads via curl_cffi; "
+            "Playwright only opens when reflection is confirmed. Fastest mode, "
+            "ideal for large URL lists (e.g. GAU output)."
+        ),
     )
     scan.add_argument(
         "--deep",
         action="store_true",
         default=False,
         help=(
-            "Full probe + 3-phase targeted generation (scout → contextual → research). "
-            "Probes each parameter for char-survival and reflection context first. "
-            "Slower but finds context-specific bypasses that fast mode misses."
+            "Full probe + AI-targeted payload generation per param. "
+            "Best for 1–2 focused targets. Slowest mode."
         ),
     )
     scan.add_argument(
         "--obliterate",
         action="store_true",
         default=False,
-        help=(
-            "Maximum coverage: broad-spectrum prompt across all 3 AI phases with no probe delay. "
-            "Higher API spend than --fast or --deep alone."
-        ),
+        help=argparse.SUPPRESS,   # hidden deprecated alias for normal mode
     )
 
     # ── XSS type selectors ────────────────────────────────────────────────
@@ -1357,6 +1357,22 @@ def _run_active_scan(
         rate=args.rate,
     )
 
+    # Derive scan mode from flags (obliterate is deprecated alias for normal)
+    if getattr(args, "obliterate", False):
+        import warnings
+        warnings.warn(
+            "--obliterate is deprecated and will be removed in a future release. "
+            "Normal mode (no flag) now provides the same broad-spectrum coverage.",
+            DeprecationWarning, stacklevel=2,
+        )
+        _mode = "normal"
+    elif getattr(args, "deep", False):
+        _mode = "deep"
+    elif getattr(args, "fast", False):
+        _mode = "fast"
+    else:
+        _mode = "normal"
+
     scan_config = ActiveScanConfig(
         rate=args.rate,
         workers=getattr(args, "workers", 1),
@@ -1376,9 +1392,7 @@ def _run_active_scan(
         cli_tool=ai_config.cli_tool,
         cli_model=ai_config.cli_model,
         cloud_attempts=getattr(args, "attempts", 1),
-        mode=("deep" if getattr(args, "deep", False) else
-              "normal" if getattr(args, "obliterate", False) else
-              "fast"),
+        mode=_mode,
         fresh=getattr(args, "fresh", False),
         waf_source=getattr(args, "waf_source", None),
         keep_searching=getattr(args, "keep_searching", False),

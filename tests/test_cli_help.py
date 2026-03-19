@@ -60,7 +60,7 @@ class CliHelpTest(unittest.TestCase):
         self.assertIn("--interesting FILE", help_text)
         self.assertIn("--deep", help_text)
         self.assertIn("--fast", help_text)
-        self.assertIn("--obliterate", help_text)
+        self.assertNotIn("--obliterate", help_text)
         self.assertIn("--reflected", help_text)
         self.assertIn("--stored", help_text)
         self.assertIn("--uploads", help_text)
@@ -167,6 +167,27 @@ class CliHelpTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(captured["attempts"], 3)
         self.assertEqual(captured["timeout"], 600)
+
+    def test_scan_help_mode_flags(self) -> None:
+        help_text = _subparser_help("scan")
+        # --fast is now an explicit flag
+        self.assertIn("--fast", help_text)
+        # --deep still present
+        self.assertIn("--deep", help_text)
+        # --obliterate is hidden (suppress=argparse.SUPPRESS) — must NOT appear in help
+        self.assertNotIn("--obliterate", help_text)
+
+    def test_obliterate_still_accepted(self) -> None:
+        """--obliterate must still parse without error (deprecated hidden alias)."""
+        from ai_xss_generator.cli import build_parser
+        from ai_xss_generator.config import DEFAULT_MODEL
+        parser = build_parser(DEFAULT_MODEL)
+        # Should not raise during parse
+        args = parser.parse_args(["scan", "-u", "http://example.com", "--obliterate"])
+        # argparse sets the flag — mode derivation happens in the handler, not parse_args
+        assert args.obliterate is True
+        assert args.fast is False
+        assert args.deep is False
 
     def test_main_research_profile_raises_default_attempts_and_timeout(self) -> None:
         captured: dict[str, object] = {}
