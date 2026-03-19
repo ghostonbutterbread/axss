@@ -4,12 +4,12 @@ AI-assisted XSS scanning for authorized testing. `axss` crawls a target, probes 
 
 ## What it does
 
-- Reflected XSS: GET parameter discovery, probing, payload generation, browser confirmation
+- Reflected XSS: GET parameter discovery, probing, deterministic context-specific payloads, programmatic mutations, AI-assisted generation, browser confirmation
 - Stored XSS: POST form submission, sink auto-discovery, sink-context override before generation
 - DOM XSS: runtime source→sink discovery with AI-generated payloads and static fallbacks
 - Blind XSS: OOB token injection for payloads that execute out-of-band (admin panels, logs, emails) — **requires `--blind-callback URL`**; disabled by default
 - href/formaction bypass: detects `javascript:` URI injection points (e.g. `<a href="javascript:...">`) and clicks them post-navigation to confirm execution
-- Fast-by-default generation: compact scout prompts first, deeper phased prompts only when needed
+- Deterministic-first generation: context-specific payloads fire before any AI call; programmatic mutations run before cloud API spend
 - Scan artifact caching: sitemap and probe results cached 24 h so re-runs reuse prior work
 
 ## Setup
@@ -24,30 +24,78 @@ axss --help
 ## Quick start
 
 ```bash
-# Default — broad-spectrum Gen XSS, no probe (fast is the default)
-axss -u "https://target.tld" --active
+# Default (normal mode) — deterministic + mutation + lightweight cloud, all XSS types
+axss scan -u "https://target.tld"
 
-# Full probe + 3-phase targeted generation — finds context-specific injections
-axss -u "https://target.tld" --active --deep
+# Fast mode — HTTP pre-filter, broad-spectrum payloads, no probe (best for large URL lists)
+axss scan -u "https://target.tld" --fast
 
-# Maximum coverage: no probe + full 3-phase broad-spectrum
-axss -u "https://target.tld" --active --obliterate
+# Deep mode — full probe + exhaustive per-param investigation (best for 1-2 high-value pages)
+axss scan -u "https://target.tld" --deep
+
+# URL list scan (normal mode by default)
+axss scan --urls urls.txt
 
 # Stored XSS only
-axss -u "https://target.tld" --stored
+axss scan -u "https://target.tld" --stored
 
 # DOM XSS only
-axss -u "https://target.tld" --dom
+axss scan -u "https://target.tld" --dom
 
 # Ignore all caches, re-collect everything from scratch
-axss -u "https://target.tld" --active --fresh
+axss scan -u "https://target.tld" --fresh
+```
+
+## Scan modes
+
+| Flag | Probe | Payload pipeline | Best for |
+|------|-------|-----------------|----------|
+| *(default)* / Normal | partial | Tier 1 (deterministic) → Tier 1.5 (mutations) → Tier 3 (cloud seed scout) | URL lists, broad coverage — reflected + stored + DOM light |
+| `--fast` | skip | Pre-generated broad-spectrum set, HTTP pre-filter before Playwright | Large URL lists (35k+), speed over depth |
+| `--deep` | full | Tier 1 → Tier 1.5 → Tier 2 (local triage) → Tier 3 (cloud constraint-aware mutation) | 1-2 high-value pages, exhaustive investigation |
+
+### Payload pipeline (Normal + Deep)
+
+Payloads are generated in tiers before any cloud API spend:
+
+```
+Tier 1 — Deterministic
+  Context-specific generators fire first (html_body, html_attr_url, js_string, etc.)
+  Payloads filtered by probe-confirmed surviving chars (deep mode) or unfiltered (normal)
+        ↓ hit → done (source: phase1_deterministic)
+        ↓ miss
+
+Tier 1.5 — Programmatic Mutations
+  GenXSS-style transforms on best Tier 1 seeds: case randomisation,
+  space replacement, encoding variants, event handler rotation, quote swaps
+  Free, no API cost
+        ↓ hit → done (source: phase1_deterministic)
+        ↓ miss
+
+Tier 2 — Local Triage Gate (Deep only)
+  Local model decides whether cloud spend is justified
+  Input: context_type, surviving_chars, WAF, delivery_mode — no raw HTML
+        ↓ should_escalate=False → stop
+        ↓ should_escalate=True
+
+Tier 3 — Cloud
+  Normal: lightweight seed mutation scout (3 payloads, encoding-heavy)
+  Deep: constraint-aware mutation from top failed payloads + blocked chars
+        ↓ hit → done (source: cloud_model)
+        ↓ miss → no finding for this param
 ```
 
 ## Visual flow
 
 ```text
-active scan
+axss scan
 
+  Pre-flight
+  - strip tracking params
+  - path-shape dedup (collapses /tag/nyc, /tag/london → one representative)
+  - liveness filter (HEAD-check, drop 404/410/DNS failure, keep 401/403/5xx)
+         |
+         v
   check sitemap cache (~/.axss/cache/<host>/sitemap_*.json)
   - hit: skip crawl, use cached CrawlResult
   - miss: crawl / enumerate → write cache
@@ -55,7 +103,7 @@ active scan
          v
   check probe cache per URL (~/.axss/cache/<host>/probe_*.json)
   - hit: skip probe, use real reflection contexts at zero cost
-  - --fast / --obliterate: use cache if present, else synthesize fast_omni
+  - --fast: synthesize fast_omni (no probe)
   - miss: probe target behavior
     - reflection context + surviving chars
     - DOM taint source → sink
@@ -63,17 +111,11 @@ active scan
     → write cache
          |
          v
-  build compact AI context
-  - context envelope
-  - seed payloads
-  - success / failure memory
-         |
-         v
-  generate payloads
-  - default: fast scout round, escalate on failure
-  - --deep: full 3-phase (scout → contextual → research) on every attempt
-  - --fast: broad-spectrum single call, no probe context needed
-  - --obliterate: broad-spectrum + full 3-phase (maximum throughput + depth)
+  payload pipeline (per injectable param)
+  - Tier 1: deterministic context-specific payloads
+  - Tier 1.5: programmatic seed mutations
+  - Tier 2: local model triage gate (deep only)
+  - Tier 3: cloud seed mutation
          |
          v
   execute in Playwright
@@ -84,51 +126,68 @@ active scan
   - dialog / console / network / DOM runtime
 ```
 
-## Scan modes
-
-| Flag | Probe | Phases | Best for |
-|------|-------|--------|----------|
-| *(default)* / `--fast` | skip | 1 broad-spectrum | general use — fast Gen XSS across all contexts |
-| `--deep` | full | 3 phases targeted | thorough assessment, context-specific injections (JS strings, attr breakouts, href bypass) |
-| `--obliterate` | skip | 3 phases broad-spectrum | maximum payload variety at full speed |
-
 ## Cache behavior
 
 Scan artifacts are stored under `~/.axss/cache/<netloc>/` and expire after **24 hours**.
 
 - **Sitemap cache**: reused when the same seed URL + scope is scanned again — skips full BFS re-crawl.
-- **Probe cache**: reused per URL+params. When a `--fast` or `--obliterate` scan finds a probe cache entry from a prior normal scan, it uses real reflection contexts instead of the synthetic broad-spectrum fallback — better-targeted generation at zero extra network cost.
+- **Probe cache**: reused per URL+params. When a `--fast` scan finds a probe cache entry from a prior normal scan, it uses real reflection contexts instead of the synthetic broad-spectrum fallback — better-targeted generation at zero extra network cost.
 - **`--fresh`**: bypass both caches and re-collect everything from scratch.
 - `--urls FILE` mode never writes or reads the sitemap cache (URL list was pre-enumerated by the user).
 
 ## Useful commands
 
 ```bash
-# Auth manager
-axss auth
+# Knowledge base management
+axss memory
 
-# Show knowledge base counts
-axss --memory-stats
+# List available local models
+axss models list
+
+# Validate API keys
+axss models check-keys
+
+# Validate local model triage capability before a deep scan
+axss models --test-triage
 
 # Resume the latest interrupted scan for a target
-axss -u "https://target.tld" --active --resume
+axss scan -u "https://target.tld" --resume
 
 # Scan a SPA with browser crawl
-axss -u "https://target.tld" --active --browser-crawl
+axss scan -u "https://target.tld" --browser-crawl
 
 # Blind XSS — requires an OOB callback URL you control
 # (Interactsh, Burp Collaborator, webhook.site, or your own server)
-axss -u "https://target.tld" --active --blind-callback "https://abc123.oast.pro"
+axss scan -u "https://target.tld" --blind-callback "https://abc123.oast.pro"
 
 # Check which blind tokens have fired since the scan
 axss --poll-blind ~/.axss/reports/<report-dir>/blind_tokens.json \
      --blind-callback "https://abc123.oast.pro"
 
-# Re-scan without re-crawling (probe cache still applies)
-axss -u "https://target.tld" --active --fast
+# Deep scan, bypass local triage gate (use when local model is unavailable)
+axss scan -u "https://target.tld" --deep --skip-triage
 
-# Force full fresh scan — ignore all cached artifacts
-axss -u "https://target.tld" --active --obliterate --fresh
+# Force fresh scan, ignore all cached artifacts
+axss scan -u "https://target.tld" --fresh
+
+# Generate AI-ranked payloads without browser execution
+axss generate -u "https://target.tld/search?q=test"
+```
+
+## Recommended workflow for large target sets
+
+```bash
+# Step 1: Fast sweep across all URLs
+axss scan --urls all_urls.txt --fast
+
+# Step 2: Score remaining URLs for interest (static URL analysis)
+axss scan --urls all_urls.txt --interesting
+
+# Step 3: Normal scan on filtered high-interest URLs
+axss scan --urls interesting_urls.txt
+
+# Step 4: Deep scan on specific high-value targets
+axss scan -u "https://target.tld/specific-page" --deep
 ```
 
 ## Scope enforcement

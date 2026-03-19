@@ -7,35 +7,49 @@ This document is for LLMs, scripts, and other automation that need the current `
 ```text
 input
   - URL / URL list / local HTML
-  - mode: --active or --generate
+  - mode: normal (default), --fast, or --deep
 
           |
           v
 
-1. discover surface
-  - crawl unless --no-crawl
+1. pre-flight
+  - strip tracking params
+  - path-shape dedup (collapse /tag/nyc, /tag/london → one representative URL)
+  - liveness filter (HEAD-check all URLs; drop 404/410/connection errors; keep 401/403/5xx)
+
+2. discover surface
+  - crawl unless --no-crawl or --urls
   - find GET params, POST forms, uploads, DOM candidates
 
-2. probe
-  - classify reflection context
-  - measure surviving chars
+3. probe (normal + deep; skipped for fast)
+  - classify reflection context (html_body, html_attr_url, js_string_dq, etc.)
+  - measure surviving chars (deep mode: full char probe)
   - discover DOM source -> sink paths
   - for stored flows, discover sink pages when possible
 
-3. build prompt context
-  - compact context envelope
-  - planning envelope for deeper phases
-  - few-shot seeds
-  - success / failure memory
-  - similar findings
-
-4. generate payloads
-  - default: fast scout-only rounds first
-  - deep escalation only after scout attempts fail
-  - --deep restores scout -> contextual -> research on every attempt
+4. payload pipeline (per injectable param)
+  - Tier 1: deterministic context-specific payloads
+      payloads_for_context(context_type, surviving_chars) routes to the correct
+      generator. surviving_chars=None in normal mode (no probe → full candidate list).
+      HTTP reflection pre-rank for normal mode (top 3 reflecting payloads become seeds).
+      Hit → ConfirmedFinding(source="phase1_deterministic"), stop.
+  - Tier 1.5: programmatic seed mutations (GenXSS-style)
+      mutate_seeds(seeds, surviving_chars) applies 5 transforms:
+      case randomisation, space replacement, encoding variants (alert/confirm/prompt),
+      event handler rotation, quote swap. Up to 15 variants per seed set.
+      Hit → ConfirmedFinding(source="phase1_deterministic"), stop.
+  - Tier 2: local model triage gate (deep only)
+      Input: context_type, surviving_chars (frozenset), waf, delivery_mode — no raw HTML.
+      Output: score (1-10), should_escalate (bool), reason.
+      should_escalate=False → skip this param, no cloud spend.
+  - Tier 3: cloud (normal + deep, different prompts)
+      Normal: generate_normal_scout() — seeds + "mutate with encoding" — 3 payloads.
+      Deep: constraint-aware mutation — top 5 failed payloads + blocked_on per payload — 8 payloads.
+      Hit → ConfirmedFinding(source="cloud_model"), stop.
 
 5. execute
-  - Playwright browser execution for active mode
+  - Playwright browser execution
+  - click javascript: href/formaction elements post-injection
   - confirm via dialog, console, network, or DOM runtime
 
 6. feedback
@@ -45,21 +59,21 @@ input
 
 ## Mode summary
 
-`--generate`
-- parse / probe if needed
-- generate and rank payloads
-- no browser confirmation
+| Mode | Flag | Probe | Pipeline | Best for |
+|------|------|-------|----------|----------|
+| Normal | *(default)* | partial | Tier 1 → 1.5 → Tier 3 scout | URL lists, broad coverage |
+| Fast | `--fast` | none | Pre-generated set + HTTP pre-filter | Large URL lists, speed |
+| Deep | `--deep` | full | Tier 1 → 1.5 → Tier 2 triage → Tier 3 mutation | 1-2 pages, exhaustive |
 
-`--active`
-- discover -> probe -> generate -> execute -> feedback
+**Fast mode is unchanged by the pipeline restructure** — it uses a pre-generated broad-spectrum payload set with an HTTP pre-filter before Playwright. No deterministic dispatch, no local triage.
 
-## Current generation behavior
+## Generation behavior
 
-- Fast by default: scout prompt is intentionally small.
-- Deep prompting is conditional unless `--deep` is set.
-- Scout uses context-matched seeds from payload metadata, not hardcoded seed lists.
-- Similar successful findings are shown as few-shot examples in deeper phases.
-- Success memory is shown before failure memory.
+- **Deterministic first:** Context-specific generators always fire before any AI call. These are structured payloads matched to the injection context (html_body, html_attr_url, js_string_dq, etc.).
+- **Mutation before cloud:** GenXSS-style programmatic transforms run on the best Tier 1 seeds before any API spend. No cloud call needed for mutations.
+- **Seed mutation, not cold generation:** Cloud prompts receive the top failed seeds and instructions to mutate aggressively — not cold generation from scratch.
+- **Deep mode triage:** Local model scores the injection surface before cloud escalation. Structured labels only — the local model does not parse raw HTML.
+- **`generate_fast_batch` only in fast mode:** Normal mode no longer runs an upfront AI batch call. Per-param scout calls only.
 
 ## Stored XSS behavior
 
@@ -78,18 +92,26 @@ input
   - `code_location`
 - DOM payload generation is AI-first.
 - Static sink payloads are used as reference seeds and final fallback.
+- Normal mode: URL params only for DOM taint discovery.
+- Deep mode: all 6 DOM sources probed.
 
 ## Practical command patterns
 
 ```bash
-# Full scan
+# Default normal mode scan
 axss scan -u "https://target.tld"
 
-# Fast-first active scan with two scout attempts before deep escalation
-axss scan -u "https://target.tld" --attempts 2
+# Fast sweep for large URL lists
+axss scan --urls all_urls.txt --fast
 
-# Force deep mode
-axss scan -u "https://target.tld" --deep
+# Deep scan on specific high-value page
+axss scan -u "https://target.tld/app" --deep
+
+# Deep scan, bypass local triage gate (when local model is slow or unavailable)
+axss scan -u "https://target.tld/app" --deep --skip-triage
+
+# Validate local model triage before deep scanning
+axss models --test-triage
 
 # Stored XSS with optional manual sink override
 axss scan -u "https://target.tld/settings" --stored
@@ -101,7 +123,7 @@ axss scan -u "https://target.tld" --dom
 # Browser crawl for SPA targets
 axss scan -u "https://target.tld" --browser-crawl
 
-# Payload generation only
+# Payload generation only (no browser)
 axss generate -u "https://target.tld/search?q=test"
 
 # Scope from bug bounty platform (API)
@@ -116,6 +138,40 @@ axss scan --urls urls.txt --scope "https://hackerone.com/twitter"
 # Rate-limited scan (shared across all phases including pre-flight)
 axss scan --urls urls.txt -r 2
 ```
+
+## Recommended workflow for large target sets
+
+```
+1. axss scan --urls all_urls.txt --fast         # broad sweep
+2. axss scan --urls all_urls.txt --interesting  # score URLs (static analysis)
+3. axss scan --urls interesting.txt             # normal mode on filtered set
+4. axss scan -u "https://target.tld/page" --deep  # exhaustive on high-value pages
+```
+
+## Debug flags
+
+`--skip-triage` (deep mode only)
+- Bypasses the local model triage gate after Tier 1 + 1.5 miss
+- Goes directly to Tier 3 cloud mutation
+- No-op in fast and normal mode
+- Use when local model is unavailable or producing unreliable decisions
+
+`axss models --test-triage`
+- Fires a synthetic example through the simplified triage prompt
+- Prints: exact JSON sent to local model, raw response, parsed result
+- Synthetic input: `context_type=html_attr_url`, `surviving_chars=['"', ' ', 'javascript:']`, `waf=null`
+- Exit code 1 if local model returns malformed JSON or score outside 1-10
+
+## ConfirmedFinding source values
+
+| Value | Meaning |
+|-------|---------|
+| `phase1_transform` | Existing transform-based hit |
+| `phase1_waf_fallback` | WAF-specific deterministic fallback |
+| `phase1_deterministic` | Context-specific generator or mutation hit (Tier 1 or 1.5) |
+| `local_model` | Local model generation hit (deep mode) |
+| `cloud_model` | Cloud generation hit (normal scout or deep mutation) |
+| `dom_xss_runtime` | DOM taint analysis hit |
 
 ## Scope resolution order
 
@@ -138,9 +194,10 @@ Deduplication and other in-memory operations are never rate-limited. Set `--rate
 
 ## Operational notes
 
-- CLI help is the source of truth for flags: `axss scan --help`, `axss generate --help`
-- Running `axss scan` or `axss generate` with no arguments prints the subcommand help
-- Auth profiles are managed via `axss memory`
+- CLI help is the source of truth for flags: `axss scan --help`, `axss generate --help`, `axss models --help`
+- Running a subcommand with no arguments prints the subcommand help
+- Knowledge base is managed via `axss memory`
+- Models are managed via `axss models`
 - Reports go to `~/.axss/reports/`
 - Config lives in `~/.axss/config.json`
 - Keys live in `~/.axss/keys` — includes slots for H1, Bugcrowd, and Intigriti API credentials
@@ -149,6 +206,8 @@ Deduplication and other in-memory operations are never rate-limited. Set `--rate
 
 - Prefer `axss scan` for real confirmation.
 - Prefer `--browser-crawl` for SPA targets.
-- Prefer default fast mode first; add `--deep` only when the target is stubborn or you explicitly want maximum model spend.
+- Use `--fast` for initial sweeps of large URL lists; `--deep` only on specific high-value pages.
+- Normal mode is the default — it's the right choice for most URL list scans.
 - Do not assume `--sink-url` is required for stored XSS anymore.
 - When scanning targets that IP-ban aggressively, always set `--rate`.
+- Before running deep mode scans, use `axss models --test-triage` to confirm the local model is functional.
