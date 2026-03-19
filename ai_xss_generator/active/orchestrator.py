@@ -92,6 +92,19 @@ def _auto_workers(rate: float, explicit_workers: int) -> int:
     return min(auto, explicit_workers)
 
 
+def _auto_workers_for_mode(mode: str, rate: float, explicit_workers: int) -> int:
+    """Return worker count for a given mode.
+
+    Normal mode with rate >= 2 guarantees at least 2 slots so that DOM and
+    reflected workers can run concurrently (each at half rate). When rate < 2
+    the split would yield sub-1 req/s streams — fall back to 1 slot.
+    """
+    base = _auto_workers(rate, explicit_workers)
+    if mode == "normal" and rate >= 2:
+        return max(2, base)
+    return base
+
+
 def _domain(url: str) -> str:
     return urllib.parse.urlparse(url).netloc or url
 
@@ -475,7 +488,7 @@ def run_active_scan(
     n_post = sum(1 for kind, _ in work_items if kind == "post")
     n_upload = sum(1 for kind, _ in work_items if kind == "upload")
 
-    n_workers = _auto_workers(config.rate, config.workers)
+    n_workers = _auto_workers_for_mode(config.mode, config.rate, config.workers)
     step(
         f"Active scan [{_active_types}]: {n_get} GET URL(s) + {n_post} POST form(s) + {n_upload} upload form(s) | "
         f"{n_workers} worker(s) | "
@@ -674,13 +687,19 @@ def run_active_scan(
                     except StopIteration:
                         break
 
+                    # Normal mode with rate >= 2: split rate evenly between GET and DOM streams
+                    if config.mode == "normal" and config.rate >= 2:
+                        _get_rate = config.rate / 2
+                    else:
+                        _get_rate = config.rate
+
                     if kind == "get":
                         next_url = item
                         proc = multiprocessing.Process(
                             target=run_worker,
                             kwargs={
                                 "url": next_url,
-                                "rate": config.rate,
+                                "rate": _get_rate,
                                 "waf_hint": config.waf,
                                 "model": config.model,
                                 "cloud_model": config.cloud_model,
@@ -757,7 +776,7 @@ def run_active_scan(
                             target=run_post_worker,
                             kwargs={
                                 "post_form": pf,
-                                "rate": config.rate,
+                                "rate": _get_rate,
                                 "waf_hint": config.waf,
                                 "model": config.model,
                                 "cloud_model": config.cloud_model,
