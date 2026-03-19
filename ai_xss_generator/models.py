@@ -1944,7 +1944,7 @@ def _generate_dom_local_with_ollama(
 def triage_probe_result(
     *,
     context_type: str,
-    surviving_chars: str,
+    surviving_chars: frozenset[str],
     waf: str | None,
     delivery_mode: str,
     model: str,

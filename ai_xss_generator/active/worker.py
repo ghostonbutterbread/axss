@@ -3950,26 +3950,31 @@ def _run_post(
 
                 # Local model triage gate for POST params — mirrors GET behaviour.
                 # fast_omni skips triage (no probe data, cloud always runs).
-                # skip_triage=True bypasses the local model gate entirely.
+                # skip_triage=True bypasses the local model gate only in deep mode.
                 _triage_approved = True
-                if not skip_triage and context_type != "fast_omni" and escalation_policy.use_local and not context_done and not _timed_out():
-                    local_model_rounds += 1
-                    _triage = _triage_with_local_model(
-                        probe_result=context_probe_result,
-                        model=model,
-                        waf=waf_hint,
-                        delivery_mode="post",
-                        fast_mode=mode in ("fast", "normal"),
-                    )
-                    _triage_approved = _triage.should_escalate
-                    _append_reason(escalation_reasons, f"[triage score={_triage.score}] {_triage.reason}")
-                    if _triage.context_notes:
-                        _append_reason(escalation_reasons, _triage.context_notes)
-                    if not _triage_approved:
-                        log.debug(
-                            "Triage gate: skipping cloud for POST %s param=%s (score=%d): %s",
-                            post_form.action_url, param_name, _triage.score, _triage.reason,
+                if context_type != "fast_omni" and escalation_policy.use_local and not context_done and not _timed_out():
+                    # In deep mode: skip_triage bypasses the local model gate entirely.
+                    if mode == "deep" and skip_triage:
+                        _triage_approved = True
+                        _append_reason(escalation_reasons, "skip_triage=True — triage gate bypassed")
+                    else:
+                        local_model_rounds += 1
+                        _triage = _triage_with_local_model(
+                            probe_result=context_probe_result,
+                            model=model,
+                            waf=waf_hint,
+                            delivery_mode="post",
+                            fast_mode=mode in ("fast", "normal"),
                         )
+                        _triage_approved = _triage.should_escalate
+                        _append_reason(escalation_reasons, f"[triage score={_triage.score}] {_triage.reason}")
+                        if _triage.context_notes:
+                            _append_reason(escalation_reasons, _triage.context_notes)
+                        if not _triage_approved:
+                            log.debug(
+                                "Triage gate: skipping cloud for POST %s param=%s (score=%d): %s",
+                                post_form.action_url, param_name, _triage.score, _triage.reason,
+                            )
 
                 if not context_done and _triage_approved and use_cloud and not _timed_out():
                     surviving_chars = frozenset().union(
