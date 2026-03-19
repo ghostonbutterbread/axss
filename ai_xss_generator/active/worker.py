@@ -1627,8 +1627,62 @@ def _run(
                             len(_all_failed), [e["payload"][:20] for e in _top5],
                         )
 
+                    # ── Normal mode Tier 3: lightweight cloud scout ──
+                    # Instead of the full generate_cloud_payloads path, normal mode
+                    # uses generate_normal_scout() which sends top seeds for encoding
+                    # mutation (assumes angle brackets blocked, encoding-heavy).
+                    if mode == "normal" and not context_done and not _timed_out() and use_cloud:
+                        from ai_xss_generator.models import generate_normal_scout
+                        _scout_frameworks = [
+                            str(item).lower()
+                            for item in getattr(_cached_context, "frameworks", [])[:3]
+                        ]
+                        _scout_payloads = generate_normal_scout(
+                            context_type,
+                            waf_hint,
+                            _scout_frameworks,
+                            seeds=tier1_seeds,
+                            model=cloud_model,
+                            ai_backend=ai_backend,
+                            cli_tool=cli_tool,
+                            cli_model=cli_model,
+                        )
+                        cloud_escalated = True
+                        cloud_model_rounds += 1
+                        _scout_new, _ = _unique_new_payloads(_scout_payloads, seen_cloud_payloads)
+                        fast_generated_count += len(_scout_new)
+                        for _scout_text in _scout_new:
+                            if context_done or _timed_out():
+                                break
+                            if not _scout_text:
+                                continue
+                            total_transforms_tried += 1
+                            result = executor.fire(
+                                url=url,
+                                param_name=param_name,
+                                payload=_scout_text,
+                                all_params=flat_params,
+                                transform_name="cloud_model",
+                                sink_url=sink_url,
+                            )
+                            _ai_tried_payloads.append((_scout_text, "cloud_model"))
+                            if result.confirmed:
+                                finding = _make_finding(
+                                    url=url,
+                                    probe_result=context_probe_result,
+                                    context_type=context_type,
+                                    result=result,
+                                    waf=waf_hint,
+                                    source="cloud_model",
+                                    cloud_escalated=True,
+                                    ai_note="Normal mode Tier 3 scout payload confirmed.",
+                                )
+                                if _record_context_finding(finding) and len(context_variant_keys) >= context_hit_cap:
+                                    context_done = True
+                                    break
+
                     for attempt_number in range(1, attempt_limit + 1):
-                        if _timed_out():
+                        if _timed_out() or mode == "normal":
                             break
 
                         cloud_escalated = True
@@ -3998,6 +4052,149 @@ def _run_post(
                         pass
                     return True
 
+                # ── Tier 1: deterministic context-specific payloads (POST, normal + deep) ──
+                # Mirrors GET worker Tier 1 + 1.5 wiring. Skipped for fast_omni.
+                _post_tier1_failed_payloads: list[str] = []
+                _post_tier15_failed_payloads: list[str] = []
+                tier1_seeds: list[str] = []  # used by normal mode Tier 3 scout below
+
+                if mode in ("normal", "deep") and context_type != "fast_omni" and not context_done and not _timed_out():
+                    # Compute surviving_chars: None in normal (no probe), frozenset in deep.
+                    _post_t1_surviving: "frozenset[str] | None"
+                    if mode == "deep":
+                        _post_t1_surviving = frozenset().union(
+                            *(ctx.surviving_chars for ctx in context_probe_result.reflections
+                              if getattr(ctx, "surviving_chars", None))
+                        ) or None
+                    else:
+                        _post_t1_surviving = None
+
+                    from ai_xss_generator.active.generator import payloads_for_context, mutate_seeds
+
+                    _post_t1_attr = ""
+                    if context_probe_result.reflections:
+                        _post_t1_attr = str(getattr(context_probe_result.reflections[0], "attr_name", "") or "")
+                    _post_t1_context_before = ""
+                    if context_probe_result.reflections:
+                        _post_t1_context_before = str(getattr(context_probe_result.reflections[0], "context_before", "") or "")
+
+                    post_tier1_candidates = payloads_for_context(
+                        context_type,
+                        _post_t1_surviving,
+                        param_name=param_name,
+                        attr_name=_post_t1_attr or "href",
+                        context_before=_post_t1_context_before,
+                    )
+
+                    # In normal mode: HTTP pre-rank top 10 by reflection check.
+                    if mode == "normal" and post_tier1_candidates:
+                        try:
+                            from ai_xss_generator.active.executor import _http_reflects_payload as _post_hrp
+                            _post_check = post_tier1_candidates[:10]
+                            _post_ranked: list[Any] = []
+                            _post_non_reflecting: list[Any] = []
+                            for _ptc in _post_check:
+                                _ptc_text = _payload_text(_ptc)
+                                if not _ptc_text:
+                                    continue
+                                # For POST, build a simple GET-style check URL (best effort)
+                                _ptc_parsed = urllib.parse.urlparse(post_form.action_url)
+                                _ptc_params = {param_name: _ptc_text}
+                                _ptc_url = urllib.parse.urlunparse(
+                                    _ptc_parsed._replace(
+                                        query=urllib.parse.urlencode(_ptc_params, quote_via=urllib.parse.quote)
+                                    )
+                                )
+                                _ptc_reflects = _post_hrp(_ptc_url, _ptc_text, auth_headers or {})
+                                if _ptc_reflects is True:
+                                    _post_ranked.append(_ptc)
+                                else:
+                                    _post_non_reflecting.append(_ptc)
+                            _post_ranked.sort(key=lambda c: -getattr(c, "risk_score", 0))
+                            _post_non_reflecting.sort(key=lambda c: -getattr(c, "risk_score", 0))
+                            post_tier1_candidates = _post_ranked + _post_non_reflecting + post_tier1_candidates[10:]
+                        except Exception as _post_rank_exc:
+                            log.debug("POST Tier 1 HTTP pre-rank failed: %s", _post_rank_exc)
+
+                    # Select top 3 seeds for Tier 1.5 and normal mode cloud scout.
+                    tier1_seeds = [_payload_text(c) for c in post_tier1_candidates[:3] if _payload_text(c)]
+
+                    # Fire Tier 1 payloads
+                    for _pt1_cand in post_tier1_candidates:
+                        if context_done or _timed_out():
+                            break
+                        _pt1_text = _payload_text(_pt1_cand)
+                        if not _pt1_text:
+                            continue
+                        total_transforms_tried += 1
+                        result = executor.fire_post(
+                            source_page_url=post_form.source_page_url,
+                            action_url=post_form.action_url,
+                            param_name=param_name,
+                            payload=_pt1_text,
+                            all_param_names=post_form.param_names,
+                            csrf_field=post_form.csrf_field,
+                            transform_name="tier1_deterministic",
+                            sink_url=effective_sink_url,
+                            payload_candidate=_pt1_cand,
+                            extra_sink_urls=crawled_pages or [],
+                        )
+                        _ai_tried_payloads.append((_pt1_text, "tier1_deterministic"))
+                        if result.confirmed:
+                            finding = _make_finding(
+                                url=post_form.action_url,
+                                probe_result=context_probe_result,
+                                context_type=context_type,
+                                result=result,
+                                waf=waf_hint,
+                                source="phase1_deterministic",
+                                cloud_escalated=False,
+                                ai_note="Tier 1 deterministic context-specific payload confirmed.",
+                            )
+                            if _record_context_finding(finding) and len(context_variant_keys) >= context_hit_cap:
+                                context_done = True
+                                break
+                        else:
+                            _post_tier1_failed_payloads.append(_pt1_text)
+
+                    # ── Tier 1.5: seed mutations after Tier 1 miss ──
+                    if not context_done and not _timed_out() and tier1_seeds:
+                        post_tier15_mutations = mutate_seeds(tier1_seeds, _post_t1_surviving)
+                        for _pt15_text in post_tier15_mutations:
+                            if context_done or _timed_out():
+                                break
+                            if not _pt15_text:
+                                continue
+                            total_transforms_tried += 1
+                            result = executor.fire_post(
+                                source_page_url=post_form.source_page_url,
+                                action_url=post_form.action_url,
+                                param_name=param_name,
+                                payload=_pt15_text,
+                                all_param_names=post_form.param_names,
+                                csrf_field=post_form.csrf_field,
+                                transform_name="tier15_mutation",
+                                sink_url=effective_sink_url,
+                                extra_sink_urls=crawled_pages or [],
+                            )
+                            _ai_tried_payloads.append((_pt15_text, "tier15_mutation"))
+                            if result.confirmed:
+                                finding = _make_finding(
+                                    url=post_form.action_url,
+                                    probe_result=context_probe_result,
+                                    context_type=context_type,
+                                    result=result,
+                                    waf=waf_hint,
+                                    source="phase1_deterministic",
+                                    cloud_escalated=False,
+                                    ai_note="Tier 1.5 seed mutation confirmed.",
+                                )
+                                if _record_context_finding(finding) and len(context_variant_keys) >= context_hit_cap:
+                                    context_done = True
+                                    break
+                            else:
+                                _post_tier15_failed_payloads.append(_pt15_text)
+
                 # Local model triage gate for POST params — mirrors GET behaviour.
                 # fast_omni skips triage (no probe data, cloud always runs).
                 # skip_triage=True bypasses the local model gate only in deep mode.
@@ -4181,8 +4378,62 @@ def _run_post(
                                     break
                         continue  # next (param_name, context_type, variants) tuple
 
+                    # ── Normal mode Tier 3 (POST): lightweight cloud scout ──
+                    if mode == "normal" and not context_done and not _timed_out() and use_cloud:
+                        from ai_xss_generator.models import generate_normal_scout
+                        _post_scout_frameworks = [
+                            str(item).lower()
+                            for item in getattr(generation_context, "frameworks", [])[:3]
+                        ]
+                        _post_scout_payloads = generate_normal_scout(
+                            context_type,
+                            waf_hint,
+                            _post_scout_frameworks,
+                            seeds=tier1_seeds,
+                            model=cloud_model,
+                            ai_backend=ai_backend,
+                            cli_tool=cli_tool,
+                            cli_model=cli_model,
+                        )
+                        cloud_escalated = True
+                        cloud_model_rounds += 1
+                        _post_scout_new, _ = _unique_new_payloads(_post_scout_payloads, seen_cloud_payloads)
+                        fast_generated_count += len(_post_scout_new)
+                        for _post_scout_text in _post_scout_new:
+                            if context_done or _timed_out():
+                                break
+                            if not _post_scout_text:
+                                continue
+                            total_transforms_tried += 1
+                            result = executor.fire_post(
+                                source_page_url=post_form.source_page_url,
+                                action_url=post_form.action_url,
+                                param_name=param_name,
+                                payload=_post_scout_text,
+                                all_param_names=post_form.param_names,
+                                csrf_field=post_form.csrf_field,
+                                transform_name="cloud_model",
+                                sink_url=effective_sink_url,
+                                extra_sink_urls=crawled_pages or [],
+                            )
+                            _ai_tried_payloads.append((_post_scout_text, "cloud_model"))
+                            if result.confirmed:
+                                finding = _make_finding(
+                                    url=post_form.action_url,
+                                    probe_result=context_probe_result,
+                                    context_type=context_type,
+                                    result=result,
+                                    waf=waf_hint,
+                                    source="cloud_model",
+                                    cloud_escalated=True,
+                                    ai_note="Normal mode Tier 3 POST scout payload confirmed.",
+                                )
+                                if _record_context_finding(finding) and len(context_variant_keys) >= context_hit_cap:
+                                    context_done = True
+                                    break
+
                     for attempt_number in range(1, attempt_limit + 1):
-                        if _timed_out():
+                        if _timed_out() or mode == "normal":
                             break
 
                         cloud_escalated = True

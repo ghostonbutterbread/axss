@@ -264,6 +264,7 @@ def test_get_worker_retries_cloud_with_feedback_before_fallback():
             cli_tool="claude",
             cli_model=None,
             cloud_attempts=2,
+            mode="deep",
         )
 
     assert cloud_feedback_counts == [0, 1]
@@ -435,6 +436,7 @@ def test_get_worker_uses_deterministic_fallback_only_after_local_and_cloud_fail(
             ai_backend="api",
             cli_tool="claude",
             cli_model=None,
+            mode="deep",
         )
 
     assert actions == ["local:html_body", "cloud:html_body", "fire:raw"]
@@ -511,6 +513,7 @@ def test_get_worker_skips_local_on_high_friction_hard_context_and_uses_cloud() -
             ai_backend="api",
             cli_tool="claude",
             cli_model=None,
+            mode="deep",
         )
 
     assert actions == ["fire:cloud_model:cloud-url"]
@@ -1174,6 +1177,8 @@ def test_post_worker_retries_cloud_with_feedback_before_fallback():
             "ai_xss_generator.active.transforms.all_variants_for_probe",
             return_value=[("q", "html_body", [TransformVariant("raw", "fallback-html")])],
         ),
+        patch("ai_xss_generator.active.generator.payloads_for_context", return_value=[]),
+        patch("ai_xss_generator.active.generator.mutate_seeds", return_value=[]),
         patch("ai_xss_generator.active.worker._get_local_payloads", return_value=[]),
         patch("ai_xss_generator.active.worker._get_cloud_payloads", side_effect=_cloud_payloads),
     ):
@@ -1197,6 +1202,7 @@ def test_post_worker_retries_cloud_with_feedback_before_fallback():
             cli_tool="claude",
             cli_model=None,
             cloud_attempts=2,
+            mode="deep",
         )
 
     assert cloud_feedback_counts == [0, 1]
@@ -1291,6 +1297,7 @@ def test_post_worker_uses_deterministic_fallback_only_after_local_and_cloud_fail
             ai_backend="api",
             cli_tool="claude",
             cli_model=None,
+            mode="deep",
         )
 
     assert actions == ["local:html_body", "cloud:html_body", "fire:raw"]
