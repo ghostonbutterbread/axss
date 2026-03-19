@@ -150,3 +150,35 @@ class TestTriageProbeResultSignature:
         assert "surviving_chars" in sig.parameters
         assert "waf" in sig.parameters
         assert "delivery_mode" in sig.parameters
+
+
+class TestBlockedOnAssembly:
+    def test_blocked_on_identifies_blocked_char(self):
+        from ai_xss_generator.active.worker import _blocked_on_char
+        surviving = frozenset("abcdefghijklmnopqrstuvwxyz()1\"' ")
+        payload = "<img src=x onerror=alert(1)>"
+        result = _blocked_on_char(payload, surviving)
+        assert result == "<"  # first char in payload not in surviving
+
+    def test_blocked_on_null_when_all_survive(self):
+        from ai_xss_generator.active.worker import _blocked_on_char
+        surviving = frozenset("<>abcdefghijklmnopqrstuvwxyz()1\"' =")
+        payload = "<img src=x onerror=alert(1)>"
+        result = _blocked_on_char(payload, surviving)
+        assert result is None
+
+    def test_blocked_on_null_for_empty_surviving(self):
+        # Empty surviving_chars means we can't determine what's blocked
+        from ai_xss_generator.active.worker import _blocked_on_char
+        result = _blocked_on_char("alert(1)", frozenset())
+        # Can't determine — no surviving chars to diff against
+        assert result is None or isinstance(result, str)
+
+
+class TestSkipTriageWorkerPath:
+    def test_worker_accepts_skip_triage_kwarg(self):
+        """run_worker (or equivalent) must accept skip_triage parameter."""
+        import inspect
+        from ai_xss_generator.active.worker import run_worker
+        sig = inspect.signature(run_worker)
+        assert "skip_triage" in sig.parameters

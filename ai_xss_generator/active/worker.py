@@ -250,6 +250,21 @@ def _append_reason(reasons: list[str], note: str) -> None:
         reasons.append(cleaned)
 
 
+def _blocked_on_char(payload: str, surviving_chars: "frozenset[str]") -> "str | None":
+    """Return the first character in *payload* that is not in *surviving_chars*.
+
+    Used to annotate failed Tier 1/1.5 payloads for the deep mode cloud mutation
+    prompt. Returns None when all characters survive (failure was not char-based)
+    or when surviving_chars is empty (can't determine).
+    """
+    if not surviving_chars:
+        return None
+    for ch in payload:
+        if ch not in surviving_chars:
+            return ch
+    return None
+
+
 def _join_lessons(*lesson_groups: list[Any] | None) -> list[Any] | None:
     merged: list[Any] = []
     for group in lesson_groups:
@@ -908,6 +923,7 @@ def run_worker(
     extreme: bool = False,
     research: bool = False,
     fast_batch: "list[Any] | None" = None,
+    skip_triage: bool = False,
 ) -> None:
     """Target function for multiprocessing.Process.
 
@@ -950,6 +966,7 @@ def run_worker(
             extreme=extreme,
             research=research,
             fast_batch=fast_batch,
+            skip_triage=skip_triage,
         )
     except Exception as exc:
         log.exception("Worker crashed for %s", url)
@@ -985,6 +1002,7 @@ def _run(
     extreme: bool = False,
     research: bool = False,
     fast_batch: "list[Any] | None" = None,
+    skip_triage: bool = False,
 ) -> None:
     deadline = start_time + active_worker_timeout_budget(
         timeout_seconds,
@@ -1268,28 +1286,176 @@ def _run(
                         pass
                     return True
 
-                # Local model triage gate — decides whether this injection point
+                # ── Tier 1: deterministic context-specific payloads (normal + deep) ──
+                # Runs before AI/cloud to get cheap, context-aware confirmation
+                # attempts at zero API cost. Skipped for fast_omni (fast mode only).
+                _tier1_failed_payloads: list[str] = []   # for blocked_on assembly (deep)
+                _tier15_failed_payloads: list[str] = []  # for blocked_on assembly (deep)
+
+                if mode in ("normal", "deep") and context_type != "fast_omni" and not context_done and not _timed_out():
+                    # Compute surviving_chars for Tier 1: None in normal (no probe),
+                    # real frozenset in deep (from probe reflections).
+                    _t1_surviving: "frozenset[str] | None"
+                    if mode == "deep":
+                        _t1_surviving = frozenset().union(
+                            *(ctx.surviving_chars for ctx in context_probe_result.reflections
+                              if getattr(ctx, "surviving_chars", None))
+                        ) or None
+                    else:
+                        _t1_surviving = None  # normal mode: bypass char filtering
+
+                    from ai_xss_generator.active.generator import payloads_for_context, mutate_seeds
+
+                    # Get surviving_chars for param_name and attr_name hints
+                    _t1_attr = ""
+                    if context_probe_result.reflections:
+                        _t1_attr = str(getattr(context_probe_result.reflections[0], "attr_name", "") or "")
+                    _t1_context_before = ""
+                    if context_probe_result.reflections:
+                        _t1_context_before = str(getattr(context_probe_result.reflections[0], "context_before", "") or "")
+
+                    tier1_candidates = payloads_for_context(
+                        context_type,
+                        _t1_surviving,
+                        param_name=param_name,
+                        attr_name=_t1_attr or "href",
+                        context_before=_t1_context_before,
+                    )
+
+                    # In normal mode: pre-rank top 10 candidates by HTTP reflection
+                    # check. Payloads that reflect in HTTP get promoted above those
+                    # that don't; avoids spending Playwright time on filtered payloads.
+                    if mode == "normal" and tier1_candidates:
+                        try:
+                            from ai_xss_generator.active.executor import _http_reflects_payload as _hrp
+                            _check_candidates = tier1_candidates[:10]
+                            _ranked: list[Any] = []
+                            _non_reflecting: list[Any] = []
+                            for _tc in _check_candidates:
+                                _tc_text = _payload_text(_tc)
+                                if not _tc_text:
+                                    continue
+                                # Build fired URL for this param+payload
+                                _parsed_u = urllib.parse.urlparse(url)
+                                _params_copy = {k: v for k, v in flat_params.items()}
+                                _params_copy[param_name] = _tc_text
+                                _tc_url = urllib.parse.urlunparse(
+                                    _parsed_u._replace(
+                                        query=urllib.parse.urlencode(_params_copy, quote_via=urllib.parse.quote)
+                                    )
+                                )
+                                _reflects = _hrp(_tc_url, _tc_text, auth_headers or {})
+                                if _reflects is True:
+                                    _ranked.append(_tc)
+                                else:
+                                    _non_reflecting.append(_tc)
+                            # Reflecting payloads first, then remaining (sorted by risk_score)
+                            _ranked.sort(key=lambda c: -getattr(c, "risk_score", 0))
+                            _non_reflecting.sort(key=lambda c: -getattr(c, "risk_score", 0))
+                            tier1_candidates = _ranked + _non_reflecting + tier1_candidates[10:]
+                        except Exception as _rank_exc:
+                            log.debug("Tier 1 HTTP pre-rank failed: %s", _rank_exc)
+
+                    # Select top 3 seeds for Tier 1.5 (before we fire and possibly mutate state)
+                    tier1_seeds = [_payload_text(c) for c in tier1_candidates[:3] if _payload_text(c)]
+
+                    # Fire Tier 1 payloads
+                    for t1_cand in tier1_candidates:
+                        if context_done or _timed_out():
+                            break
+                        _t1_text = _payload_text(t1_cand)
+                        if not _t1_text:
+                            continue
+                        total_transforms_tried += 1
+                        result = executor.fire(
+                            url=url,
+                            param_name=param_name,
+                            payload=_t1_text,
+                            all_params=flat_params,
+                            transform_name="tier1_deterministic",
+                            sink_url=sink_url,
+                            payload_candidate=t1_cand,
+                        )
+                        _ai_tried_payloads.append((_t1_text, "tier1_deterministic"))
+                        if result.confirmed:
+                            finding = _make_finding(
+                                url=url,
+                                probe_result=context_probe_result,
+                                context_type=context_type,
+                                result=result,
+                                waf=waf_hint,
+                                source="phase1_deterministic",
+                                cloud_escalated=False,
+                                ai_note="Tier 1 deterministic context-specific payload confirmed.",
+                            )
+                            if _record_context_finding(finding) and len(context_variant_keys) >= context_hit_cap:
+                                context_done = True
+                                break
+                        else:
+                            _tier1_failed_payloads.append(_t1_text)
+
+                    # ── Tier 1.5: seed mutations (GenXSS-style) after Tier 1 miss ──
+                    if not context_done and not _timed_out() and tier1_seeds:
+                        tier15_mutations = mutate_seeds(tier1_seeds, _t1_surviving)
+                        for t15_text in tier15_mutations:
+                            if context_done or _timed_out():
+                                break
+                            if not t15_text:
+                                continue
+                            total_transforms_tried += 1
+                            result = executor.fire(
+                                url=url,
+                                param_name=param_name,
+                                payload=t15_text,
+                                all_params=flat_params,
+                                transform_name="tier15_mutation",
+                                sink_url=sink_url,
+                            )
+                            _ai_tried_payloads.append((t15_text, "tier15_mutation"))
+                            if result.confirmed:
+                                finding = _make_finding(
+                                    url=url,
+                                    probe_result=context_probe_result,
+                                    context_type=context_type,
+                                    result=result,
+                                    waf=waf_hint,
+                                    source="phase1_deterministic",
+                                    cloud_escalated=False,
+                                    ai_note="Tier 1.5 seed mutation confirmed.",
+                                )
+                                if _record_context_finding(finding) and len(context_variant_keys) >= context_hit_cap:
+                                    context_done = True
+                                    break
+                            else:
+                                _tier15_failed_payloads.append(t15_text)
+
+                # ── Local model triage gate — decides whether this injection point
                 # is worth cloud API spend. It does NOT generate payloads.
                 # In --fast mode or fast_omni context, triage is skipped and cloud always runs.
                 _triage_approved = True  # default when local model unavailable
                 if context_type != "fast_omni" and escalation_policy.use_local and not context_done and not _timed_out():
-                    local_model_rounds += 1
-                    _triage = _triage_with_local_model(
-                        probe_result=context_probe_result,
-                        model=model,
-                        waf=waf_hint,
-                        delivery_mode="get",
-                        fast_mode=mode in ("fast", "normal"),
-                    )
-                    _triage_approved = _triage.should_escalate
-                    _append_reason(escalation_reasons, f"[triage score={_triage.score}] {_triage.reason}")
-                    if _triage.context_notes:
-                        _append_reason(escalation_reasons, _triage.context_notes)
-                    if not _triage_approved:
-                        log.debug(
-                            "Triage gate: skipping cloud for %s param=%s (score=%d): %s",
-                            url, param_name, _triage.score, _triage.reason,
+                    # In deep mode: skip_triage bypasses the local model gate entirely.
+                    if mode == "deep" and skip_triage:
+                        _triage_approved = True
+                        _append_reason(escalation_reasons, "skip_triage=True — triage gate bypassed")
+                    else:
+                        local_model_rounds += 1
+                        _triage = _triage_with_local_model(
+                            probe_result=context_probe_result,
+                            model=model,
+                            waf=waf_hint,
+                            delivery_mode="get",
+                            fast_mode=mode in ("fast", "normal"),
                         )
+                        _triage_approved = _triage.should_escalate
+                        _append_reason(escalation_reasons, f"[triage score={_triage.score}] {_triage.reason}")
+                        if _triage.context_notes:
+                            _append_reason(escalation_reasons, _triage.context_notes)
+                        if not _triage_approved:
+                            log.debug(
+                                "Triage gate: skipping cloud for %s param=%s (score=%d): %s",
+                                url, param_name, _triage.score, _triage.reason,
+                            )
 
                 # Cloud model generates payloads — gated by local triage verdict.
                 if not context_done and _triage_approved and use_cloud and not _timed_out():
@@ -1377,6 +1543,40 @@ def _run(
                         # Skip the normal attempt loop for fast_omni
                         continue  # next (param_name, context_type, variants) tuple
 
+                    # ── Step 3.9: Build blocked_on failure set for deep Tier 3 ──
+                    # Assemble which chars blocked each failed Tier 1/1.5 payload so
+                    # the cloud mutation prompt knows what to avoid.
+                    _deep_strategy_hint: str | None = None
+                    if mode == "deep" and (_tier1_failed_payloads or _tier15_failed_payloads):
+                        _all_failed_strs = _tier1_failed_payloads + _tier15_failed_payloads
+                        _probe_surviving = frozenset().union(
+                            *(ctx.surviving_chars for ctx in context_probe_result.reflections
+                              if getattr(ctx, "surviving_chars", None))
+                        ) if context_probe_result.reflections else frozenset()
+                        _all_failed = [
+                            {"payload": p, "blocked_on": _blocked_on_char(p, _probe_surviving)}
+                            for p in _all_failed_strs
+                        ]
+                        # Sort: payloads with a known blocker first, then by payload string
+                        _all_failed.sort(key=lambda x: (x["blocked_on"] is None, x["payload"]))
+                        _top5 = _all_failed[:5]
+                        _hint_parts = [
+                            "Tier1/Tier1.5 payloads already tried and failed:"
+                        ]
+                        for _fentry in _top5:
+                            _blocker = _fentry["blocked_on"]
+                            _blocker_note = f" (blocked on {_blocker!r})" if _blocker else ""
+                            _hint_parts.append(f"  {_fentry['payload']!r}{_blocker_note}")
+                        _hint_parts.append(
+                            "Mutate aggressively; avoid characters that are blocked. "
+                            "Use encoding bypasses, alternative syntax, or different handler strategies."
+                        )
+                        _deep_strategy_hint = "\n".join(_hint_parts)
+                        log.debug(
+                            "Deep Tier 3 hint built: %d failed payloads, top5=%r",
+                            len(_all_failed), [e["payload"][:20] for e in _top5],
+                        )
+
                     for attempt_number in range(1, attempt_limit + 1):
                         if _timed_out():
                             break
@@ -1401,6 +1601,7 @@ def _run(
                             feedback_lessons=cloud_feedback_lessons,
                             phase_profile=phase_profile,
                             deep=mode == "deep",
+                            strategy_hint=_deep_strategy_hint,
                         ))
                         cloud_payloads, duplicate_payloads = _unique_new_payloads(
                             cloud_plan.payloads,
