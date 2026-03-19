@@ -569,7 +569,6 @@ def payloads_for_context(
     *,
     param_name: str = "_p",
     attr_name: str = "href",
-    quote_char: str = '"',
     context_before: str = "",
 ) -> "list[PayloadCandidate]":
     """Return context-specific PayloadCandidate list for Tier 1 of the pipeline.
@@ -593,7 +592,9 @@ def payloads_for_context(
     else:
         chars = surviving_chars
 
-    if base in ("html_body", "html_comment"):
+    if base == "html_comment":
+        return html_comment_payloads(chars, param_name)
+    if base == "html_body":
         return html_body_payloads(chars, param_name)
     if base == "html_attr_url":
         return html_attr_url_payloads(chars, param_name, attr_name)
@@ -658,12 +659,20 @@ def mutate_seeds(
         for sub in ("/", "%09", "%0a", "%0d", "/**/"):
             _add(seed.replace(" ", sub))
 
-        # Transform 3: encoding variants on 'alert' token
+        # Transform 3: encoding variants on JS expression tokens
         for target, encoded in (
             ("alert", "&#97;&#108;&#101;&#114;&#116;"),
             ("alert", "%61%6c%65%72%74"),
             ("alert", "\\x61lert"),
             ("alert", "\\u0061lert"),
+            ("confirm", "&#99;&#111;&#110;&#102;&#105;&#114;&#109;"),
+            ("confirm", "%63%6f%6e%66%69%72%6d"),
+            ("confirm", "\\x63onfirm"),
+            ("confirm", "\\u0063onfirm"),
+            ("prompt", "&#112;&#114;&#111;&#109;&#112;&#116;"),
+            ("prompt", "%70%72%6f%6d%70%74"),
+            ("prompt", "\\x70rompt"),
+            ("prompt", "\\u0070rompt"),
         ):
             if target in seed:
                 _add(seed.replace(target, encoded, 1))

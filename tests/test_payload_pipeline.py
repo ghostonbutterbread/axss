@@ -1,5 +1,4 @@
 from __future__ import annotations
-import pytest
 from ai_xss_generator.active.generator import payloads_for_context, mutate_seeds
 
 
