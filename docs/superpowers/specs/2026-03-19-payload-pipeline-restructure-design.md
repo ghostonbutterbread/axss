@@ -49,18 +49,21 @@ Two debug flags are added to help users validate and bypass the local triage gat
 - If any payload confirms execution → `ConfirmedFinding(source="phase1_deterministic")`, pipeline stops
 
 **Normal mode:** Tier 1 proceeds to Tier 1.5 if deterministic misses.
-**Deep mode:** Tier 1 proceeds to local triage if deterministic misses.
+**Deep mode:** Tier 1 proceeds to Tier 1.5 if deterministic misses.
 
 ### Tier 1.5 — Programmatic Seed Mutation (Normal + Deep)
 
 GenXSS-style systematic transforms applied to the top Tier 1 seeds. Free, fast,
 no API cost. Runs before any cloud call.
 
-**Seed selection:** Before firing Tier 1, a single lightweight HTTP reflection
-check (reusing `_http_reflects_payload()`) identifies which Tier 1 payloads have
-at least partial reflection in the response body. Payloads with partial reflection
-rank highest as seeds — they got furthest through the filter. Payloads with no
-reflection at all rank lowest.
+**Seed selection:** After generating Tier 1 candidates with `payloads_for_context()`,
+a lightweight HTTP check (reusing `_http_reflects_payload()`) fires each candidate
+via curl_cffi and checks whether the full payload string appears in the response
+body. This is a binary "reflects / does not reflect" check — not partial substring
+analysis. Payloads that reflect rank above those that don't; within each group,
+`risk_score` is the tiebreaker. The top 3 ranked payloads become seeds for Tier 1.5
+and for the cloud prompt. Payloads that don't reflect are still fired via Playwright
+in Tier 1 (a WAF may block curl but allow the browser), but rank lower as seeds.
 
 **Transforms applied to each seed (in order):**
 1. `random_upper()` — randomize case on tag names and event handler names
@@ -77,7 +80,7 @@ reflection at all rank lowest.
 both are deterministic, non-AI paths).
 
 **Normal mode:** Proceeds to Tier 3 cloud if Tier 1.5 misses.
-**Deep mode:** Proceeds to local triage if Tier 1.5 misses.
+**Deep mode:** Proceeds to Tier 2 local triage if Tier 1.5 misses.
 
 ### Tier 2 — Local Triage Gate (Deep only)
 
@@ -102,20 +105,22 @@ generation moves entirely to per-param scout calls in `worker.py`.
 ```
 Parser-detected context_type
         ↓
-HTTP reflection check on Tier 1 candidates (reuse _http_reflects_payload)
-→ rank seeds by partial reflection (most surviving fragments = best seed)
+payloads_for_context(context_type, surviving_chars=None)
+→ generate full Tier 1 candidate list
         ↓
-[Tier 1] payloads_for_context(context_type, surviving_chars=None)
-         fire top seeds via executor
+HTTP reflection pre-rank: _http_reflects_payload() per candidate (curl_cffi)
+→ reflects=True ranks above reflects=False; risk_score breaks ties
+→ top 3 become seeds
+        ↓
+[Tier 1] fire all Tier 1 candidates via executor (ranked order)
         ↓ hit → ConfirmedFinding(source="phase1_deterministic"), done
         ↓ miss
-[Tier 1.5] Programmatic mutations of best seeds
+[Tier 1.5] mutate_seeds(top_3_seeds, surviving_chars=None)
            (case, encoding, space, handler rotation — up to 15 variants)
            fire via executor
         ↓ hit → ConfirmedFinding(source="phase1_deterministic"), done
         ↓ miss
-[Tier 3] generate_normal_scout(context_type, waf, frameworks, seeds) → 3 payloads
-         input: top 3 seeds that came closest + context
+[Tier 3] generate_normal_scout(context_type, waf, frameworks, seeds=top_3) → 3 payloads
          instruction: seed mutation, encoding-heavy, assume angle brackets blocked
          fire via executor
         ↓ hit → ConfirmedFinding(source="cloud_model"), done
@@ -273,10 +278,12 @@ character is used as the `blocked_on` value. `null` means no blocked character
 was identified in the payload — the failure was not char-based (e.g. WAF pattern
 match or sanitizer stripping the whole construct).
 
-**Failure ranking:** Top 5 from Tier 1 ranked by fewest blocked chars
-(payloads that came closest to clearing the filter rank highest). Payloads with
-`blocked_on=null` rank below those with an identified blocker since the failure
-reason is less actionable for mutation.
+**Failure ranking:** Top 5 from the combined Tier 1 + Tier 1.5 failure pool,
+ranked by fewest blocked chars (payloads that came closest to clearing the filter
+rank highest). Tier 1.5 mutations are preferred over raw Tier 1 seeds when both
+failed — they are already partially mutated and represent more actionable starting
+points. Payloads with `blocked_on=null` rank below those with an identified
+blocker since the failure reason is less actionable for mutation.
 
 **Output:** 8 payloads, fired in confidence order.
 
@@ -287,7 +294,7 @@ reason is less actionable for mutation.
 ### `axss scan --skip-triage` (deep mode only)
 
 - Bypasses the local model triage gate
-- After Tier 1 miss → goes directly to Tier 3 cloud mutation
+- After Tier 1 + Tier 1.5 miss → goes directly to Tier 3 cloud mutation
 - Use case: local model unavailable, slow, or producing unreliable decisions
 - No-op in fast and normal mode
 
@@ -323,7 +330,7 @@ reason is less actionable for mutation.
 |------|--------|
 | `ai_xss_generator/active/generator.py` | Add `payloads_for_context(context_type, surviving_chars)` dispatch function; add `mutate_seeds(seeds, surviving_chars)` for Tier 1.5 programmatic mutations |
 | `ai_xss_generator/active/worker.py` | Wire Tier 1 + Tier 1.5 for normal + deep; HTTP reflection pre-check for seed ranking (normal mode); drop `snippet`/`param_name` from `_triage_with_local_model`; add `skip_triage` path; assemble `blocked_on` for failure set |
-| `ai_xss_generator/models.py` | Add `generate_normal_scout(context_type: str, waf: str \| None, frameworks: list[str]) -> list[str]`; restructure deep cloud prompt to mutation framing; drop `reflection_snippet` and `param_name` from `triage_probe_result()` signature |
+| `ai_xss_generator/models.py` | Add `generate_normal_scout(context_type: str, waf: str \| None, frameworks: list[str], seeds: list[str]) -> list[str]`; restructure deep cloud prompt to mutation framing; drop `reflection_snippet` and `param_name` from `triage_probe_result()` signature |
 | `ai_xss_generator/active/orchestrator.py` | Add `skip_triage: bool = False` to `ActiveScanConfig`; pass through to worker kwargs; remove `generate_fast_batch` from `mode == "normal"` path (retain for `mode == "fast"` only) |
 | `ai_xss_generator/active/reporter.py` | Add `"phase1_deterministic"` to source-label display mapping |
 | `ai_xss_generator/cli.py` | Add `--skip-triage` to `axss scan`; add `--test-triage` to `axss models` |
