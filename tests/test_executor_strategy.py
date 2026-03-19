@@ -1,7 +1,101 @@
 from __future__ import annotations
 
-from ai_xss_generator.active.executor import _build_delivery_plan, _build_post_delivery_plan
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from ai_xss_generator.active.executor import (
+    _build_delivery_plan,
+    _build_post_delivery_plan,
+    _http_reflects_payload,
+    ActiveExecutor,
+)
 from ai_xss_generator.types import PayloadCandidate, StrategyProfile
+
+
+class TestHttpReflectsPayload:
+    def test_returns_false_when_payload_absent(self):
+        """Payload not in response body → returns False (skip Playwright)."""
+        with patch("ai_xss_generator.active.executor.FetcherSession") as MockFS:
+            mock_session = MagicMock()
+            mock_response = MagicMock()
+            mock_response.text = "<html>no match here</html>"
+            mock_response.status_code = 200
+            mock_session.__enter__ = MagicMock(return_value=mock_session)
+            mock_session.__exit__ = MagicMock(return_value=False)
+            mock_session.get.return_value = mock_response
+            MockFS.return_value = mock_session
+
+            result = _http_reflects_payload(
+                "http://example.com/?q=xss",
+                payload="<script>alert(1)</script>",
+                auth_headers={},
+            )
+            assert result is False
+
+    def test_returns_true_when_html_encoded_payload_reflects(self):
+        """HTML-encoded reflection (&lt;script&gt;) must still be detected."""
+        with patch("ai_xss_generator.active.executor.FetcherSession") as MockFS:
+            mock_session = MagicMock()
+            mock_response = MagicMock()
+            mock_response.text = "<html>value: &lt;script&gt;alert(1)&lt;/script&gt;</html>"
+            mock_response.status_code = 200
+            mock_session.__enter__ = MagicMock(return_value=mock_session)
+            mock_session.__exit__ = MagicMock(return_value=False)
+            mock_session.get.return_value = mock_response
+            MockFS.return_value = mock_session
+
+            result = _http_reflects_payload(
+                "http://example.com/?q=xss",
+                payload="<script>alert(1)</script>",
+                auth_headers={},
+            )
+            assert result is True
+
+    def test_returns_none_on_waf_challenge_response(self):
+        """WAF JS-challenge response (403 + challenge body) → None (go to Playwright)."""
+        with patch("ai_xss_generator.active.executor.FetcherSession") as MockFS:
+            mock_session = MagicMock()
+            mock_response = MagicMock()
+            mock_response.text = "attention required! | cloudflare __cf_chl_ challenge"
+            mock_response.status_code = 403
+            mock_session.__enter__ = MagicMock(return_value=mock_session)
+            mock_session.__exit__ = MagicMock(return_value=False)
+            mock_session.get.return_value = mock_response
+            MockFS.return_value = mock_session
+
+            result = _http_reflects_payload(
+                "http://example.com/?q=xss",
+                payload="<script>",
+                auth_headers={},
+            )
+            assert result is None  # None = needs Playwright
+
+    def test_returns_none_on_curl_blocking_error(self):
+        """curl_cffi blocking error → None (go to Playwright)."""
+        with patch("ai_xss_generator.active.executor.FetcherSession") as MockFS:
+            mock_session = MagicMock()
+            mock_session.__enter__ = MagicMock(return_value=mock_session)
+            mock_session.__exit__ = MagicMock(return_value=False)
+            mock_session.get.side_effect = Exception("curl error (92) HTTP/2 stream error")
+            MockFS.return_value = mock_session
+
+            result = _http_reflects_payload(
+                "http://example.com/?q=xss",
+                payload="<script>",
+                auth_headers={},
+            )
+            assert result is None
+
+
+class TestActiveExecutorFastMode:
+    def test_executor_accepts_mode_param(self):
+        executor = ActiveExecutor(mode="fast")
+        assert executor._mode == "fast"
+
+    def test_executor_default_mode_is_normal(self):
+        executor = ActiveExecutor()
+        assert executor._mode == "normal"
 
 
 def test_build_delivery_plan_uses_fragment_strategy_hint() -> None:

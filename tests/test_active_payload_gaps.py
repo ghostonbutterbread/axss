@@ -270,7 +270,7 @@ def test_get_worker_runs_coordinated_split_payload_fallback_for_reflected_only_p
     results: list[WorkerResult] = []
 
     class FakeExecutor:
-        def __init__(self, auth_headers=None) -> None:
+        def __init__(self, auth_headers=None, mode="normal") -> None:
             pass
 
         def start(self) -> None:

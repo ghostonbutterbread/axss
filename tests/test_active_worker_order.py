@@ -112,7 +112,7 @@ def test_get_worker_runs_local_model_per_context_before_any_fallback():
     results: list[WorkerResult] = []
 
     class FakeExecutor:
-        def __init__(self, auth_headers=None) -> None:
+        def __init__(self, auth_headers=None, mode="normal") -> None:
             pass
 
         def start(self) -> None:
@@ -198,7 +198,7 @@ def test_get_worker_retries_cloud_with_feedback_before_fallback():
     results: list[WorkerResult] = []
 
     class FakeExecutor:
-        def __init__(self, auth_headers=None) -> None:
+        def __init__(self, auth_headers=None, mode="normal") -> None:
             pass
 
         def start(self) -> None:
@@ -281,7 +281,7 @@ def test_get_worker_keep_searching_collects_multiple_distinct_local_variants():
     fire_calls: list[str] = []
 
     class FakeExecutor:
-        def __init__(self, auth_headers=None) -> None:
+        def __init__(self, auth_headers=None, mode="normal") -> None:
             pass
 
         def start(self) -> None:
@@ -362,7 +362,7 @@ def test_get_worker_uses_deterministic_fallback_only_after_local_and_cloud_fail(
     results: list[WorkerResult] = []
 
     class FakeExecutor:
-        def __init__(self, auth_headers=None) -> None:
+        def __init__(self, auth_headers=None, mode="normal") -> None:
             pass
 
         def start(self) -> None:
@@ -445,7 +445,7 @@ def test_get_worker_skips_local_on_high_friction_hard_context_and_uses_cloud() -
     results: list[WorkerResult] = []
 
     class FakeExecutor:
-        def __init__(self, auth_headers=None) -> None:
+        def __init__(self, auth_headers=None, mode="normal") -> None:
             pass
 
         def start(self) -> None:
@@ -565,7 +565,7 @@ def test_get_worker_forwards_payload_candidate_strategy_to_executor() -> None:
     results: list[WorkerResult] = []
 
     class FakeExecutor:
-        def __init__(self, auth_headers=None) -> None:
+        def __init__(self, auth_headers=None, mode="normal") -> None:
             pass
 
         def start(self) -> None:
@@ -1028,7 +1028,7 @@ def test_post_worker_runs_local_model_per_context_before_any_fallback():
     results: list[WorkerResult] = []
 
     class FakeExecutor:
-        def __init__(self, auth_headers=None) -> None:
+        def __init__(self, auth_headers=None, mode="normal") -> None:
             pass
 
         def start(self) -> None:
@@ -1120,7 +1120,7 @@ def test_post_worker_retries_cloud_with_feedback_before_fallback():
     results: list[WorkerResult] = []
 
     class FakeExecutor:
-        def __init__(self, auth_headers=None) -> None:
+        def __init__(self, auth_headers=None, mode="normal") -> None:
             pass
 
         def start(self) -> None:
@@ -1209,7 +1209,7 @@ def test_post_worker_uses_deterministic_fallback_only_after_local_and_cloud_fail
     results: list[WorkerResult] = []
 
     class FakeExecutor:
-        def __init__(self, auth_headers=None) -> None:
+        def __init__(self, auth_headers=None, mode="normal") -> None:
             pass
 
         def start(self) -> None:
@@ -1322,7 +1322,7 @@ def test_post_worker_uses_discovered_sink_context_for_generation_and_follow_up()
     results: list[WorkerResult] = []
 
     class FakeExecutor:
-        def __init__(self, auth_headers=None) -> None:
+        def __init__(self, auth_headers=None, mode="normal") -> None:
             pass
 
         def start(self) -> None:

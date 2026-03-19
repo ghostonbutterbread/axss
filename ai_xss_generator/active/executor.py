@@ -63,6 +63,80 @@ _BEACON_HOST = "axss.internal.confirm"
 # Per-payload navigation timeout in milliseconds
 _NAV_TIMEOUT_MS = 8_000
 
+# ---------------------------------------------------------------------------
+# Fast-mode HTTP pre-filter helpers
+# ---------------------------------------------------------------------------
+
+# JS-challenge body markers from known WAFs — if any appear, curl result is untrustworthy
+_CHALLENGE_BODY_MARKERS: tuple[str, ...] = (
+    "__cf_chl_",               # Cloudflare
+    "ray id:",                 # Cloudflare
+    "akamaighost",             # Akamai
+    "reference #",             # Akamai
+    "_incap_ses_",             # Imperva
+    "incapsula incident id",
+    "datadome",
+    "kasada",
+)
+
+_BLOCKING_CURL_CODES = ("(92)", "(28)")  # CURLE_HTTP2_STREAM, CURLE_OPERATION_TIMEDOUT
+
+try:
+    from scrapling.fetchers import FetcherSession
+except ImportError:  # scrapling not installed in test environments
+    FetcherSession = None  # type: ignore[assignment,misc]
+
+
+def _http_reflects_payload(
+    url: str,
+    payload: str,
+    auth_headers: dict[str, str],
+) -> "bool | None":
+    """Fire *payload* at *url* via curl_cffi and check if it reflects.
+
+    Returns:
+        True  — payload found in decoded response body (proceed to Playwright)
+        False — no reflection found (skip Playwright for this param+payload)
+        None  — WAF block or curl error (fall back to Playwright regardless)
+    """
+    import html as _html
+    import urllib.parse as _up
+
+    _FetcherSession = FetcherSession
+    if _FetcherSession is None:
+        try:
+            from scrapling.fetchers import FetcherSession as _FS
+            _FetcherSession = _FS
+        except ImportError:
+            return None  # scrapling unavailable — fall back to Playwright
+
+    try:
+        with _FetcherSession(
+            impersonate="chrome",
+            stealthy_headers=True,
+            timeout=10,
+            follow_redirects=True,
+            retries=0,
+        ) as session:
+            resp = session.get(url, headers={**auth_headers, "User-Agent": "Mozilla/5.0"})
+            body = getattr(resp, "text", None) or ""
+            # status is available as resp.status_code or resp.status
+            body_lower = body.lower()
+
+            # Check for WAF JS-challenge body markers
+            if any(marker in body_lower for marker in _CHALLENGE_BODY_MARKERS):
+                return None  # WAF — Playwright fallback
+
+            # Decode before matching: server may HTML-encode or URL-encode the reflection
+            decoded = _html.unescape(_up.unquote(body))
+            return payload in decoded
+
+    except Exception as exc:
+        exc_str = str(exc)
+        if any(code in exc_str for code in _BLOCKING_CURL_CODES):
+            return None  # blocking WAF error — Playwright fallback
+        return None  # any other curl failure — safe to fall back
+
 
 @dataclass(slots=True)
 class ExecutionResult:
@@ -216,11 +290,17 @@ class ActiveExecutor:
             executor.stop()
     """
 
-    def __init__(self, auth_headers: dict[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        auth_headers: dict[str, str] | None = None,
+        mode: str = "normal",
+    ) -> None:
         self._pw = None
         self._browser = None
         self._started = False
         self._auth_headers: dict[str, str] = auth_headers or {}
+        self._mode = mode
+        self._waf_detected = False  # set True on first WAF block; skips curl for remaining fire() calls
 
     def start(self) -> None:
         from playwright.sync_api import sync_playwright
@@ -303,6 +383,31 @@ class ActiveExecutor:
         fired_url = plan.fired_url
         planned_modes = _planned_delivery_modes(plan, base_mode="get")
         preflight_attempted = bool(plan.preflight_urls)
+
+        # Fast mode: HTTP pre-filter — skip Playwright if payload doesn't reflect via curl_cffi.
+        # If a WAF block was already detected in this executor session, skip curl and use Playwright.
+        if self._mode == "fast" and not self._waf_detected:
+            reflects = _http_reflects_payload(
+                fired_url,
+                payload=payload,
+                auth_headers=self._auth_headers,
+            )
+            if reflects is False:
+                # Definitely doesn't reflect — skip browser entirely for this attempt
+                return ExecutionResult(
+                    confirmed=False,
+                    method="",
+                    detail="pre-filter: no HTTP reflection",
+                    transform_name=transform_name,
+                    payload=payload,
+                    param_name=param_name,
+                    fired_url=fired_url,
+                    actual_url="",
+                )
+            if reflects is None:
+                # WAF detected — mark executor so remaining fire() calls skip curl
+                self._waf_detected = True
+            # reflects is True or WAF detected — fall through to Playwright
 
         confirmed = False
         method = ""

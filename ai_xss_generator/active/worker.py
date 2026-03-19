@@ -1201,7 +1201,7 @@ def _run(
 
     # ── Step 5: Start Playwright executor (shared for all payload attempts) ──
     from ai_xss_generator.active.executor import ActiveExecutor
-    executor = ActiveExecutor(auth_headers=auth_headers)
+    executor = ActiveExecutor(auth_headers=auth_headers, mode=mode)
     try:
         executor.start()
     except Exception as exc:
@@ -3567,7 +3567,7 @@ def _run_post(
             pass
 
     # Start Playwright executor
-    executor = ActiveExecutor(auth_headers=auth_headers)
+    executor = ActiveExecutor(auth_headers=auth_headers, mode=mode)
     try:
         executor.start()
     except Exception as exc:
