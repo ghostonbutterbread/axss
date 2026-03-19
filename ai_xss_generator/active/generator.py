@@ -557,3 +557,136 @@ def html_attr_event_payloads(
         ))
 
     return candidates
+
+
+# ---------------------------------------------------------------------------
+# Pipeline dispatch — unified entry point for Tier 1
+# ---------------------------------------------------------------------------
+
+def payloads_for_context(
+    context_type: str,
+    surviving_chars: "frozenset[str] | None",
+    *,
+    param_name: str = "_p",
+    attr_name: str = "href",
+    quote_char: str = '"',
+    context_before: str = "",
+) -> "list[PayloadCandidate]":
+    """Return context-specific PayloadCandidate list for Tier 1 of the pipeline.
+
+    Routes to the correct existing generator based on *context_type*.
+
+    *surviving_chars* is ``None`` in normal mode (no probe — bypass filtering,
+    return full candidate list). Deep mode passes a ``frozenset`` from the probe.
+
+    Unknown context types return an empty list (no error).
+    """
+    # Normalise: strip trailing subcontext detail (e.g. "html_body:div" → "html_body")
+    base = (context_type or "").strip().lower().split(":")[0]
+
+    # When surviving_chars is None, pass an all-permissive frozenset to existing
+    # generators so their internal char-filtering is bypassed.
+    chars: frozenset[str]
+    if surviving_chars is None:
+        # Include all chars the generators check for
+        chars = frozenset("<>\"'`/=;:(){}[]\\-+*&^%$#@!?., \t\n")
+    else:
+        chars = surviving_chars
+
+    if base in ("html_body", "html_comment"):
+        return html_body_payloads(chars, param_name)
+    if base == "html_attr_url":
+        return html_attr_url_payloads(chars, param_name, attr_name)
+    if base == "html_attr_value":
+        return html_attr_value_payloads(chars, param_name, attr_name)
+    if base in ("js_string_dq", "js_string_sq", "js_string_bt", "js_string"):
+        qc = '"' if "dq" in base else ("'" if "sq" in base else "`")
+        return js_string_payloads(chars, param_name, qc, context_before, base)
+    if base == "js_code":
+        return js_code_payloads(chars, param_name, context_before)
+    if base in ("html_attr_event", "html_attr_event_value"):
+        return html_attr_event_payloads(chars, param_name, attr_name)
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Seed mutation — Tier 1.5 GenXSS-style systematic transforms
+# ---------------------------------------------------------------------------
+
+def mutate_seeds(
+    seeds: "list[str]",
+    surviving_chars: "frozenset[str] | None",
+) -> "list[str]":
+    """Apply GenXSS-style systematic transforms to *seeds* and return deduplicated mutations.
+
+    Returns up to 15 mutation strings. The original seed strings are NOT included
+    in the output — only transformed variants. When *surviving_chars* is not None,
+    mutations that introduce a character not in the set are skipped.
+
+    Transforms applied (in order):
+    1. random_upper() — case randomisation on the full payload string
+    2. Space replacement — substitute space with /  %09  %0a  %0d  /**/
+    3. Encoding variants on JS expression tokens — HTML entity, URL, hex, unicode
+    4. Event handler rotation — swap onerror/ontoggle/onpointerenter/onfocus
+    5. Quote style variants — swap " for ' or none where applicable
+    """
+    import re as _re
+
+    def _chars_ok(s: str) -> bool:
+        if surviving_chars is None:
+            return True
+        return all(c in surviving_chars for c in s)
+
+    seen: set[str] = set(seeds)
+    results: list[str] = []
+
+    def _add(s: str) -> None:
+        if s and s not in seen and len(results) < 15:
+            if _chars_ok(s):
+                seen.add(s)
+                results.append(s)
+
+    for seed in seeds:
+        if not seed:
+            continue
+
+        # Transform 1: case randomisation (3 variants per seed)
+        for _ in range(3):
+            _add(random_upper(seed))
+
+        # Transform 2: space replacement
+        for sub in ("/", "%09", "%0a", "%0d", "/**/"):
+            _add(seed.replace(" ", sub))
+
+        # Transform 3: encoding variants on 'alert' token
+        for target, encoded in (
+            ("alert", "&#97;&#108;&#101;&#114;&#116;"),
+            ("alert", "%61%6c%65%72%74"),
+            ("alert", "\\x61lert"),
+            ("alert", "\\u0061lert"),
+        ):
+            if target in seed:
+                _add(seed.replace(target, encoded, 1))
+
+        # Transform 4: event handler rotation
+        for old, new in (
+            ("onerror", "ontoggle"),
+            ("onerror", "onpointerenter"),
+            ("ontoggle", "onerror"),
+            ("ontoggle", "onpointerenter"),
+            ("onmouseover", "onpointerenter"),
+            ("onmouseover", "onfocus"),
+        ):
+            if old in seed.lower():
+                _add(_re.sub(_re.escape(old), new, seed, flags=_re.IGNORECASE))
+
+        # Transform 5: quote style swap
+        if '"' in seed:
+            _add(seed.replace('"', "'"))
+        elif "'" in seed:
+            _add(seed.replace("'", '"'))
+
+        if len(results) >= 15:
+            break
+
+    return results
