@@ -93,3 +93,60 @@ class TestMutateSeeds:
         seed = "javascript:alert(1)"
         results = mutate_seeds([seed], None)
         assert seed not in results
+
+
+class TestGenerateNormalScout:
+    def test_signature_accepts_seeds(self):
+        """generate_normal_scout must accept a seeds parameter."""
+        import inspect
+        from ai_xss_generator.models import generate_normal_scout
+        sig = inspect.signature(generate_normal_scout)
+        assert "seeds" in sig.parameters
+
+    def test_signature(self):
+        import inspect
+        from ai_xss_generator.models import generate_normal_scout
+        sig = inspect.signature(generate_normal_scout)
+        params = list(sig.parameters.keys())
+        assert "context_type" in params
+        assert "waf" in params
+        assert "frameworks" in params
+        assert "seeds" in params
+
+    def test_returns_list(self):
+        """generate_normal_scout returns list[str] even when model unavailable."""
+        from ai_xss_generator.models import generate_normal_scout
+        # Should return empty list gracefully when no model configured, not raise
+        result = generate_normal_scout(
+            context_type="html_attr_url",
+            waf=None,
+            frameworks=[],
+            seeds=["javascript:alert(1)"],
+            model="__nonexistent_model__",
+        )
+        assert isinstance(result, list)
+
+
+class TestTriageProbeResultSignature:
+    def test_no_reflection_snippet_param(self):
+        """triage_probe_result must NOT accept reflection_snippet."""
+        import inspect
+        from ai_xss_generator.models import triage_probe_result
+        sig = inspect.signature(triage_probe_result)
+        assert "reflection_snippet" not in sig.parameters
+
+    def test_no_param_name_param(self):
+        """triage_probe_result must NOT accept param_name."""
+        import inspect
+        from ai_xss_generator.models import triage_probe_result
+        sig = inspect.signature(triage_probe_result)
+        assert "param_name" not in sig.parameters
+
+    def test_required_params_present(self):
+        import inspect
+        from ai_xss_generator.models import triage_probe_result
+        sig = inspect.signature(triage_probe_result)
+        assert "context_type" in sig.parameters
+        assert "surviving_chars" in sig.parameters
+        assert "waf" in sig.parameters
+        assert "delivery_mode" in sig.parameters

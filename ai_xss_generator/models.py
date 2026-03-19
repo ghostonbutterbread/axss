@@ -1943,10 +1943,8 @@ def _generate_dom_local_with_ollama(
 
 def triage_probe_result(
     *,
-    param_name: str,
     context_type: str,
     surviving_chars: str,
-    reflection_snippet: str,
     waf: str | None,
     delivery_mode: str,
     model: str,
@@ -1973,31 +1971,19 @@ def triage_probe_result(
             "context_notes": "",
         }
 
-    waf_line = f"WAF detected: {waf}" if waf else "No WAF detected"
-    prompt = (
-        "You are a security analyst triaging web parameter injection points for XSS.\n"
-        "Analyze the probe result below and decide if it is worth spending cloud AI budget on.\n\n"
-        f"Parameter: {param_name}\n"
-        f"Delivery: {delivery_mode}\n"
-        f"Injection context: {context_type}\n"
-        f"Surviving chars (passed the filter unmodified): {surviving_chars or 'unknown'}\n"
-        f"Reflection snippet (how input appeared in the response):\n{reflection_snippet or '(not available)'}\n"
-        f"{waf_line}\n\n"
-        "Scoring guide:\n"
-        "  9-10 = Script/JS context with unfiltered quotes/parens, or unencoded attr with event handler potential\n"
-        "  7-8  = HTML context with surviving angle-brackets or attr context with one quote type surviving\n"
-        "  5-6  = Partial filter, some hope with obfuscation or encoding tricks\n"
-        "  3-4  = Heavy encoding/stripping but maybe a niche vector exists\n"
-        "  1-2  = Fully sanitised, no viable XSS path\n\n"
-        "Return ONLY valid JSON, no markdown:\n"
-        '{"score": <1-10>, "should_escalate": <true|false>, '
-        '"reason": "<one sentence>", "context_notes": "<hints for payload generator>"}'
-    )
+    prompt_data = {
+        "context_type": context_type,
+        "surviving_chars": list(surviving_chars) if surviving_chars else [],
+        "waf": waf or None,
+        "delivery_mode": delivery_mode,
+    }
+    system = "You are a triage gate for an XSS scanner. Given a reflection context, score its XSS potential 1-10 and decide if cloud API spend is justified. Reply only with valid JSON: score, should_escalate, reason."
+    user = json.dumps(prompt_data)
 
     try:
         response = requests.post(
             f"{OLLAMA_BASE_URL}/api/generate",
-            json={"model": resolved_model, "prompt": prompt, "stream": False},
+            json={"model": resolved_model, "prompt": f"{system}\n\n{user}", "stream": False},
             timeout=max(1, request_timeout_seconds),
         )
         response.raise_for_status()
@@ -2012,7 +1998,7 @@ def triage_probe_result(
             "context_notes": str(data.get("context_notes", "")),
         }
     except Exception as exc:
-        log.debug("Local triage error for param=%s: %s — defaulting to escalate", param_name, exc)
+        log.debug("Local triage error: %s — defaulting to escalate", exc)
         return {
             "score": 5,
             "should_escalate": True,
@@ -3043,4 +3029,125 @@ def generate_fast_batch(
             log.warning("OpenAI fast batch failed: %s", exc)
 
     log.error("Fast batch generation failed — no API key available or all backends failed")
+    return []
+
+
+def generate_normal_scout(
+    context_type: str,
+    waf: str | None,
+    frameworks: list[str],
+    seeds: list[str],
+    *,
+    model: str = "",
+    ai_backend: str = "api",
+    cli_tool: str = "claude",
+    cli_model: str | None = None,
+    timeout: int = 30,
+) -> list[str]:
+    """Lightweight cloud scout for normal mode — seed mutation, not cold generation.
+
+    Sends top seeds from Tier 1 to the cloud with instruction to mutate using
+    creative encoding. Returns up to 3 payload strings. Returns [] on any error
+    so the caller can fall through gracefully.
+
+    The cloud prompt instructs seed mutation (encoding-heavy, assume angle brackets
+    blocked) rather than cold generation. This is the Tier 3 normal mode call.
+    """
+    if not seeds:
+        return []
+
+    seed_list = "\n".join(f"- {s}" for s in seeds[:3])
+    frameworks_str = ", ".join(frameworks[:3]) if frameworks else "unknown"
+    waf_str = waf or "none detected"
+
+    prompt = (
+        f"Context: {context_type}\n"
+        f"WAF: {waf_str}\n"
+        f"Frameworks: {frameworks_str}\n"
+        f"Seed payloads (had partial reflection, did not execute):\n{seed_list}\n\n"
+        "These seed payloads had partial reflection but did not execute. "
+        "Mutate them with creative encoding: multi-layer entity encoding, mixed encoding schemes, "
+        "whitespace/null-byte injection, unicode normalization tricks, scheme fragmentation. "
+        "Assume angle brackets are filtered. Generate 3 novel mutations. "
+        'Return ONLY a valid JSON array of payload strings, e.g. ["payload1","payload2","payload3"]'
+    )
+
+    system_msg = (
+        "You are an expert offensive-security researcher specialising in XSS. "
+        "Return strict JSON only — no markdown, no commentary outside the JSON array."
+    )
+
+    resolved_model = model or OPENAI_FALLBACK_MODEL
+
+    # CLI backend path
+    if ai_backend == "cli":
+        try:
+            from ai_xss_generator.cli_runner import generate_via_cli_with_tool
+            raw, _used_tool = generate_via_cli_with_tool(
+                cli_tool,
+                prompt,
+                model=cli_model or None,
+                timeout_seconds=timeout,
+            )
+            import json as _json
+            text = raw.strip()
+            if text.startswith("```"):
+                text = text.split("```")[1].lstrip("json").strip()
+            parsed = _json.loads(text)
+            if isinstance(parsed, list):
+                return [str(p).strip() for p in parsed if str(p).strip()][:3]
+        except Exception as exc:
+            log.debug("generate_normal_scout CLI error: %s", exc)
+        return []
+
+    # API backend path — try OpenRouter then OpenAI
+    from ai_xss_generator.config import load_api_key
+
+    def _call_scout_api(base_url: str, api_key: str, mdl: str) -> list[str]:
+        headers: dict[str, str] = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        if "openrouter" in base_url:
+            headers["HTTP-Referer"] = "https://github.com/axss"
+            headers["X-Title"] = "axss"
+        resp = requests.post(
+            f"{base_url}/chat/completions",
+            headers=headers,
+            json={
+                "model": mdl,
+                "messages": [
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.7,
+            },
+            timeout=max(1, timeout),
+        )
+        resp.raise_for_status()
+        import json as _json
+        content = resp.json()["choices"][0]["message"]["content"]
+        text = content.strip()
+        if text.startswith("```"):
+            text = text.split("```")[1].lstrip("json").strip()
+        parsed = _json.loads(text)
+        if isinstance(parsed, list):
+            return [str(p).strip() for p in parsed if str(p).strip()][:3]
+        return []
+
+    api_key = os.environ.get("OPENROUTER_API_KEY", "") or load_api_key("openrouter_api_key")
+    if api_key:
+        try:
+            return _call_scout_api(OPENROUTER_BASE_URL, api_key, resolved_model)
+        except Exception as exc:
+            log.debug("generate_normal_scout OpenRouter error: %s", exc)
+
+    api_key = os.environ.get("OPENAI_API_KEY", "") or load_api_key("openai_api_key")
+    if api_key:
+        try:
+            return _call_scout_api(OPENAI_BASE_URL, api_key, resolved_model)
+        except Exception as exc:
+            log.debug("generate_normal_scout OpenAI error: %s", exc)
+
+    log.debug("generate_normal_scout: no API key available")
     return []

@@ -210,29 +210,22 @@ def _triage_with_local_model(
             reason="fast mode — triage skipped", context_notes="",
         )
 
-    # Build a concise reflection snippet from surviving char data
+    # Build surviving chars from reflection data
     reflections = getattr(probe_result, "reflections", [])
     surviving_chars = ""
-    snippet = ""
     if reflections:
         chars: set[str] = set()
         for r in reflections:
             chars.update(getattr(r, "surviving_chars", set()))
         surviving_chars = " ".join(sorted(chars)) if chars else "unknown"
-        snippet = getattr(reflections[0], "raw_context", "") or ""
-        if len(snippet) > 400:
-            snippet = snippet[:400] + "…"
 
     context_type = getattr(probe_result, "context_type", "") or ""
-    param_name = getattr(probe_result, "param_name", "?")
 
     try:
         from ai_xss_generator.models import triage_probe_result
         result = triage_probe_result(
-            param_name=param_name,
             context_type=context_type,
             surviving_chars=surviving_chars,
-            reflection_snippet=snippet,
             waf=waf,
             delivery_mode=delivery_mode,
             model=model,
