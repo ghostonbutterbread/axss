@@ -9,6 +9,7 @@ from ai_xss_generator.active.transforms import TransformVariant
 from ai_xss_generator.active.dom_xss import DomTaintHit
 from ai_xss_generator.behavior import attach_behavior_profile, build_target_behavior_profile
 from ai_xss_generator.active.worker import (
+    LocalTriageResult,
     WorkerResult,
     _discover_sink_from_crawled_pages,
     _dom_hit_priority,
@@ -143,6 +144,7 @@ def test_get_worker_runs_local_model_per_context_before_any_fallback():
 
     with (
         patch("ai_xss_generator.probe.probe_url", return_value=[probe_result]),
+        patch("ai_xss_generator.cache.get_probe", return_value=[probe_result]),
         patch("ai_xss_generator.parser.parse_target", return_value=_fake_context(url)),
         patch("scrapling.fetchers.FetcherSession", _FakeFetcherSession),
         patch("ai_xss_generator.active.executor.ActiveExecutor", FakeExecutor),
@@ -153,6 +155,8 @@ def test_get_worker_runs_local_model_per_context_before_any_fallback():
                 ("q", "js_string_dq", [TransformVariant("raw", "fallback-js")]),
             ],
         ),
+        patch("ai_xss_generator.active.generator.payloads_for_context", return_value=[]),
+        patch("ai_xss_generator.active.generator.mutate_seeds", return_value=[]),
         patch("ai_xss_generator.active.worker._get_local_payloads", side_effect=_local_payloads),
         patch("ai_xss_generator.active.worker._get_cloud_payloads", return_value=[]),
     ):
@@ -235,6 +239,8 @@ def test_get_worker_retries_cloud_with_feedback_before_fallback():
             "ai_xss_generator.active.transforms.all_variants_for_probe",
             return_value=[("q", "html_body", [TransformVariant("raw", "fallback-html")])],
         ),
+        patch("ai_xss_generator.active.generator.payloads_for_context", return_value=[]),
+        patch("ai_xss_generator.active.generator.mutate_seeds", return_value=[]),
         patch("ai_xss_generator.active.worker._get_local_payloads", return_value=[]),
         patch("ai_xss_generator.active.worker._get_cloud_payloads", side_effect=_cloud_payloads),
     ):
@@ -311,6 +317,8 @@ def test_get_worker_keep_searching_collects_multiple_distinct_local_variants():
             "ai_xss_generator.active.transforms.all_variants_for_probe",
             return_value=[("q", "html_body", [TransformVariant("raw", "fallback-html")])],
         ),
+        patch("ai_xss_generator.active.generator.payloads_for_context", return_value=[]),
+        patch("ai_xss_generator.active.generator.mutate_seeds", return_value=[]),
         patch(
             "ai_xss_generator.active.worker._get_local_payloads",
             return_value=["<img src=x onerror=alert(1)>", "<svg onload=alert(1)>"],
@@ -403,6 +411,8 @@ def test_get_worker_uses_deterministic_fallback_only_after_local_and_cloud_fail(
                 ("q", "html_body", [TransformVariant("raw", "fallback-html")]),
             ],
         ),
+        patch("ai_xss_generator.active.generator.payloads_for_context", return_value=[]),
+        patch("ai_xss_generator.active.generator.mutate_seeds", return_value=[]),
         patch("ai_xss_generator.active.worker._get_local_payloads", side_effect=_local_payloads),
         patch("ai_xss_generator.active.worker._get_cloud_payloads", side_effect=_cloud_payloads),
     ):
@@ -477,6 +487,8 @@ def test_get_worker_skips_local_on_high_friction_hard_context_and_uses_cloud() -
             "ai_xss_generator.active.transforms.all_variants_for_probe",
             return_value=[("redirect", "html_attr_url", [TransformVariant("raw", "fallback-url")])],
         ),
+        patch("ai_xss_generator.active.generator.payloads_for_context", return_value=[]),
+        patch("ai_xss_generator.active.generator.mutate_seeds", return_value=[]),
         patch("ai_xss_generator.active.worker._get_local_payloads", side_effect=AssertionError("local should be skipped")),
         patch("ai_xss_generator.active.worker._get_cloud_payloads", return_value=["cloud-url"]),
     ):
@@ -595,6 +607,8 @@ def test_get_worker_forwards_payload_candidate_strategy_to_executor() -> None:
             "ai_xss_generator.active.transforms.all_variants_for_probe",
             return_value=[("q", "html_body", [TransformVariant("raw", "fallback-html")])],
         ),
+        patch("ai_xss_generator.active.generator.payloads_for_context", return_value=[]),
+        patch("ai_xss_generator.active.generator.mutate_seeds", return_value=[]),
         patch(
             "ai_xss_generator.active.worker._get_local_payloads",
             return_value=[
@@ -1059,6 +1073,7 @@ def test_post_worker_runs_local_model_per_context_before_any_fallback():
 
     with (
         patch("ai_xss_generator.probe.probe_post_form", return_value=[probe_result]),
+        patch("ai_xss_generator.cache.get_probe", return_value=[probe_result]),
         patch("ai_xss_generator.parser.parse_target", return_value=_fake_context(post_form.source_page_url)),
         patch("ai_xss_generator.active.executor.ActiveExecutor", FakeExecutor),
         patch("ai_xss_generator.active.worker._autodiscover_post_sink_context", return_value=("", None, None)),
@@ -1069,6 +1084,8 @@ def test_post_worker_runs_local_model_per_context_before_any_fallback():
                 ("q", "js_string_dq", [TransformVariant("raw", "fallback-js")]),
             ],
         ),
+        patch("ai_xss_generator.active.generator.payloads_for_context", return_value=[]),
+        patch("ai_xss_generator.active.generator.mutate_seeds", return_value=[]),
         patch("ai_xss_generator.active.worker._get_local_payloads", side_effect=_local_payloads),
         patch("ai_xss_generator.active.worker._get_cloud_payloads", return_value=[]),
     ):
@@ -1250,6 +1267,8 @@ def test_post_worker_uses_deterministic_fallback_only_after_local_and_cloud_fail
                 ("q", "html_body", [TransformVariant("raw", "fallback-html")]),
             ],
         ),
+        patch("ai_xss_generator.active.generator.payloads_for_context", return_value=[]),
+        patch("ai_xss_generator.active.generator.mutate_seeds", return_value=[]),
         patch("ai_xss_generator.active.worker._get_local_payloads", side_effect=_local_payloads),
         patch("ai_xss_generator.active.worker._get_cloud_payloads", side_effect=_cloud_payloads),
     ):
@@ -1347,10 +1366,13 @@ def test_post_worker_uses_discovered_sink_context_for_generation_and_follow_up()
         local_calls.append(kwargs["probe_result"].reflections[0].context_type)
         return ["ai-js"]
 
+    _triage_approve = LocalTriageResult(score=8, should_escalate=True, reason="test approve", context_notes="")
+
     with (
         patch("ai_xss_generator.probe.probe_post_form", return_value=[probe_result]),
         patch("ai_xss_generator.parser.parse_target", return_value=_fake_context(post_form.source_page_url)),
         patch("ai_xss_generator.active.executor.ActiveExecutor", FakeExecutor),
+        patch("ai_xss_generator.active.worker._triage_with_local_model", return_value=_triage_approve),
         patch(
             "ai_xss_generator.active.worker._autodiscover_post_sink_context",
             return_value=("https://example.test/profile", sink_reflection, _fake_context("https://example.test/profile")),
@@ -1359,6 +1381,8 @@ def test_post_worker_uses_discovered_sink_context_for_generation_and_follow_up()
             "ai_xss_generator.active.transforms.all_variants_for_probe",
             return_value=[("q", "js_string_dq", [TransformVariant("raw", "fallback-js")])],
         ),
+        patch("ai_xss_generator.active.generator.payloads_for_context", return_value=[]),
+        patch("ai_xss_generator.active.generator.mutate_seeds", return_value=[]),
         patch("ai_xss_generator.active.worker._get_local_payloads", side_effect=_local_payloads),
         patch("ai_xss_generator.active.worker._get_cloud_payloads", return_value=[]),
     ):
@@ -1381,6 +1405,7 @@ def test_post_worker_uses_discovered_sink_context_for_generation_and_follow_up()
             ai_backend="api",
             cli_tool="claude",
             cli_model=None,
+            mode="deep",
         )
 
     assert local_calls == ["js_string_dq"]

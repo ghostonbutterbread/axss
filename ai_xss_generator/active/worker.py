@@ -212,12 +212,10 @@ def _triage_with_local_model(
 
     # Build surviving chars from reflection data
     reflections = getattr(probe_result, "reflections", [])
-    surviving_chars = ""
+    surviving_chars: frozenset[str] = frozenset()
     if reflections:
-        chars: set[str] = set()
         for r in reflections:
-            chars.update(getattr(r, "surviving_chars", set()))
-        surviving_chars = " ".join(sorted(chars)) if chars else "unknown"
+            surviving_chars = surviving_chars | frozenset(getattr(r, "surviving_chars", frozenset()))
 
     context_type = getattr(probe_result, "context_type", "") or ""
 
@@ -1456,6 +1454,58 @@ def _run(
                                 "Triage gate: skipping cloud for %s param=%s (score=%d): %s",
                                 url, param_name, _triage.score, _triage.reason,
                             )
+
+                # ── Local model payload generation (normal + deep, non-fast_omni) ──
+                # Runs after triage gate; generates per-context AI payloads from the
+                # local Ollama model. Skipped when escalation_policy.use_local is False
+                # (high-friction contexts routed straight to cloud).
+                if (
+                    context_type != "fast_omni"
+                    and escalation_policy.use_local
+                    and not context_done
+                    and not _timed_out()
+                ):
+                    local_candidates = _get_local_payloads(
+                        url=url,
+                        probe_result=context_probe_result,
+                        model=model,
+                        waf=waf_hint,
+                        base_context=_cached_context,
+                        auth_headers=auth_headers,
+                        delivery_mode="get",
+                        session_lessons=session_lessons,
+                    )
+                    for lc in local_candidates:
+                        if context_done or _timed_out():
+                            break
+                        _lc_text = _payload_text(lc)
+                        if not _lc_text:
+                            continue
+                        total_transforms_tried += 1
+                        result = executor.fire(
+                            url=url,
+                            param_name=param_name,
+                            payload=_lc_text,
+                            all_params=flat_params,
+                            transform_name="local_model",
+                            sink_url=sink_url,
+                            payload_candidate=lc,
+                        )
+                        _ai_tried_payloads.append((_lc_text, "local_model"))
+                        if result.confirmed:
+                            finding = _make_finding(
+                                url=url,
+                                probe_result=context_probe_result,
+                                context_type=context_type,
+                                result=result,
+                                waf=waf_hint,
+                                source="local_model",
+                                cloud_escalated=False,
+                                ai_note="Local model payload confirmed.",
+                            )
+                            if _record_context_finding(finding) and len(context_variant_keys) >= context_hit_cap:
+                                context_done = True
+                                break
 
                 # Cloud model generates payloads — gated by local triage verdict.
                 if not context_done and _triage_approved and use_cloud and not _timed_out():
@@ -3975,6 +4025,60 @@ def _run_post(
                                 "Triage gate: skipping cloud for POST %s param=%s (score=%d): %s",
                                 post_form.action_url, param_name, _triage.score, _triage.reason,
                             )
+
+                # ── Local model payload generation (POST, normal + deep) ──
+                # Mirrors GET worker behaviour: runs after triage, before cloud.
+                # Skipped when escalation_policy.use_local is False (high-friction).
+                if (
+                    context_type != "fast_omni"
+                    and escalation_policy.use_local
+                    and not context_done
+                    and not _timed_out()
+                ):
+                    local_candidates = _get_local_payloads(
+                        url=post_form.source_page_url,
+                        probe_result=context_probe_result,
+                        model=model,
+                        waf=waf_hint,
+                        base_context=generation_context,
+                        auth_headers=auth_headers,
+                        delivery_mode="post",
+                        session_lessons=post_session_lessons,
+                    )
+                    for lc in local_candidates:
+                        if context_done or _timed_out():
+                            break
+                        _lc_text = _payload_text(lc)
+                        if not _lc_text:
+                            continue
+                        total_transforms_tried += 1
+                        result = executor.fire_post(
+                            source_page_url=post_form.source_page_url,
+                            action_url=post_form.action_url,
+                            param_name=param_name,
+                            payload=_lc_text,
+                            all_param_names=post_form.param_names,
+                            csrf_field=post_form.csrf_field,
+                            transform_name="local_model",
+                            sink_url=effective_sink_url,
+                            payload_candidate=lc,
+                            extra_sink_urls=crawled_pages or [],
+                        )
+                        _ai_tried_payloads.append((_lc_text, "local_model"))
+                        if result.confirmed:
+                            finding = _make_finding(
+                                url=post_form.action_url,
+                                probe_result=context_probe_result,
+                                context_type=context_type,
+                                result=result,
+                                waf=waf_hint,
+                                source="local_model",
+                                cloud_escalated=False,
+                                ai_note="Local model payload confirmed.",
+                            )
+                            if _record_context_finding(finding) and len(context_variant_keys) >= context_hit_cap:
+                                context_done = True
+                                break
 
                 if not context_done and _triage_approved and use_cloud and not _timed_out():
                     surviving_chars = frozenset().union(
