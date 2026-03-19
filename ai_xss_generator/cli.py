@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import math
 import sys
+import warnings
 from pathlib import Path
 from typing import Callable
 
@@ -1330,12 +1331,6 @@ def _run_active_scan(
         info("Active scan profile: extreme")
     if getattr(args, "research", False):
         info("Active scan profile: research")
-    if getattr(args, "obliterate", False):
-        info("AI phase mode: obliterate (fast probe-skip + 3-phase broad-spectrum generation)")
-    elif getattr(args, "deep", False):
-        info("AI phase mode: deep (probe + 3-phase targeted generation)")
-    else:
-        info("AI phase mode: fast (default — broad-spectrum Gen XSS, no probe)")
     if getattr(args, "keep_searching", False):
         info("Post-confirmation mode: keep searching for distinct variants")
     if getattr(args, "waf_source", None):
@@ -1359,7 +1354,6 @@ def _run_active_scan(
 
     # Derive scan mode from flags (obliterate is deprecated alias for normal)
     if getattr(args, "obliterate", False):
-        import warnings
         warnings.warn(
             "--obliterate is deprecated and will be removed in a future release. "
             "Normal mode (no flag) now provides the same broad-spectrum coverage.",
@@ -1372,6 +1366,8 @@ def _run_active_scan(
         _mode = "fast"
     else:
         _mode = "normal"
+
+    info(f"Scan mode: {_mode}")
 
     scan_config = ActiveScanConfig(
         rate=args.rate,
