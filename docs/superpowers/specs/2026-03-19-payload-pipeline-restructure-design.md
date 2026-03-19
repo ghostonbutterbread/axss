@@ -9,11 +9,12 @@
 ## Summary
 
 Restructure the deep and normal mode payload pipelines to use a deterministic
-context-specific first pass before any AI generation, simplify the local triage
-gate input, and reframe the deep mode cloud prompt from open-ended generation to
-constraint-aware mutation. Normal mode gains lightweight cloud-based encoding-biased
-generation for params the deterministic pass misses. Two debug flags are added to
-help users validate and bypass the local triage gate.
+context-specific first pass before any AI generation, followed by a GenXSS-style
+programmatic mutation layer (Tier 1.5) that encodes and varies the best Tier 1
+seeds before touching the cloud. Simplify the local triage gate input for deep
+mode, and reframe all cloud prompts from cold generation to seed mutation —
+the cloud receives the payloads that came closest and mutates them aggressively.
+Two debug flags are added to help users validate and bypass the local triage gate.
 
 ---
 
@@ -22,7 +23,7 @@ help users validate and bypass the local triage gate.
 | Mode | Target Use Case | AI Role |
 |------|----------------|---------|
 | **Fast** | Large URL lists, reflected XSS sweep | Unchanged — pre-generated payload set, HTTP pre-filter |
-| **Normal** | URL lists, broad coverage (reflected + stored + DOM light) | Encoding-biased cloud scout (1 call per missed param) |
+| **Normal** | URL lists, broad coverage (reflected + stored + DOM light) | Seed mutation — Tier 1 seeds → programmatic mutations → cloud mutates best seeds |
 | **Deep** | 1-2 specific high-value pages, exhaustive investigation | Probe → local triage → cloud mutation with failure evidence |
 
 **Fast mode is unchanged by this spec.**
@@ -47,8 +48,36 @@ help users validate and bypass the local triage gate.
 - Payloads sorted by `risk_score` descending (existing field on `PayloadCandidate`)
 - If any payload confirms execution → `ConfirmedFinding(source="phase1_deterministic")`, pipeline stops
 
-**Normal mode:** Tier 1 only proceeds to cloud if deterministic misses.
-**Deep mode:** Tier 1 only proceeds to local triage if deterministic misses.
+**Normal mode:** Tier 1 proceeds to Tier 1.5 if deterministic misses.
+**Deep mode:** Tier 1 proceeds to local triage if deterministic misses.
+
+### Tier 1.5 — Programmatic Seed Mutation (Normal + Deep)
+
+GenXSS-style systematic transforms applied to the top Tier 1 seeds. Free, fast,
+no API cost. Runs before any cloud call.
+
+**Seed selection:** Before firing Tier 1, a single lightweight HTTP reflection
+check (reusing `_http_reflects_payload()`) identifies which Tier 1 payloads have
+at least partial reflection in the response body. Payloads with partial reflection
+rank highest as seeds — they got furthest through the filter. Payloads with no
+reflection at all rank lowest.
+
+**Transforms applied to each seed (in order):**
+1. `random_upper()` — randomize case on tag names and event handler names
+   (already in `generator.py`, reused here)
+2. Space replacement variants — substitute spaces with `/`, `%09`, `%0a`, `/**/`
+3. Encoding variants on the JS expression — HTML entity (`&#x61;lert`),
+   URL-encode (`%61lert`), hex (`\x61lert`), unicode (`\u0061lert`)
+4. Event handler rotation — cycle through compatible handlers:
+   `onerror` → `ontoggle` → `onpointerenter` → `onfocus`
+5. Quote style variants — double → single → none → backtick where applicable
+
+**Output:** Up to 15 mutated candidates per seed, sorted by transform confidence.
+`ConfirmedFinding(source="phase1_deterministic")` used for hits (same as Tier 1 —
+both are deterministic, non-AI paths).
+
+**Normal mode:** Proceeds to Tier 3 cloud if Tier 1.5 misses.
+**Deep mode:** Proceeds to local triage if Tier 1.5 misses.
 
 ### Tier 2 — Local Triage Gate (Deep only)
 
@@ -73,12 +102,21 @@ generation moves entirely to per-param scout calls in `worker.py`.
 ```
 Parser-detected context_type
         ↓
+HTTP reflection check on Tier 1 candidates (reuse _http_reflects_payload)
+→ rank seeds by partial reflection (most surviving fragments = best seed)
+        ↓
 [Tier 1] payloads_for_context(context_type, surviving_chars=None)
-         fire via executor
+         fire top seeds via executor
         ↓ hit → ConfirmedFinding(source="phase1_deterministic"), done
         ↓ miss
-[Tier 3] generate_normal_scout(context_type, waf, frameworks) → 3 payloads
-         instruction: encoding-biased, assume angle brackets blocked
+[Tier 1.5] Programmatic mutations of best seeds
+           (case, encoding, space, handler rotation — up to 15 variants)
+           fire via executor
+        ↓ hit → ConfirmedFinding(source="phase1_deterministic"), done
+        ↓ miss
+[Tier 3] generate_normal_scout(context_type, waf, frameworks, seeds) → 3 payloads
+         input: top 3 seeds that came closest + context
+         instruction: seed mutation, encoding-heavy, assume angle brackets blocked
          fire via executor
         ↓ hit → ConfirmedFinding(source="cloud_model"), done
         ↓ miss → no finding for this param
@@ -90,8 +128,14 @@ Parser-detected context_type
 Probe result (context_type, surviving_chars confirmed, waf)
         ↓
 [Tier 1] payloads_for_context(context_type, surviving_chars)
-         filtered by confirmed surviving chars
+         filtered by confirmed surviving chars, sorted by risk_score desc
          fire top candidates via executor
+        ↓ hit → ConfirmedFinding(source="phase1_deterministic"), done
+        ↓ miss
+[Tier 1.5] Programmatic mutations of best Tier 1 seeds
+           (case, encoding, space, handler rotation — up to 15 variants)
+           surviving_chars used to skip mutations requiring blocked chars
+           fire via executor
         ↓ hit → ConfirmedFinding(source="phase1_deterministic"), done
         ↓ miss
 [Tier 2] Local triage (structured labels only)
@@ -163,7 +207,11 @@ class LocalTriageResult:
 
 ## Section 4: Cloud Prompt Designs
 
-### Normal Mode — Encoding-Biased Scout
+### Normal Mode — Seed Mutation Scout
+
+The cloud does not generate payloads from scratch. It receives the top seeds
+from Tier 1 (the payloads that came closest based on partial reflection) and
+mutates them with encoding techniques that programmatic transforms can't produce.
 
 **Input:**
 ```json
@@ -171,17 +219,26 @@ class LocalTriageResult:
   "context_type": "html_attr_url",
   "waf": "cloudflare",
   "frameworks": ["angular"],
-  "note": "no probe data — assume angle brackets blocked"
+  "seeds": [
+    "javascript:alert(1)",
+    "jaVasCript:alert(1)",
+    "&#106;avascript:alert(1)"
+  ],
+  "note": "no probe data — assume angle brackets blocked, seeds had partial reflection"
 }
 ```
 
 **Instruction:**
-> "Generate 3 XSS payloads for this context. Assume angle brackets are filtered.
-> Prioritize encoding-heavy variants: HTML entities, URL encoding, unicode escapes,
-> hex encoding, whitespace injection, mixed case. Avoid raw `<` or `>`.
+> "These seed payloads had partial reflection but did not execute. Mutate them
+> with creative encoding: multi-layer entity encoding, mixed encoding schemes,
+> whitespace/null-byte injection, unicode normalization tricks, scheme fragmentation.
+> Assume angle brackets are filtered. Generate 3 novel mutations.
 > Return only valid JSON array of payload strings."
 
-**Output:** 3 payloads. No strategy object required. Fast and cheap.
+**Output:** 3 payloads. Structurally derived from seeds — not cold generation.
+
+`generate_normal_scout` signature:
+`def generate_normal_scout(context_type: str, waf: str | None, frameworks: list[str], seeds: list[str]) -> list[str]`
 
 ---
 
@@ -264,8 +321,8 @@ reason is less actionable for mutation.
 
 | File | Change |
 |------|--------|
-| `ai_xss_generator/active/generator.py` | Add `payloads_for_context(context_type, surviving_chars)` dispatch function |
-| `ai_xss_generator/active/worker.py` | Wire Tier 1 for normal + deep; drop `snippet`/`param_name` from `_triage_with_local_model`; add `skip_triage` path; assemble `blocked_on` for failure set |
+| `ai_xss_generator/active/generator.py` | Add `payloads_for_context(context_type, surviving_chars)` dispatch function; add `mutate_seeds(seeds, surviving_chars)` for Tier 1.5 programmatic mutations |
+| `ai_xss_generator/active/worker.py` | Wire Tier 1 + Tier 1.5 for normal + deep; HTTP reflection pre-check for seed ranking (normal mode); drop `snippet`/`param_name` from `_triage_with_local_model`; add `skip_triage` path; assemble `blocked_on` for failure set |
 | `ai_xss_generator/models.py` | Add `generate_normal_scout(context_type: str, waf: str \| None, frameworks: list[str]) -> list[str]`; restructure deep cloud prompt to mutation framing; drop `reflection_snippet` and `param_name` from `triage_probe_result()` signature |
 | `ai_xss_generator/active/orchestrator.py` | Add `skip_triage: bool = False` to `ActiveScanConfig`; pass through to worker kwargs; remove `generate_fast_batch` from `mode == "normal"` path (retain for `mode == "fast"` only) |
 | `ai_xss_generator/active/reporter.py` | Add `"phase1_deterministic"` to source-label display mapping |
