@@ -30,7 +30,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Sequence, TYPE_CHECKING
+from typing import Any, Literal, Sequence, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ai_xss_generator.types import PostFormTarget, UploadTarget
@@ -76,7 +76,7 @@ class ActiveScanConfig:
     cli_tool: str = "claude"      # "claude" | "codex" (when ai_backend="cli")
     cli_model: str | None = None  # model passed to CLI (None = CLI default)
     cloud_attempts: int = 1       # recursive cloud reasoning rounds per context
-    mode: str = "normal"          # "fast" | "normal" | "deep"
+    mode: Literal["fast", "normal", "deep"] = "normal"
     fresh: bool = False           # ignore all caches, re-collect from scratch
     blind_callback: str | None = None  # OOB callback URL for blind XSS payloads
     waf_source: str | None = None # local path to open-source WAF/filter code for planning hints

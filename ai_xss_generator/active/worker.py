@@ -1056,7 +1056,7 @@ def _run(
             injectable = list(probe_results)
             reflected = list(probe_results)
     else:
-        # Normal mode: pre-fetch for clean context, then probe.
+        # Deep mode: pre-fetch for clean context, then probe.
         try:
             from ai_xss_generator.probe import _BROWSER_REQUIRED_WAFS, fetch_html_with_browser
             if waf_hint is not None and waf_hint.lower() in _BROWSER_REQUIRED_WAFS:
@@ -1091,7 +1091,7 @@ def _run(
         reflected  = [r for r in probe_results if r.is_reflected]
         coordinated_attempts = _coordinated_split_attempts(reflected)
 
-        # Cache probe results for reuse by future fast/deep/obliterate scans.
+        # Cache probe results for reuse by future fast/normal/deep scans.
         try:
             from ai_xss_generator.cache import put_probe
             put_probe(url, list(flat_params.keys()), probe_results)
@@ -3312,7 +3312,7 @@ def _get_fast_omni_payloads(
 
     Passes ``phase_profile="fast_omni"`` to ``generate_cloud_payloads`` so the
     prompt is augmented with broad-spectrum multi-context instructions.
-    When ``deep=True`` (obliterate mode) all three generation phases run:
+    When ``deep=True`` all three generation phases run:
     scout → contextual → research, each with the broad-spectrum prompt.
     No probe_result enrichment is performed — base_context is passed directly.
     """
@@ -3537,7 +3537,7 @@ def _run_post(
             injectable = list(probe_results)
             reflected = list(probe_results)
     else:
-        # Normal mode: probe all params for reflection.
+        # Deep mode: probe all params for reflection.
         probe_results = probe_post_form(
             action_url=post_form.action_url,
             source_page_url=post_form.source_page_url,
@@ -3553,7 +3553,7 @@ def _run_post(
         injectable = [r for r in probe_results if r.is_injectable]
         reflected = [r for r in probe_results if r.is_reflected]
 
-        # Cache probe results for reuse by future fast/deep/obliterate scans.
+        # Cache probe results for reuse by future fast/normal/deep scans.
         try:
             from ai_xss_generator.cache import put_probe
             put_probe(post_form.action_url, post_form.param_names, probe_results)
