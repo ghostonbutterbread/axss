@@ -81,13 +81,8 @@ class TestSkipTriageConfig:
 class TestFastBatchNormalModeRemoval:
     def test_normal_mode_does_not_call_generate_fast_batch(self):
         """generate_fast_batch must only be called for fast mode, not normal."""
-        import ast, inspect
+        import inspect
         from ai_xss_generator.active import orchestrator
         src = inspect.getsource(orchestrator)
-        tree = ast.parse(src)
-        # Find the if-branch containing generate_fast_batch
-        # It should check mode == "fast" only, not mode in ("fast", "normal")
-        assert 'mode in ("fast", "normal")' not in src or \
-               src.count('generate_fast_batch') == 0 or \
-               'mode == "fast"' in src, \
-               "generate_fast_batch should only run in fast mode"
+        assert 'mode in ("fast", "normal")' not in src, \
+            "generate_fast_batch should only run in fast mode"

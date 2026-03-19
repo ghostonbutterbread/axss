@@ -2726,6 +2726,7 @@ def run_dom_worker(
     fast_batch: "list[Any] | None" = None,
     findings_lock: Any = None,  # passed for parallel Normal mode safety
     dom_sources: "list[tuple[str, str]] | None" = None,  # None = all sources (Deep)
+    skip_triage: bool = False,  # reserved for future triage gate in DOM path
 ) -> None:
     """Worker entry point for DOM XSS runtime scanning.
 
@@ -3602,6 +3603,7 @@ def run_post_worker(
     extreme: bool = False,
     research: bool = False,
     fast_batch: "list[Any] | None" = None,
+    skip_triage: bool = False,
 ) -> None:
     """Worker entry point for POST form targets. Mirrors run_worker() for GET URLs."""
     start_time = time.monotonic()
@@ -3638,6 +3640,7 @@ def run_post_worker(
             extreme=extreme,
             research=research,
             fast_batch=fast_batch,
+            skip_triage=skip_triage,
         )
     except Exception as exc:
         log.exception("POST worker crashed for %s", post_form.action_url)
@@ -3674,6 +3677,7 @@ def _run_post(
     extreme: bool = False,
     research: bool = False,
     fast_batch: "list[Any] | None" = None,
+    skip_triage: bool = False,
 ) -> None:
     from ai_xss_generator.probe import probe_post_form
     from ai_xss_generator.active.executor import ActiveExecutor
@@ -3946,8 +3950,9 @@ def _run_post(
 
                 # Local model triage gate for POST params — mirrors GET behaviour.
                 # fast_omni skips triage (no probe data, cloud always runs).
+                # skip_triage=True bypasses the local model gate entirely.
                 _triage_approved = True
-                if context_type != "fast_omni" and escalation_policy.use_local and not context_done and not _timed_out():
+                if not skip_triage and context_type != "fast_omni" and escalation_policy.use_local and not context_done and not _timed_out():
                     local_model_rounds += 1
                     _triage = _triage_with_local_model(
                         probe_result=context_probe_result,
