@@ -1977,7 +1977,12 @@ def triage_probe_result(
         "waf": waf or None,
         "delivery_mode": delivery_mode,
     }
-    system = "You are a triage gate for an XSS scanner. Given a reflection context, score its XSS potential 1-10 and decide if cloud API spend is justified. Reply only with valid JSON: score, should_escalate, reason."
+    system = (
+        "You are a triage gate for an XSS scanner. Given a reflection context, score its XSS potential "
+        "1-10 and decide if cloud API spend is justified. "
+        "Reply only with valid JSON: score (int 1-10), should_escalate (bool), reason (one sentence), "
+        "context_notes (one sentence of hints for payload generation, or empty string)."
+    )
     user = json.dumps(prompt_data)
 
     try:
@@ -3089,11 +3094,17 @@ def generate_normal_scout(
                 model=cli_model or None,
                 timeout_seconds=timeout,
             )
-            import json as _json
             text = raw.strip()
             if text.startswith("```"):
-                text = text.split("```")[1].lstrip("json").strip()
-            parsed = _json.loads(text)
+                # strip opening fence + optional language tag
+                text = text[3:]
+                if "\n" in text:
+                    text = text[text.index("\n") + 1:]
+                # strip closing fence if present
+                if text.strip().endswith("```"):
+                    text = text[:text.rfind("```")]
+                text = text.strip()
+            parsed = json.loads(text)
             if isinstance(parsed, list):
                 return [str(p).strip() for p in parsed if str(p).strip()][:3]
         except Exception as exc:
@@ -3125,12 +3136,18 @@ def generate_normal_scout(
             timeout=max(1, timeout),
         )
         resp.raise_for_status()
-        import json as _json
         content = resp.json()["choices"][0]["message"]["content"]
         text = content.strip()
         if text.startswith("```"):
-            text = text.split("```")[1].lstrip("json").strip()
-        parsed = _json.loads(text)
+            # strip opening fence + optional language tag
+            text = text[3:]
+            if "\n" in text:
+                text = text[text.index("\n") + 1:]
+            # strip closing fence if present
+            if text.strip().endswith("```"):
+                text = text[:text.rfind("```")]
+            text = text.strip()
+        parsed = json.loads(text)
         if isinstance(parsed, list):
             return [str(p).strip() for p in parsed if str(p).strip()][:3]
         return []
