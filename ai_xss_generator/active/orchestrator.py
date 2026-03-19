@@ -84,6 +84,7 @@ class ActiveScanConfig:
     extreme: bool = False
     research: bool = False
     skip_liveness: bool = False   # skip pre-flight HEAD checks (default for --urls lists)
+    skip_triage: bool = False     # bypass local triage model, go straight to cloud
 
 
 def _auto_workers(rate: float, explicit_workers: int) -> int:
@@ -413,10 +414,10 @@ def run_active_scan(
                 rate_limiter=rate_limiter,
             )
 
-    # Fast/normal modes: generate one payload batch upfront for all workers to share.
-    # Deep mode uses per-URL AI generation; fast and normal modes share an upfront batch.
+    # Fast mode: generate one payload batch upfront for all workers to share.
+    # Normal and deep modes use per-URL/per-param generation; fast mode shares an upfront batch.
     fast_batch: list[Any] = []
-    if config.mode in ("fast", "normal") and url_list:
+    if config.mode == "fast" and url_list:
         from ai_xss_generator.models import generate_fast_batch
         step("Fast mode: generating payload batch…")
         fast_batch = generate_fast_batch(
@@ -718,6 +719,7 @@ def run_active_scan(
                                 "extreme": config.extreme,
                                 "research": config.research,
                                 "fast_batch": fast_batch or None,
+                                "skip_triage": config.skip_triage,
                                 **_cli_kwargs,
                             },
                             daemon=True,

@@ -64,3 +64,30 @@ class TestNormalModeParallelDispatch:
         from ai_xss_generator.active.orchestrator import _auto_workers_for_mode
         n = _auto_workers_for_mode("normal", rate=1.0, explicit_workers=10)
         assert n == 1
+
+
+class TestSkipTriageConfig:
+    def test_skip_triage_default_false(self):
+        from ai_xss_generator.active.orchestrator import ActiveScanConfig
+        cfg = ActiveScanConfig()
+        assert cfg.skip_triage is False
+
+    def test_skip_triage_settable(self):
+        from ai_xss_generator.active.orchestrator import ActiveScanConfig
+        cfg = ActiveScanConfig(skip_triage=True)
+        assert cfg.skip_triage is True
+
+
+class TestFastBatchNormalModeRemoval:
+    def test_normal_mode_does_not_call_generate_fast_batch(self):
+        """generate_fast_batch must only be called for fast mode, not normal."""
+        import ast, inspect
+        from ai_xss_generator.active import orchestrator
+        src = inspect.getsource(orchestrator)
+        tree = ast.parse(src)
+        # Find the if-branch containing generate_fast_batch
+        # It should check mode == "fast" only, not mode in ("fast", "normal")
+        assert 'mode in ("fast", "normal")' not in src or \
+               src.count('generate_fast_batch') == 0 or \
+               'mode == "fast"' in src, \
+               "generate_fast_batch should only run in fast mode"
