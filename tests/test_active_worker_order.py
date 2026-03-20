@@ -22,6 +22,17 @@ from ai_xss_generator.active.worker import (
 from ai_xss_generator.probe import ProbeResult, ReflectionContext
 from ai_xss_generator.types import ParsedContext, PayloadCandidate, PostFormTarget, StrategyProfile
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _isolate_seed_pool(tmp_path, monkeypatch):
+    """Redirect SeedPool writes to a temp file so tests never touch ~/.axss/seed_pool.jsonl."""
+    import ai_xss_generator.seed_pool as _sp
+    fake_path = tmp_path / "seed_pool.jsonl"
+    fake_path.touch()
+    monkeypatch.setattr(_sp, "POOL_PATH", fake_path)
+
 
 def _fake_context(source: str) -> SimpleNamespace:
     return SimpleNamespace(
