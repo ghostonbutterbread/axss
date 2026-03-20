@@ -4017,6 +4017,8 @@ def _run_post(
     if mode in ("fast", "normal"):
         # Fast/normal mode: check probe cache first — real context from a
         # prior scan beats the synthetic fast_omni broad-spectrum fallback.
+        # TODO: POST normal mode should use probe_param_context() T0 detection
+        #       (same as GET normal mode) — deferred, see plan 2026-03-20-normal-mode-t0-redesign.md
         from ai_xss_generator.cache import get_probe
         from ai_xss_generator.probe import make_fast_probe_result
         _cached_probe = None if fresh else get_probe(post_form.action_url, post_form.param_names)
