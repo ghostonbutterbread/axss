@@ -4141,6 +4141,7 @@ def _run_post(
     cloud_model_rounds = 0
     fallback_rounds = 0
     escalation_reasons: list[str] = []
+    _post_label = post_form.action_url.split("?")[0].rsplit("/", 1)[-1] or post_form.action_url
 
     try:
         for probe_result in injectable:
@@ -4165,6 +4166,7 @@ def _run_post(
                 _append_reason(escalation_reasons, escalation_policy.note)
                 cloud_plan = CloudPayloadPlan()
                 context_done = False
+                _v_steps: list[str] = []  # -v summary tokens for this context
                 context_variant_keys: set[str] = set()
                 _ai_tried_payloads: list[tuple[str, str]] = []  # (payload, source)
 
@@ -4224,6 +4226,19 @@ def _run_post(
                         context_before=_post_t1_context_before,
                     )
 
+                    # -vv: POST Tier 1 dispatch
+                    if post_tier1_candidates:
+                        _pt1_top = _trunc(_payload_text(post_tier1_candidates[0]) or "", 50)
+                        _console.debug(
+                            f"POST {_trunc(_post_label, 30)} [{context_type}] "
+                            f"Tier 1: {len(post_tier1_candidates)} candidates | top: \"{_pt1_top}\""
+                        )
+                    else:
+                        _console.debug(
+                            f"POST {_trunc(_post_label, 30)} [{context_type}] "
+                            f"Tier 1: 0 candidates — context not dispatched"
+                        )
+
                     # In normal mode: HTTP pre-rank top 10 by reflection check.
                     if mode == "normal" and post_tier1_candidates:
                         try:
@@ -4251,6 +4266,19 @@ def _run_post(
                             _post_ranked.sort(key=lambda c: -getattr(c, "risk_score", 0))
                             _post_non_reflecting.sort(key=lambda c: -getattr(c, "risk_score", 0))
                             post_tier1_candidates = _post_ranked + _post_non_reflecting + post_tier1_candidates[10:]
+                            # -vv: POST pre-rank result
+                            if _post_ranked:
+                                _pprerank_top = _trunc(_payload_text(_post_ranked[0]) or "", 50)
+                                _console.debug(
+                                    f"POST {_trunc(_post_label, 30)} [{context_type}] "
+                                    f"Pre-rank: {len(_post_ranked)}/{len(_post_check)} reflect | "
+                                    f"top: \"{_pprerank_top}\""
+                                )
+                            else:
+                                _console.debug(
+                                    f"POST {_trunc(_post_label, 30)} [{context_type}] "
+                                    f"Pre-rank: 0/{len(_post_check)} reflect — order unchanged"
+                                )
                         except Exception as _post_rank_exc:
                             log.debug("POST Tier 1 HTTP pre-rank failed: %s", _post_rank_exc)
 
@@ -4295,9 +4323,30 @@ def _run_post(
                         else:
                             _post_tier1_failed_payloads.append(_pt1_text)
 
+                    # -vv: POST Tier 1 results
+                    _pt1_confirmed = 1 if context_done else 0
+                    _console.debug(
+                        f"POST {_trunc(_post_label, 30)} [{context_type}] "
+                        f"Tier 1: fired {len(post_tier1_candidates)} → {_pt1_confirmed} confirmed"
+                    )
+                    # -v: Tier 1 outcome token
+                    if not post_tier1_candidates:
+                        _v_steps.append("T1:skip(no-cands)")
+                    elif context_done:
+                        _v_steps.append("T1:CONFIRMED")
+                    else:
+                        _v_steps.append("T1:miss")
+
                     # ── Tier 1.5: seed mutations after Tier 1 miss ──
                     if not context_done and not _timed_out() and tier1_seeds:
                         post_tier15_mutations = mutate_seeds(tier1_seeds, _post_t1_surviving)
+                        # -vv: POST Tier 1.5 mutations
+                        _pt15_top = _trunc(post_tier15_mutations[0] if post_tier15_mutations else "", 50)
+                        _console.debug(
+                            f"POST {_trunc(_post_label, 30)} [{context_type}] "
+                            f"Tier 1.5: {len(post_tier15_mutations)} mutations from {len(tier1_seeds)} seeds | "
+                            f"top: \"{_pt15_top}\""
+                        )
                         for _pt15_text in post_tier15_mutations:
                             if context_done or _timed_out():
                                 break
@@ -4333,6 +4382,18 @@ def _run_post(
                             else:
                                 _post_tier15_failed_payloads.append(_pt15_text)
 
+                        # -vv: POST Tier 1.5 results
+                        _pt15_confirmed = 1 if context_done else 0
+                        _console.debug(
+                            f"POST {_trunc(_post_label, 30)} [{context_type}] "
+                            f"Tier 1.5: fired {len(post_tier15_mutations)} → {_pt15_confirmed} confirmed"
+                        )
+                        # -v: Tier 1.5 outcome token
+                        if context_done:
+                            _v_steps.append("T1.5:CONFIRMED")
+                        else:
+                            _v_steps.append("T1.5:miss")
+
                 # Local model triage gate for POST params — mirrors GET behaviour.
                 # fast_omni skips triage (no probe data, cloud always runs).
                 # skip_triage=True bypasses the local model gate only in deep mode.
@@ -4342,6 +4403,12 @@ def _run_post(
                     if mode == "deep" and skip_triage:
                         _triage_approved = True
                         _append_reason(escalation_reasons, "skip_triage=True — triage gate bypassed")
+                        _console.debug(
+                            f"POST {_trunc(_post_label, 30)} [{context_type}] "
+                            f"Triage: skipped (--skip-triage) — auto-escalate"
+                        )
+                        # -v: skip_triage token
+                        _v_steps.append("triage:skip(flag)")
                     else:
                         local_model_rounds += 1
                         _triage = _triage_with_local_model(
@@ -4352,6 +4419,20 @@ def _run_post(
                             fast_mode=mode in ("fast", "normal"),
                         )
                         _triage_approved = _triage.should_escalate
+                        # -vv: POST triage result
+                        _console.debug(
+                            f"POST {_trunc(_post_label, 30)} [{context_type}] "
+                            f"Triage: score={_triage.score} escalate={'YES' if _triage_approved else 'NO'} | "
+                            f"{_trunc(_triage.reason, 60)}"
+                        )
+                        # -v: triage outcome token
+                        if _triage_approved:
+                            if mode in ("fast", "normal"):
+                                _v_steps.append("triage:skip(fast)")
+                            else:
+                                _v_steps.append("triage:escalate")
+                        else:
+                            _v_steps.append(f"triage:block(score={_triage.score})")
                         _append_reason(escalation_reasons, f"[triage score={_triage.score}] {_triage.reason}")
                         if _triage.context_notes:
                             _append_reason(escalation_reasons, _triage.context_notes)
@@ -4514,6 +4595,8 @@ def _run_post(
                                 if len(context_variant_keys) >= context_hit_cap:
                                     context_done = True
                                     break
+                        # -v: fast_omni skips triage entirely
+                        _v_steps.append("triage:skip(omni)")
                         continue  # next (param_name, context_type, variants) tuple
 
                     # ── Normal mode Tier 3 (POST): lightweight cloud scout ──
@@ -4532,6 +4615,12 @@ def _run_post(
                             ai_backend=ai_backend,
                             cli_tool=cli_tool,
                             cli_model=cli_model,
+                        )
+                        # -vv: POST normal scout returned
+                        _pscout_top = _trunc(_post_scout_payloads[0] if _post_scout_payloads else "", 50)
+                        _console.debug(
+                            f"POST {_trunc(_post_label, 30)} [{context_type}] "
+                            f"Tier 3 scout: {len(_post_scout_payloads)} payloads | top: \"{_pscout_top}\""
                         )
                         cloud_escalated = True
                         cloud_model_rounds += 1
@@ -4569,6 +4658,14 @@ def _run_post(
                                 if _record_context_finding(finding) and len(context_variant_keys) >= context_hit_cap:
                                     context_done = True
                                     break
+                        # -vv: POST normal scout fire result
+                        _pscout_confirmed = 1 if context_done else 0
+                        _console.debug(
+                            f"POST {_trunc(_post_label, 30)} [{context_type}] "
+                            f"Tier 3 scout: fired {len(_post_scout_new)} → {_pscout_confirmed} confirmed"
+                        )
+                        # -v: normal scout token
+                        _v_steps.append("T3-scout:CONFIRMED" if context_done else "T3-scout:miss")
 
                     for attempt_number in range(1, attempt_limit + 1):
                         if _timed_out() or mode == "normal":
@@ -4642,6 +4739,14 @@ def _run_post(
                                     break
                             failed_results.append(result)
 
+                        # -vv: POST Deep Tier 3 fire result
+                        _pdeep_confirmed = 1 if context_done else 0
+                        _console.debug(
+                            f"POST {_trunc(_post_label, 30)} [{context_type}] "
+                            f"Deep Tier 3: fired {len(cloud_payloads)} → {_pdeep_confirmed} confirmed"
+                        )
+                        # -v: deep T3 token
+                        _v_steps.append("Deep-T3:CONFIRMED" if context_done else "Deep-T3:miss")
                         cloud_feedback_lessons = _build_cloud_feedback_lessons(
                             attempt_number=attempt_number,
                             total_attempts=attempt_limit,
@@ -4796,6 +4901,16 @@ def _run_post(
                             if _record_context_finding(finding) and len(context_variant_keys) >= context_hit_cap:
                                 context_done = True
                                 break
+
+                # -v: emit POST per-context summary line
+                if _v_steps:
+                    if _timed_out() and (
+                        _v_steps[-1] in ("T1:miss", "T1.5:miss")
+                        or _v_steps[-1].startswith("triage:")
+                    ):
+                        _v_steps.append("timeout")
+                    _v_label = f"POST {_trunc(_post_label, 30)} [{context_type}]"
+                    _console.verbose(f"{_v_label} {' → '.join(_v_steps)}")
 
     finally:
         executor.stop()
