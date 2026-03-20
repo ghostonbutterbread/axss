@@ -1918,6 +1918,77 @@ def make_fast_probe_result(param_name: str, original_value: str) -> "ProbeResult
     )
 
 
+# Optimistic surviving-chars set for T0 (normal mode): we don't test char
+# survival — normal mode T1 bypasses char filtering anyway (_t1_surviving=None).
+# We need *some* chars here so is_exploitable returns True for html_body etc.
+_NORMAL_T0_ASSUMED_SURVIVING: frozenset[str] = frozenset('<>"\'`=;/()')
+
+
+def probe_param_context(
+    url: str,
+    param_name: str,
+    param_value: str,
+    auth_headers: dict[str, str] | None = None,
+    timeout: int = 10,
+) -> "ProbeResult | None":
+    """Lightweight T0 context detection for normal mode.
+
+    Fires one scrapling HTTP GET with a short canary injected into *param_name*
+    and classifies where the canary lands in the response HTML using the existing
+    _classify_context_at() logic.  Returns a ProbeResult with a real context_type
+    and optimistic surviving_chars, or None if the param is not reflected or the
+    request fails.
+
+    Costs: one HTTP request, no Playwright.
+    Does NOT test surviving chars — that is deep mode's job.
+    """
+    canary = "axsst0" + secrets.token_hex(4)
+
+    parsed = urllib.parse.urlparse(url)
+    params = dict(urllib.parse.parse_qsl(parsed.query))
+    params[param_name] = canary
+    probe_url_str = urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(params)))
+
+    try:
+        with FetcherSession(
+            impersonate="chrome",
+            stealthy_headers=True,
+            timeout=timeout,
+            follow_redirects=True,
+            retries=0,
+        ) as session:
+            resp = session.get(
+                probe_url_str,
+                headers={**(auth_headers or {}), "User-Agent": "Mozilla/5.0"},
+            )
+            html: str = getattr(resp, "text", None) or ""
+    except Exception as e:
+        log.debug("probe_param_context failed for %s param=%s: %s", url, param_name, e)
+        return None
+
+    idx = html.find(canary)
+    if idx == -1:
+        return None
+
+    ctx = _classify_context_at(html, idx, canary)
+    if ctx is None:
+        # Inert context (textarea, style, title) — not exploitable
+        return None
+
+    # Attach optimistic surviving_chars so is_injectable returns True.
+    # Normal mode T1 ignores these chars for filtering anyway.
+    ctx_with_chars = _clone_reflection_context(
+        ctx, surviving_chars=_NORMAL_T0_ASSUMED_SURVIVING
+    )
+
+    return ProbeResult(
+        param_name=param_name,
+        original_value=param_value,
+        reflections=[ctx_with_chars],
+        probe_mode="normal_t0",
+    )
+
+
 def enrich_context(context: ParsedContext, probe_results: list[ProbeResult]) -> ParsedContext:
     """Merge active probe results into *context*, prepending confirmed sinks and notes."""
     from dataclasses import replace as dc_replace
