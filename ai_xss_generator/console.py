@@ -119,6 +119,16 @@ def debug(message: str) -> None:
     _after_print()
 
 
+def verbose(message: str) -> None:
+    """[>] Verbose output — printed at -v (VERBOSE_LEVEL >= 1)."""
+    if VERBOSE_LEVEL < 1:
+        return
+    _before_print()
+    prefix = _c(DIM, "[>]") if _tty() else "[>]"
+    print(f"{prefix} {message}", flush=True)
+    _after_print()
+
+
 def risk_color(score: int) -> str:
     """Return ANSI color code based on risk score (only when TTY)."""
     if not _tty():
