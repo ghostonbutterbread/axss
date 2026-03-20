@@ -3298,7 +3298,7 @@ def _run_dom(
                             local_done = True
                             local_payloads = payloads
                             # -vv: DOM local model result
-                            _dom_local_top = _trunc(local_payloads[0] if local_payloads else "", 50)
+                            _dom_local_top = _trunc(_payload_text(local_payloads[0]) if local_payloads else "", 50)
                             _console.debug(
                                 f"DOM {_hit_label} Local: {len(local_payloads)} payloads | top: \"{_dom_local_top}\""
                             )
@@ -3340,7 +3340,7 @@ def _run_dom(
                             )
                             fast_generated_count += len(cloud_payloads)
                             # -vv: DOM cloud payloads
-                            _dom_cloud_top = _trunc(cloud_payloads[0] if cloud_payloads else "", 50)
+                            _dom_cloud_top = _trunc(_payload_text(cloud_payloads[0]) if cloud_payloads else "", 50)
                             _console.debug(
                                 f"DOM {_hit_label} Cloud: {len(cloud_payloads)} payloads | top: \"{_dom_cloud_top}\""
                             )

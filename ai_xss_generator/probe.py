@@ -1955,13 +1955,18 @@ def probe_param_context(
             stealthy_headers=True,
             timeout=timeout,
             follow_redirects=True,
-            retries=0,
+            retries=1,
         ) as session:
             resp = session.get(
                 probe_url_str,
                 headers={**(auth_headers or {}), "User-Agent": "Mozilla/5.0"},
             )
-            html: str = getattr(resp, "text", None) or ""
+            html: str = ""
+            _text = getattr(resp, "text", None)
+            if _text:
+                html = str(_text)
+            elif hasattr(resp, "body") and resp.body:
+                html = resp.body.decode("utf-8", errors="replace")
     except Exception as e:
         log.debug("probe_param_context failed for %s param=%s: %s", url, param_name, e)
         return None
