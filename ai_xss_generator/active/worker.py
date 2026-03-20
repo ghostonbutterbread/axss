@@ -3087,6 +3087,17 @@ def _run_dom(
         finally:
             browser.close()
             pw.stop()
+
+        # -vv: taint discovery result
+        _dom_url_label = _trunc(url.split("?")[0].rsplit("/", 1)[-1] or url, 30)
+        if dom_hits:
+            _console.debug(
+                f"DOM {_dom_url_label} Taint discovery: {len(dom_hits)} paths found"
+            )
+        else:
+            _console.debug(
+                f"DOM {_dom_url_label} Taint discovery: 0 paths — no DOM XSS surface"
+            )
     except Exception as exc:
         put_result(WorkerResult(
             url=url, status="error", error=f"DOM XSS scan failed: {exc}", kind="dom",
@@ -3148,6 +3159,8 @@ def _run_dom(
             args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
         )
         try:
+            _dom_v_confirmed = False
+            _dom_v_taint_count = len(dom_hits)
             for hit in dom_hits:
                 if _timed_out():
                     break
@@ -3169,6 +3182,7 @@ def _run_dom(
                 )
                 _append_reason(escalation_reasons, escalation_policy.note)
                 confirmed = False
+                _hit_label = f"{_trunc(hit.source_name or hit.source_type, 15)}→{_trunc(hit.sink, 15)}"
                 fired_payload = ""
                 fired_url = hit.canary_url
                 detail = (
@@ -3266,6 +3280,11 @@ def _run_dom(
                         if local_ready:
                             local_done = True
                             local_payloads = payloads
+                            # -vv: DOM local model result
+                            _dom_local_top = _trunc(local_payloads[0] if local_payloads else "", 50)
+                            _console.debug(
+                                f"DOM {_hit_label} Local: {len(local_payloads)} payloads | top: \"{_dom_local_top}\""
+                            )
                             if _try_dom_payloads(local_payloads, "local_model"):
                                 break
 
@@ -3303,6 +3322,11 @@ def _run_dom(
                                 seen_cloud_payloads,
                             )
                             fast_generated_count += len(cloud_payloads)
+                            # -vv: DOM cloud payloads
+                            _dom_cloud_top = _trunc(cloud_payloads[0] if cloud_payloads else "", 50)
+                            _console.debug(
+                                f"DOM {_hit_label} Cloud: {len(cloud_payloads)} payloads | top: \"{_dom_cloud_top}\""
+                            )
                             if _try_dom_payloads(cloud_payloads, "cloud_model"):
                                 break
                             cloud_feedback_lessons = _build_cloud_feedback_lessons(
@@ -3329,6 +3353,14 @@ def _run_dom(
                     if local_done and not local_payloads and not use_cloud:
                         break
                     time.sleep(0.05)
+
+                # -vv: DOM cloud fire result
+                _dom_cloud_confirmed_n = 1 if confirmed else 0
+                _console.debug(
+                    f"DOM {_hit_label} Cloud: fired {fast_generated_count} → {_dom_cloud_confirmed_n} confirmed"
+                )
+                if confirmed:
+                    _dom_v_confirmed = True
 
                 if not confirmed and mode != "deep" and use_cloud and not _timed_out() and fast_generated_count > 0:
                     _dom_strategy_hint = _analyze_fast_failure_strategy(
@@ -3425,6 +3457,9 @@ def _run_dom(
                         ai_note=ai_note or escalation_policy.note,
                     )
                 )
+            # -v: DOM URL-level summary
+            _dom_outcome = "CONFIRMED" if _dom_v_confirmed else ("miss" if _dom_v_taint_count else "0 paths")
+            _console.verbose(f"DOM {_dom_url_label} taint:{_dom_v_taint_count} paths → {_dom_outcome}")
         finally:
             browser.close()
             pw.stop()
