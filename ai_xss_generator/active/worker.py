@@ -1328,6 +1328,19 @@ def _run(
                         context_before=_t1_context_before,
                     )
 
+                    # -vv: Tier 1 dispatch
+                    if tier1_candidates:
+                        _t1_top = _trunc(_payload_text(tier1_candidates[0]) or "", 50)
+                        _console.debug(
+                            f"GET ?{_trunc(param_name, 20)} [{context_type}] "
+                            f"Tier 1: {len(tier1_candidates)} candidates | top: \"{_t1_top}\""
+                        )
+                    else:
+                        _console.debug(
+                            f"GET ?{_trunc(param_name, 20)} [{context_type}] "
+                            f"Tier 1: 0 candidates — context not dispatched"
+                        )
+
                     # In normal mode: pre-rank top 10 candidates by HTTP reflection
                     # check. Payloads that reflect in HTTP get promoted above those
                     # that don't; avoids spending Playwright time on filtered payloads.
@@ -1359,6 +1372,20 @@ def _run(
                             _ranked.sort(key=lambda c: -getattr(c, "risk_score", 0))
                             _non_reflecting.sort(key=lambda c: -getattr(c, "risk_score", 0))
                             tier1_candidates = _ranked + _non_reflecting + tier1_candidates[10:]
+                            # -vv: pre-rank result
+                            _prerank_top = ""
+                            if _ranked:
+                                _prerank_top = _trunc(_payload_text(_ranked[0]) or "", 50)
+                                _console.debug(
+                                    f"GET ?{_trunc(param_name, 20)} [{context_type}] "
+                                    f"Pre-rank: {len(_ranked)}/{len(_check_candidates)} reflect | "
+                                    f"top: \"{_prerank_top}\""
+                                )
+                            else:
+                                _console.debug(
+                                    f"GET ?{_trunc(param_name, 20)} [{context_type}] "
+                                    f"Pre-rank: 0/{len(_check_candidates)} reflect — order unchanged"
+                                )
                         except Exception as _rank_exc:
                             log.debug("Tier 1 HTTP pre-rank failed: %s", _rank_exc)
 
@@ -1400,9 +1427,23 @@ def _run(
                         else:
                             _tier1_failed_payloads.append(_t1_text)
 
+                    # -vv: Tier 1 results
+                    _t1_confirmed = 1 if context_done else 0
+                    _console.debug(
+                        f"GET ?{_trunc(param_name, 20)} [{context_type}] "
+                        f"Tier 1: fired {len(tier1_candidates)} → {_t1_confirmed} confirmed"
+                    )
+
                     # ── Tier 1.5: seed mutations (GenXSS-style) after Tier 1 miss ──
                     if not context_done and not _timed_out() and tier1_seeds:
                         tier15_mutations = mutate_seeds(tier1_seeds, _t1_surviving)
+                        # -vv: Tier 1.5 mutations
+                        _t15_top = _trunc(tier15_mutations[0] if tier15_mutations else "", 50)
+                        _console.debug(
+                            f"GET ?{_trunc(param_name, 20)} [{context_type}] "
+                            f"Tier 1.5: {len(tier15_mutations)} mutations from {len(tier1_seeds)} seeds | "
+                            f"top: \"{_t15_top}\""
+                        )
                         for t15_text in tier15_mutations:
                             if context_done or _timed_out():
                                 break
@@ -1434,6 +1475,13 @@ def _run(
                                     break
                             else:
                                 _tier15_failed_payloads.append(t15_text)
+
+                        # -vv: Tier 1.5 results
+                        _t15_confirmed = 1 if context_done else 0
+                        _console.debug(
+                            f"GET ?{_trunc(param_name, 20)} [{context_type}] "
+                            f"Tier 1.5: fired {len(tier15_mutations)} → {_t15_confirmed} confirmed"
+                        )
 
                 # ── Local model triage gate — decides whether this injection point
                 # is worth cloud API spend. It does NOT generate payloads.
