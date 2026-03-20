@@ -1265,6 +1265,7 @@ def _run(
                 _append_reason(escalation_reasons, escalation_policy.note)
                 cloud_plan = CloudPayloadPlan()
                 context_done = False
+                _v_steps: list[str] = []  # -v summary tokens for this context
                 context_variant_keys: set[str] = set()
                 # AI-tried payloads for this context — non-confirmed ones graduate
                 # to tier-1 (survived) in the seed pool after the context loop ends.
@@ -1433,6 +1434,13 @@ def _run(
                         f"GET ?{_trunc(param_name, 20)} [{context_type}] "
                         f"Tier 1: fired {len(tier1_candidates)} → {_t1_confirmed} confirmed"
                     )
+                    # -v: Tier 1 outcome token
+                    if not tier1_candidates:
+                        _v_steps.append("T1:skip(no-cands)")
+                    elif context_done:
+                        _v_steps.append("T1:CONFIRMED")
+                    else:
+                        _v_steps.append("T1:miss")
 
                     # ── Tier 1.5: seed mutations (GenXSS-style) after Tier 1 miss ──
                     if not context_done and not _timed_out() and tier1_seeds:
@@ -1482,6 +1490,11 @@ def _run(
                             f"GET ?{_trunc(param_name, 20)} [{context_type}] "
                             f"Tier 1.5: fired {len(tier15_mutations)} → {_t15_confirmed} confirmed"
                         )
+                        # -v: Tier 1.5 outcome token
+                        if context_done:
+                            _v_steps.append("T1.5:CONFIRMED")
+                        else:
+                            _v_steps.append("T1.5:miss")
 
                 # ── Local model triage gate — decides whether this injection point
                 # is worth cloud API spend. It does NOT generate payloads.
@@ -1496,6 +1509,8 @@ def _run(
                             f"GET ?{_trunc(param_name, 20)} [{context_type}] "
                             f"Triage: skipped (--skip-triage) — auto-escalate"
                         )
+                        # -v: skip_triage token
+                        _v_steps.append("triage:skip(flag)")
                     else:
                         local_model_rounds += 1
                         _triage = _triage_with_local_model(
@@ -1512,6 +1527,14 @@ def _run(
                             f"Triage: score={_triage.score} escalate={'YES' if _triage_approved else 'NO'} | "
                             f"{_trunc(_triage.reason, 60)}"
                         )
+                        # -v: triage outcome token
+                        if _triage_approved:
+                            if mode in ("fast", "normal"):
+                                _v_steps.append("triage:skip(fast)")
+                            else:
+                                _v_steps.append("triage:escalate")
+                        else:
+                            _v_steps.append(f"triage:block(score={_triage.score})")
                         _append_reason(escalation_reasons, f"[triage score={_triage.score}] {_triage.reason}")
                         if _triage.context_notes:
                             _append_reason(escalation_reasons, _triage.context_notes)
@@ -1656,6 +1679,8 @@ def _run(
                                 if len(context_variant_keys) >= context_hit_cap:
                                     context_done = True
                                     break
+                        # -v: fast_omni skips triage entirely
+                        _v_steps.append("triage:skip(omni)")
                         # Skip the normal attempt loop for fast_omni
                         continue  # next (param_name, context_type, variants) tuple
 
@@ -1769,6 +1794,8 @@ def _run(
                             f"GET ?{_trunc(param_name, 20)} [{context_type}] "
                             f"Tier 3 scout: fired {len(_scout_new)} → {_scout_confirmed} confirmed"
                         )
+                        # -v: normal scout token
+                        _v_steps.append("T3-scout:CONFIRMED" if context_done else "T3-scout:miss")
 
                     for attempt_number in range(1, attempt_limit + 1):
                         if _timed_out() or mode == "normal":
@@ -1848,6 +1875,8 @@ def _run(
                             f"GET ?{_trunc(param_name, 20)} [{context_type}] "
                             f"Deep Tier 3: fired {len(cloud_payloads)} → {_deep_confirmed} confirmed"
                         )
+                        # -v: deep T3 token
+                        _v_steps.append("Deep-T3:CONFIRMED" if context_done else "Deep-T3:miss")
                         cloud_feedback_lessons = _build_cloud_feedback_lessons(
                             attempt_number=attempt_number,
                             total_attempts=attempt_limit,
@@ -2023,6 +2052,20 @@ def _run(
                                 )
                     except Exception:
                         pass
+
+                # -v: emit per-context summary line
+                if _v_steps:
+                    # Append timeout token when a timeout cut the context short mid-tier.
+                    # Only append when the last token implies more tiers should have followed.
+                    # NOTE: wrap both sub-conditions in _timed_out() — operator precedence
+                    # means `and` binds tighter than `or`, so the entire OR must be inside.
+                    if _timed_out() and (
+                        _v_steps[-1] in ("T1:miss", "T1.5:miss")
+                        or _v_steps[-1].startswith("triage:")
+                    ):
+                        _v_steps.append("timeout")
+                    _v_label = f"GET ?{_trunc(param_name, 20)} [{context_type}]"
+                    _console.verbose(f"{_v_label} {' → '.join(_v_steps)}")
 
         if not confirmed_findings and not _timed_out():
             for attempt in coordinated_attempts:
