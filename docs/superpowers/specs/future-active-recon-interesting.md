@@ -73,3 +73,62 @@ output — they should be able to read it and immediately know where to look.
 - Rate limiting: respect `--rate` flag — this mode can be slow on large lists;
   consider a `--fetch-workers N` flag for parallelism
 - Playwright not needed for the fetch phase — only for JS-heavy SPAs (opt-in)
+
+---
+
+## Revised Interface Design (2026-03-20)
+
+### CLI Shape
+
+`--interesting` accepts zero or more mode keywords via `nargs='*'`:
+
+```
+axss scan --urls targets.txt --interesting
+axss scan --urls targets.txt --interesting ai
+axss scan --urls targets.txt --interesting crawl
+axss scan --urls targets.txt --interesting crawl ai
+```
+
+Modes are additive. Omitting all keywords = regex-only (current behavior, no change).
+
+### Mode Descriptions
+
+| Mode | Behavior |
+|------|----------|
+| *(bare)* | Regex scoring on input URL list — param names, path shape, known sinks |
+| `ai` | Regex pass + AI triage: one batched call ranks URLs by injection likelihood; useful even without crawl |
+| `crawl` | BFS crawl from seed URLs to discover the full surface; regex filters noise from crawled corpus |
+| `crawl ai` | Full power: crawl + regex + AI golden target ranking |
+
+### Output Format
+
+Regardless of mode, `--interesting` output carries context hints:
+
+```json
+{
+  "url": "https://example.com/search?q=test",
+  "param": "q",
+  "context_type_hint": "html_body",
+  "score": 87,
+  "evidence": "param reflects in <p> body content"
+}
+```
+
+When `context_type_hint` is present, normal mode can skip the T0 probe for that
+param and go straight to T1 — zero extra HTTP requests at scan time.
+
+### Workflow Integration
+
+```
+--interesting crawl ai  →  scored list with context hints
+                         ↓
+normal mode scan        →  reads context_type_hint → skips T0 → T1 straight away
+```
+
+### Implementation Notes (future)
+
+- `crawl` BFS should respect the existing `MAX_PAGES` cap
+- `ai` pass: batch all URLs into one AI call with a structured prompt — do not call per URL
+- Context hints from `--interesting` should be serialised into the `--urls` input file
+  format (or a companion `.hints.json` sidecar) so normal mode can consume them
+- `crawl` without `ai` is the cheapest way to find stored XSS surfaces and upload endpoints
