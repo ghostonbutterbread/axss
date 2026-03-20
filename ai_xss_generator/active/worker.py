@@ -1492,6 +1492,10 @@ def _run(
                     if mode == "deep" and skip_triage:
                         _triage_approved = True
                         _append_reason(escalation_reasons, "skip_triage=True — triage gate bypassed")
+                        _console.debug(
+                            f"GET ?{_trunc(param_name, 20)} [{context_type}] "
+                            f"Triage: skipped (--skip-triage) — auto-escalate"
+                        )
                     else:
                         local_model_rounds += 1
                         _triage = _triage_with_local_model(
@@ -1502,6 +1506,12 @@ def _run(
                             fast_mode=mode in ("fast", "normal"),
                         )
                         _triage_approved = _triage.should_escalate
+                        # -vv: triage result
+                        _console.debug(
+                            f"GET ?{_trunc(param_name, 20)} [{context_type}] "
+                            f"Triage: score={_triage.score} escalate={'YES' if _triage_approved else 'NO'} | "
+                            f"{_trunc(_triage.reason, 60)}"
+                        )
                         _append_reason(escalation_reasons, f"[triage score={_triage.score}] {_triage.reason}")
                         if _triage.context_notes:
                             _append_reason(escalation_reasons, _triage.context_notes)
@@ -1682,6 +1692,17 @@ def _run(
                             "Deep Tier 3 hint built: %d failed payloads, top5=%r",
                             len(_all_failed), [e["payload"][:20] for e in _top5],
                         )
+                        # -vv: deep T3 hint assembled
+                        _blocked_chars = sorted({
+                            _blocked_on_char(p, _probe_surviving)
+                            for p in _all_failed_strs
+                            if _blocked_on_char(p, _probe_surviving)
+                        })
+                        _console.debug(
+                            f"GET ?{_trunc(param_name, 20)} [{context_type}] "
+                            f"Deep Tier 3: {len(_all_failed)} failures → top 5 to cloud "
+                            f"(blocked on {_blocked_chars or 'unknown'})"
+                        )
 
                     # ── Normal mode Tier 3: lightweight cloud scout ──
                     # Instead of the full generate_cloud_payloads path, normal mode
@@ -1702,6 +1723,12 @@ def _run(
                             ai_backend=ai_backend,
                             cli_tool=cli_tool,
                             cli_model=cli_model,
+                        )
+                        # -vv: normal scout returned
+                        _scout_top = _trunc(_scout_payloads[0] if _scout_payloads else "", 50)
+                        _console.debug(
+                            f"GET ?{_trunc(param_name, 20)} [{context_type}] "
+                            f"Tier 3 scout: {len(_scout_payloads)} payloads | top: \"{_scout_top}\""
                         )
                         cloud_escalated = True
                         cloud_model_rounds += 1
@@ -1736,6 +1763,12 @@ def _run(
                                 if _record_context_finding(finding) and len(context_variant_keys) >= context_hit_cap:
                                     context_done = True
                                     break
+                        # -vv: normal scout fire result
+                        _scout_confirmed = 1 if context_done else 0
+                        _console.debug(
+                            f"GET ?{_trunc(param_name, 20)} [{context_type}] "
+                            f"Tier 3 scout: fired {len(_scout_new)} → {_scout_confirmed} confirmed"
+                        )
 
                     for attempt_number in range(1, attempt_limit + 1):
                         if _timed_out() or mode == "normal":
@@ -1809,6 +1842,12 @@ def _run(
                                     break
                             failed_results.append(result)
 
+                        # -vv: deep cloud fire result
+                        _deep_confirmed = 1 if context_done else 0
+                        _console.debug(
+                            f"GET ?{_trunc(param_name, 20)} [{context_type}] "
+                            f"Deep Tier 3: fired {len(cloud_payloads)} → {_deep_confirmed} confirmed"
+                        )
                         cloud_feedback_lessons = _build_cloud_feedback_lessons(
                             attempt_number=attempt_number,
                             total_attempts=attempt_limit,
