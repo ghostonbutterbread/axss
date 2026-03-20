@@ -1051,8 +1051,8 @@ def _run(
     coordinated_attempts: list[Any] = []
     target_disposition: Any = None
 
-    if mode in ("fast", "normal"):
-        # Fast/normal mode: check probe cache first — if we have real probe
+    if mode == "fast":
+        # Fast mode: check probe cache first — if we have real probe
         # data from a prior scan we use it instead of the synthetic fast_omni
         # broad-spectrum fallback, giving targeted context at no extra cost.
         from ai_xss_generator.cache import get_probe
@@ -1072,6 +1072,23 @@ def _run(
                 probe_results.append(make_fast_probe_result(_pn, _pv))
             injectable = list(probe_results)
             reflected = list(probe_results)
+
+    elif mode == "normal":
+        # T0: one HTTP request per param to detect injection context.
+        # Gives real context_type so T1 deterministic payloads can dispatch correctly.
+        # Does not test surviving chars — T1 in normal mode ignores char filtering anyway.
+        from ai_xss_generator.probe import probe_param_context
+        for _pn, _pv in flat_params.items():
+            if _pn.lower() not in testable_params:
+                continue
+            t0_result = probe_param_context(
+                url, _pn, _pv, auth_headers=auth_headers
+            )
+            if t0_result is not None:
+                probe_results.append(t0_result)
+        injectable = [r for r in probe_results if r.is_injectable]
+        reflected  = [r for r in probe_results if r.is_reflected]
+
     else:
         # Deep mode: pre-fetch for clean context, then probe.
         try:

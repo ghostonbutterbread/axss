@@ -155,6 +155,7 @@ def test_get_worker_runs_local_model_per_context_before_any_fallback():
 
     with (
         patch("ai_xss_generator.probe.probe_url", return_value=[probe_result]),
+        patch("ai_xss_generator.probe.probe_param_context", return_value=probe_result),
         patch("ai_xss_generator.cache.get_probe", return_value=[probe_result]),
         patch("ai_xss_generator.parser.parse_target", return_value=_fake_context(url)),
         patch("scrapling.fetchers.FetcherSession", _FakeFetcherSession),
@@ -322,6 +323,7 @@ def test_get_worker_keep_searching_collects_multiple_distinct_local_variants():
 
     with (
         patch("ai_xss_generator.probe.probe_url", return_value=[probe_result]),
+        patch("ai_xss_generator.probe.probe_param_context", return_value=probe_result),
         patch("ai_xss_generator.parser.parse_target", return_value=_fake_context(url)),
         patch("scrapling.fetchers.FetcherSession", _FakeFetcherSession),
         patch("ai_xss_generator.active.executor.ActiveExecutor", FakeExecutor),
@@ -614,6 +616,7 @@ def test_get_worker_forwards_payload_candidate_strategy_to_executor() -> None:
 
     with (
         patch("ai_xss_generator.probe.probe_url", return_value=[probe_result]),
+        patch("ai_xss_generator.probe.probe_param_context", return_value=probe_result),
         patch("ai_xss_generator.parser.parse_target", return_value=_fake_context(url)),
         patch("scrapling.fetchers.FetcherSession", _FakeFetcherSession),
         patch("ai_xss_generator.active.executor.ActiveExecutor", FakeExecutor),
@@ -1436,6 +1439,139 @@ def test_cli_backend_gets_extended_worker_budget() -> None:
     assert active_worker_timeout_budget(45, True, "api") == 120
     assert active_worker_timeout_budget(45, True, "cli") == 180
     assert active_worker_timeout_budget(45, True, "cli", cloud_attempts=2) == 300
+
+
+def test_normal_mode_uses_t0_probe_not_fast_omni():
+    """Normal mode should call probe_param_context per param (T0), not make_fast_probe_result.
+    Verified by: probe_param_context is called, make_fast_probe_result is NOT called,
+    and the real context_type from T0 flows into payloads_for_context (T1)."""
+    url = "https://example.test/search?q=x"
+    t0_result = ProbeResult(
+        param_name="q",
+        original_value="x",
+        reflections=[
+            ReflectionContext(
+                context_type="html_body",
+                surviving_chars=frozenset({"<", ">", '"', "'"}),
+            )
+        ],
+        probe_mode="normal_t0",
+    )
+
+    t0_calls: list[str] = []
+    fast_omni_calls: list[str] = []
+    t1_calls: list[str] = []
+    fire_calls: list[str] = []
+    results: list[WorkerResult] = []
+
+    class FakeExecutor:
+        def __init__(self, auth_headers=None, mode="normal"):
+            pass
+        def start(self): pass
+        def stop(self): pass
+        def fire(self, **kwargs):
+            fire_calls.append(kwargs["payload"])
+            return SimpleNamespace(
+                confirmed=False, method="", detail="",
+                transform_name=kwargs["transform_name"],
+                payload=kwargs["payload"], fired_url=kwargs["url"],
+            )
+
+    def fake_probe_param_context(url, param_name, param_value, **kwargs):
+        t0_calls.append(param_name)
+        return t0_result
+
+    def fake_make_fast_probe_result(param_name, original_value):
+        fast_omni_calls.append(param_name)
+        from ai_xss_generator.probe import make_fast_probe_result as _real
+        return _real(param_name, original_value)
+
+    def fake_payloads_for_context(context_type, surviving, **kwargs):
+        t1_calls.append(context_type)
+        return [PayloadCandidate(
+            payload="<script>alert(1)</script>",
+            title="T1 basic",
+            explanation="basic html injection",
+            test_vector="<script>alert(1)</script>",
+            tags=["html"],
+            risk_score=8,
+            bypass_family="raw",
+        )]
+
+    with (
+        patch("ai_xss_generator.probe.probe_param_context", side_effect=fake_probe_param_context),
+        patch("ai_xss_generator.probe.make_fast_probe_result", side_effect=fake_make_fast_probe_result),
+        patch("ai_xss_generator.cache.get_probe", return_value=None),
+        patch("ai_xss_generator.parser.parse_target", return_value=_fake_context(url)),
+        patch("scrapling.fetchers.FetcherSession", _FakeFetcherSession),
+        patch("ai_xss_generator.active.executor.ActiveExecutor", FakeExecutor),
+        patch(
+            "ai_xss_generator.active.transforms.all_variants_for_probe",
+            return_value=[("q", "html_body", [])],
+        ),
+        patch("ai_xss_generator.active.generator.payloads_for_context",
+              side_effect=fake_payloads_for_context),
+        patch("ai_xss_generator.active.generator.mutate_seeds", return_value=[]),
+        patch("ai_xss_generator.active.worker._get_local_payloads", return_value=[]),
+        patch("ai_xss_generator.models.generate_normal_scout", return_value=[]),
+        patch("ai_xss_generator.seed_pool.SeedPool.add_survived"),
+    ):
+        _run(
+            url=url, rate=25.0, waf_hint=None, model="", cloud_model="",
+            use_cloud=False, timeout_seconds=30, result_queue=None,
+            dedup_registry={}, dedup_lock=threading.Lock(),
+            findings_lock=threading.Lock(), start_time=time.monotonic(),
+            put_result=results.append, auth_headers=None, sink_url=None,
+            ai_backend="api", cli_tool="claude", cli_model=None,
+        )
+
+    # probe_param_context (T0) must have been called for param "q"
+    assert "q" in t0_calls, f"probe_param_context not called; got {t0_calls}"
+    # make_fast_probe_result must NOT be called in normal mode
+    assert fast_omni_calls == [], f"make_fast_probe_result should not be called in normal mode; got {fast_omni_calls}"
+    # T1 must have been called with the real context type from T0
+    assert "html_body" in t1_calls, f"T1 not called with html_body; got {t1_calls}"
+    # T1 candidate must have been fired
+    assert "<script>alert(1)</script>" in fire_calls
+
+
+def test_normal_mode_skips_param_when_t0_returns_none():
+    """When T0 finds no reflection for a param, that param is skipped entirely."""
+    url = "https://example.test/search?q=x"
+    fire_calls: list[str] = []
+    results: list[WorkerResult] = []
+
+    class FakeExecutor:
+        def __init__(self, auth_headers=None, mode="normal"):
+            pass
+        def start(self): pass
+        def stop(self): pass
+        def fire(self, **kwargs):
+            fire_calls.append(kwargs["payload"])
+            return SimpleNamespace(
+                confirmed=False, method="", detail="",
+                transform_name=kwargs["transform_name"],
+                payload=kwargs["payload"], fired_url=kwargs["url"],
+            )
+
+    with (
+        patch("ai_xss_generator.probe.probe_param_context", return_value=None),
+        patch("ai_xss_generator.probe.make_fast_probe_result", side_effect=AssertionError("make_fast_probe_result should not be called in normal mode")),
+        patch("ai_xss_generator.cache.get_probe", return_value=None),
+        patch("ai_xss_generator.parser.parse_target", return_value=_fake_context(url)),
+        patch("scrapling.fetchers.FetcherSession", _FakeFetcherSession),
+        patch("ai_xss_generator.active.executor.ActiveExecutor", FakeExecutor),
+    ):
+        _run(
+            url=url, rate=25.0, waf_hint=None, model="", cloud_model="",
+            use_cloud=False, timeout_seconds=30, result_queue=None,
+            dedup_registry={}, dedup_lock=threading.Lock(),
+            findings_lock=threading.Lock(), start_time=time.monotonic(),
+            put_result=results.append, auth_headers=None, sink_url=None,
+            ai_backend="api", cli_tool="claude", cli_model=None,
+        )
+
+    assert fire_calls == [], f"No payloads should fire if T0 finds no reflection; got {fire_calls}"
 
 
 def test_dom_hit_priority_prefers_fragment_before_query_param() -> None:
