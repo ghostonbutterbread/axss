@@ -32,6 +32,14 @@ from ai_xss_generator.findings import infer_bypass_family
 
 log = logging.getLogger(__name__)
 
+from ai_xss_generator import console as _console
+
+
+def _trunc(s: str, n: int = 50) -> str:
+    """Truncate *s* to *n* chars for display, appending '…' if clipped."""
+    return s if len(s) <= n else s[:n] + "…"
+
+
 _ACTIVE_LOCAL_MODEL_TIMEOUT_SECONDS = 60
 _RESEARCH_LOCAL_MODEL_TIMEOUT_SECONDS = 120
 _ACTIVE_CLOUD_GRACE_SECONDS = 60
