@@ -155,16 +155,17 @@ Replaces `generate_fast_batch` in the fast mode scan path.
 
 ```python
 def generate_fast_seeded_batch(
-    count_per_context: int = 8,
+    cloud_model: str,                    # required — matches generate_fast_batch convention
     waf_hint: str | None = None,
-    model: str = "",
-    cloud_model: str = "",
+    count_per_context: int = 8,
     ai_backend: str = "api",
     cli_tool: str = "claude",
     cli_model: str | None = None,
-    request_timeout_seconds: int = 600,
+    request_timeout_seconds: int = 600,  # 10 min — 7 parallel calls, each ~2-5 min
 ) -> list[PayloadCandidate]:
 ```
+
+`cloud_model` is required (positional first arg), matching the convention of `generate_fast_batch` and every other generation function in `models.py`.
 
 **Behavior:**
 1. For each of 7 context types: build a context-specific prompt with 2–3 golden seeds + technique list
@@ -230,16 +231,16 @@ This prints once per scan, not per URL.
 After the pre-rank block (currently around line 1392), add:
 
 ```python
-# T1 early exit: if no candidates reflect via HTTP pre-rank, the filter
-# is stripping all payloads — Playwright would confirm nothing. Skip T1
-# and go straight to T3-scout so AI can attempt WAF-aware generation.
-if mode == "normal" and _reflect_count == 0 and len(_check_candidates) > 0:
+# Inside the existing try block in the pre-rank section:
+_reflect_count = len(_ranked)  # _ranked = [p for p, hit in zip(...) if hit]
+
+# Immediately after computing _reflect_count, still inside the try:
+if _reflect_count == 0 and len(_check_candidates) > 0:
     _v_steps.append("T1:skip(0-reflect)")
-    # fall through — tier1_candidates cleared so T1 loop is skipped
-    tier1_candidates = []
+    tier1_candidates = []   # T1 loop will be a no-op
 ```
 
-`_reflect_count` must be tracked in the pre-rank block (currently only sort order is tracked).
+**Placement:** This must go **inside** the existing `try` block in the pre-rank section, after `_ranked` is computed but before the final `tier1_candidates = _ranked + _non_reflecting + tier1_candidates[10:]` reassignment. Placing it after the `try/except` would leave `_reflect_count` undefined if the `try` raised an exception.
 
 ### -vv output
 
@@ -250,13 +251,15 @@ Token added to `_v_steps`: `T1:skip(0-reflect)` — visible in the `-v` summary 
 `generate_normal_scout` currently receives top seeds from `SeedPool.select_seeds()`. When T1 was skipped (no prior failures to learn from), it should also receive context-appropriate golden seeds as fallback:
 
 ```python
-# If T1 was skipped (no reflecting payloads), seed T3-scout from golden library
-# rather than relying on SeedPool which may be empty/stale for this context
-if not tier1_failed_seeds:
+# _tier1_failed_payloads is the existing list[str] of payloads that were
+# fired and did not confirm (populated during T1 loop).
+# When T1 was skipped entirely, this list is empty — fall back to golden seeds.
+if not _tier1_failed_payloads:
     from ai_xss_generator.payloads.golden_seeds import seeds_for_context
-    scout_seeds = seeds_for_context(context_type, n=3)
+    _t3_scout_seeds = seeds_for_context(context_type, n=3)
 else:
-    scout_seeds = tier1_failed_seeds[:3]
+    _t3_scout_seeds = _tier1_failed_payloads[:3]
+# Pass _t3_scout_seeds to generate_normal_scout() as the seeds= argument.
 ```
 
 ---
@@ -282,7 +285,7 @@ When `_is_stored` is True for a context:
 
 1. **Skip T1 Cartesian product** — set `tier1_candidates = []`
 2. **Load universal stored payloads** from `stored_universal_payloads()`
-3. **Fire via executor** using the existing stored sweep path (executor already handles follow-up URL navigation when `sink_url` is set or `discovery_style=="stored_get"`)
+3. **Fire via executor** using the existing `executor.fire(..., sink_url=sink_url)` call pattern. The executor already handles follow-up URL navigation when `sink_url` is non-None (this is how deep mode's stored sweep already works — the executor navigates to `sink_url` after injecting the payload, then checks for execution). The `discovery_style` field is **not** read by the executor; routing is entirely driven by `sink_url`. If `sink_url` is None and the stored detection came from a crawled-page hit, the implementer must determine the follow-up URL from the probe result's context (the crawled page URL where the canary appeared — this may require threading through an additional parameter).
 4. **If any confirms** → mark context done, record finding
 5. **If all miss** → build stored-specific prompt and call `generate_deep_stored()` (new function in `models.py`) with:
    - `param_name`, `context_type`
