@@ -135,6 +135,60 @@ Scan artifacts are stored under `~/.axss/cache/<netloc>/` and expire after **24 
 - **`--fresh`**: bypass both caches and re-collect everything from scratch.
 - `--urls FILE` mode never writes or reads the sitemap cache (URL list was pre-enumerated by the user).
 
+## Verbosity / debug output
+
+`-v` and `-vv` give visibility into the payload pipeline without changing scan behavior.
+
+**`-v` — tier summary per param/context**
+
+One line printed after each (param, context) combination completes, showing how far the pipeline went:
+
+```
+[>] GET ?q [html_body] T1:miss → T1.5:miss → triage:escalate → T3-scout:CONFIRMED
+[>] GET ?ref [html_attr_url] T1:CONFIRMED
+[>] GET ?src [js_string_dq] T1:miss → T1.5:miss → triage:block(score=3)
+[>] GET ?id [html_body] T1:miss → T1.5:miss → triage:skip(fast) → T3-scout:miss
+[>] POST /search [html_body] T1:miss → T1.5:miss → triage:escalate → Deep-T3:CONFIRMED
+[>] DOM example.tld/app taint:3 paths → CONFIRMED
+```
+
+No payload content shown — good for a quick audit of what happened.
+
+**`-vv` — real-time tier boundaries**
+
+Inline lines printed as each tier runs — suitable for watching in a tmux split:
+
+```
+[.] GET ?q [html_body] Tier 1: 12 candidates | top: "<script>alert(1)</script>"
+[.] GET ?q [html_body] Pre-rank: 3/12 reflect | top: "<img src=x onerror=alert(1)>"
+[.] GET ?q [html_body] Tier 1: fired 12 → 0 confirmed
+[.] GET ?q [html_body] Tier 1.5: 9 mutations from 3 seeds | top: "<IMG SRC=x onerror=alert(1)>"
+[.] GET ?q [html_body] Tier 1.5: fired 9 → 0 confirmed
+[.] GET ?q [html_body] Triage: score=7 escalate=YES | html_body context, quote chars surviving
+[.] GET ?q [html_body] Tier 3 scout: 3 payloads | top: "<img/src=x onerror=alert(1)>"
+[.] GET ?q [html_body] Tier 3 scout: fired 3 → 1 confirmed
+```
+
+**Diagnosing a miss:**
+
+| What the output shows | What it means |
+|---|---|
+| `T1:skip(no-cands)` | Context dispatch returned nothing — wrong context type or no registered generator |
+| `triage:block(score=N)` | Local model scored surface too low — check context_type and surviving_chars |
+| `T3-scout:miss` / `Deep-T3:miss` | Cloud returned payloads but none confirmed — WAF or context mismatch |
+| `timeout` as last token | Tier was still running when the per-URL time limit hit |
+
+```bash
+# Single verbose — tier chain per param
+axss scan -u "https://target.tld" -v
+
+# Double verbose — inline per-tier lines
+axss scan -u "https://target.tld" -vv
+
+# Combine with deep mode to see triage decisions
+axss scan -u "https://target.tld" --deep -vv
+```
+
 ## Useful commands
 
 ```bash

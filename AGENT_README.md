@@ -113,6 +113,15 @@ axss scan -u "https://target.tld/app" --deep --skip-triage
 # Validate local model triage before deep scanning
 axss models --test-triage
 
+# Tier summary per param (which tiers fired, confirmed or blocked)
+axss scan -u "https://target.tld" -v
+
+# Real-time per-tier lines with payload counts and top seed (good for tmux)
+axss scan -u "https://target.tld" -vv
+
+# Deep scan with full pipeline visibility
+axss scan -u "https://target.tld" --deep -vv
+
 # Stored XSS with optional manual sink override
 axss scan -u "https://target.tld/settings" --stored
 axss scan -u "https://target.tld/settings" --stored --sink-url "https://target.tld/profile"
@@ -149,6 +158,38 @@ axss scan --urls urls.txt -r 2
 ```
 
 ## Debug flags
+
+`-v` (any mode)
+- Prints one summary line per (param, context_type) combination after that context's pipeline completes
+- Format: `[>] GET ?{param} [{context_type}] {tier_chain}`
+- `tier_chain` is ` → `-joined tokens: `T1:CONFIRMED`, `T1:miss`, `T1.5:miss`, `triage:escalate`, `triage:block(score=N)`, `triage:skip(fast)`, `triage:skip(flag)`, `triage:skip(omni)`, `T3-scout:CONFIRMED/miss`, `Deep-T3:CONFIRMED/miss`, `timeout`
+- No payload content — shows which tier succeeded or where the pipeline stopped
+- Use for quick audits: did every param reach triage? Did cloud fire? Which params were blocked?
+
+`-vv` (any mode)
+- Prints inline lines at each tier boundary in real time (suitable for tmux splits)
+- Format: `[.] GET ?{param} [{ctx}] Tier 1: {n} candidates | top: "{payload50}"`
+- Shows: candidate counts, pre-rank reflect ratio, fired/confirmed counts, triage score+reason, cloud payload count
+- All variable-length fields truncated to stay readable in narrow panes
+- Stacks with `-v`: both levels print simultaneously
+
+Tier chain token reference:
+
+| Token | Meaning |
+|---|---|
+| `T1:CONFIRMED` | Tier 1 deterministic payload confirmed XSS |
+| `T1:miss` | All Tier 1 payloads fired, none confirmed |
+| `T1:skip(no-cands)` | `payloads_for_context()` returned empty — context not dispatched |
+| `T1.5:CONFIRMED` | Tier 1.5 mutation confirmed XSS |
+| `T1.5:miss` | All Tier 1.5 mutations fired, none confirmed |
+| `triage:escalate` | Local model scored high enough — escalating to cloud |
+| `triage:block(score=N)` | Local model blocked escalation (score N, should_escalate=False) |
+| `triage:skip(fast)` | Normal mode auto-escalates (no triage gate) |
+| `triage:skip(flag)` | `--skip-triage` bypassed triage gate |
+| `triage:skip(omni)` | `fast_omni` context bypasses triage entirely |
+| `T3-scout:CONFIRMED/miss` | Normal mode Tier 3 cloud scout result |
+| `Deep-T3:CONFIRMED/miss` | Deep mode Tier 3 constraint-aware cloud mutation result |
+| `timeout` | Pipeline was still running when the per-URL time limit hit |
 
 `--skip-triage` (deep mode only)
 - Bypasses the local model triage gate after Tier 1 + 1.5 miss
