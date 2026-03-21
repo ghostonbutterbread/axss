@@ -1794,3 +1794,203 @@ def test_t3_scout_receives_golden_seeds_when_t1_skipped(monkeypatch):
     assert seeds_passed, (
         f"T3-scout must receive non-empty golden seeds when T1 is skipped; got seeds={seeds_passed!r}"
     )
+
+
+def _make_stored_probe_result() -> ProbeResult:
+    """Build a ProbeResult with discovery_style='stored_get' for stored XSS tests."""
+    return ProbeResult(
+        param_name="comment",
+        original_value="x",
+        reflections=[
+            ReflectionContext(
+                context_type="html_body",
+                surviving_chars=frozenset({"<", ">", '"', "'"}),
+            )
+        ],
+        probe_mode="deep",
+        discovery_style="stored_get",
+    )
+
+
+def test_stored_branch_fires_universal_not_t1_in_deep_mode(monkeypatch):
+    """In deep mode, stored_get probe skips T1 and fires stored_universal payloads."""
+    url = "https://example.test/comment?comment=x"
+    stored_probe = _make_stored_probe_result()
+    fire_calls: list[dict] = []
+    results: list[WorkerResult] = []
+
+    class FakeExecutor:
+        def __init__(self, auth_headers=None, mode="normal"):
+            pass
+        def start(self): pass
+        def stop(self): pass
+        def fire(self, **kwargs):
+            fire_calls.append(kwargs)
+            return SimpleNamespace(
+                confirmed=False, method="", detail="",
+                transform_name=kwargs["transform_name"],
+                payload=kwargs["payload"], fired_url=kwargs["url"],
+            )
+
+    with (
+        patch("ai_xss_generator.probe.probe_url", return_value=[stored_probe]),
+        patch("ai_xss_generator.probe.probe_param_context", return_value=stored_probe),
+        patch("ai_xss_generator.cache.get_probe", return_value=[stored_probe]),
+        patch("ai_xss_generator.parser.parse_target", return_value=_fake_context(url)),
+        patch("scrapling.fetchers.FetcherSession", _FakeFetcherSession),
+        patch("ai_xss_generator.active.executor.ActiveExecutor", FakeExecutor),
+        patch(
+            "ai_xss_generator.active.transforms.all_variants_for_probe",
+            return_value=[("comment", "html_body", [])],
+        ),
+        patch("ai_xss_generator.active.generator.payloads_for_context", return_value=[]),
+        patch("ai_xss_generator.active.generator.mutate_seeds", return_value=[]),
+        patch("ai_xss_generator.active.worker._get_local_payloads", return_value=[]),
+        patch("ai_xss_generator.models.generate_deep_stored", return_value=[]),
+        patch("ai_xss_generator.seed_pool.SeedPool.add_survived"),
+    ):
+        _run(
+            url=url, rate=25.0, waf_hint=None, model="", cloud_model="",
+            use_cloud=False, timeout_seconds=30, result_queue=None,
+            dedup_registry={}, dedup_lock=threading.Lock(),
+            findings_lock=threading.Lock(), start_time=time.monotonic(),
+            put_result=results.append, auth_headers=None, sink_url=None,
+            ai_backend="api", cli_tool="claude", cli_model=None,
+            mode="deep",
+        )
+
+    transform_names = [c["transform_name"] for c in fire_calls]
+    assert any(n == "stored_universal" for n in transform_names), (
+        f"stored_universal transform must fire in deep stored mode; got {transform_names}"
+    )
+    assert not any(n == "tier1_deterministic" for n in transform_names), (
+        f"tier1_deterministic must NOT fire in stored path; got {transform_names}"
+    )
+
+
+def test_stored_branch_escalates_to_ai_when_universal_miss(monkeypatch):
+    """When all universal payloads miss, generate_deep_stored is called."""
+    url = "https://example.test/comment?comment=x"
+    stored_probe = _make_stored_probe_result()
+    ai_calls: list[dict] = []
+    results: list[WorkerResult] = []
+
+    class FakeExecutor:
+        def __init__(self, auth_headers=None, mode="normal"):
+            pass
+        def start(self): pass
+        def stop(self): pass
+        def fire(self, **kwargs):
+            return SimpleNamespace(
+                confirmed=False, method="", detail="",
+                transform_name=kwargs["transform_name"],
+                payload=kwargs["payload"], fired_url=kwargs["url"],
+            )
+
+    def fake_generate_deep_stored(**kwargs):
+        ai_calls.append(kwargs)
+        return ["<svg onload=alert(document.domain)>"]
+
+    with (
+        patch("ai_xss_generator.probe.probe_url", return_value=[stored_probe]),
+        patch("ai_xss_generator.probe.probe_param_context", return_value=stored_probe),
+        patch("ai_xss_generator.cache.get_probe", return_value=[stored_probe]),
+        patch("ai_xss_generator.parser.parse_target", return_value=_fake_context(url)),
+        patch("scrapling.fetchers.FetcherSession", _FakeFetcherSession),
+        patch("ai_xss_generator.active.executor.ActiveExecutor", FakeExecutor),
+        patch(
+            "ai_xss_generator.active.transforms.all_variants_for_probe",
+            return_value=[("comment", "html_body", [])],
+        ),
+        patch("ai_xss_generator.active.generator.payloads_for_context", return_value=[]),
+        patch("ai_xss_generator.active.generator.mutate_seeds", return_value=[]),
+        patch("ai_xss_generator.active.worker._get_local_payloads", return_value=[]),
+        patch("ai_xss_generator.models.generate_deep_stored", side_effect=fake_generate_deep_stored),
+        patch("ai_xss_generator.seed_pool.SeedPool.add_survived"),
+    ):
+        _run(
+            url=url, rate=25.0, waf_hint=None, model="", cloud_model="",
+            use_cloud=True, timeout_seconds=30, result_queue=None,
+            dedup_registry={}, dedup_lock=threading.Lock(),
+            findings_lock=threading.Lock(), start_time=time.monotonic(),
+            put_result=results.append, auth_headers=None, sink_url=None,
+            ai_backend="api", cli_tool="claude", cli_model=None,
+            mode="deep",
+        )
+
+    assert ai_calls, (
+        "generate_deep_stored must be called when universal payloads all miss"
+    )
+
+
+def test_stored_branch_not_triggered_in_normal_mode(monkeypatch):
+    """Stored fast path is deep mode only — normal mode fires T1, not stored_universal."""
+    url = "https://example.test/search?q=x"
+    fire_calls: list[dict] = []
+    results: list[WorkerResult] = []
+
+    # Normal mode uses probe_param_context (T0 probe), not probe_url
+    normal_probe = ProbeResult(
+        param_name="q",
+        original_value="x",
+        reflections=[
+            ReflectionContext(
+                context_type="html_body",
+                surviving_chars=frozenset({"<", ">", '"', "'"}),
+            )
+        ],
+        probe_mode="normal_t0",
+    )
+
+    class FakeExecutor:
+        def __init__(self, auth_headers=None, mode="normal"):
+            pass
+        def start(self): pass
+        def stop(self): pass
+        def fire(self, **kwargs):
+            fire_calls.append(kwargs)
+            return SimpleNamespace(
+                confirmed=False, method="", detail="",
+                transform_name=kwargs["transform_name"],
+                payload=kwargs["payload"], fired_url=kwargs["url"],
+            )
+
+    with (
+        patch("ai_xss_generator.probe.probe_param_context", return_value=normal_probe),
+        patch("ai_xss_generator.active.executor._http_reflects_payload", return_value=True),
+        patch("ai_xss_generator.cache.get_probe", return_value=None),
+        patch("ai_xss_generator.parser.parse_target", return_value=_fake_context(url)),
+        patch("scrapling.fetchers.FetcherSession", _FakeFetcherSession),
+        patch("ai_xss_generator.active.executor.ActiveExecutor", FakeExecutor),
+        patch(
+            "ai_xss_generator.active.transforms.all_variants_for_probe",
+            return_value=[("q", "html_body", [])],
+        ),
+        patch("ai_xss_generator.active.generator.payloads_for_context",
+              return_value=[PayloadCandidate(
+                  payload="<script>alert(1)</script>",
+                  title="T1 basic", explanation="basic",
+                  test_vector="<script>alert(1)</script>",
+                  tags=["html"], risk_score=8, bypass_family="raw",
+              )]),
+        patch("ai_xss_generator.active.generator.mutate_seeds", return_value=[]),
+        patch("ai_xss_generator.active.worker._get_local_payloads", return_value=[]),
+        patch("ai_xss_generator.models.generate_normal_scout", return_value=[]),
+        patch("ai_xss_generator.seed_pool.SeedPool.add_survived"),
+    ):
+        _run(
+            url=url, rate=25.0, waf_hint=None, model="", cloud_model="",
+            use_cloud=False, timeout_seconds=30, result_queue=None,
+            dedup_registry={}, dedup_lock=threading.Lock(),
+            findings_lock=threading.Lock(), start_time=time.monotonic(),
+            put_result=results.append, auth_headers=None, sink_url=None,
+            ai_backend="api", cli_tool="claude", cli_model=None,
+        )
+
+    transform_names = [c["transform_name"] for c in fire_calls]
+    assert any(n == "tier1_deterministic" for n in transform_names), (
+        f"Normal mode must fire tier1_deterministic; got {transform_names}"
+    )
+    assert not any(n == "stored_universal" for n in transform_names), (
+        f"stored_universal must NOT fire in normal mode; got {transform_names}"
+    )

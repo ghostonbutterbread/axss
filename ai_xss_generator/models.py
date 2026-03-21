@@ -3353,3 +3353,117 @@ def generate_fast_seeded_batch(
 
     log.info("Fast seeded batch complete: %d unique payloads", len(results))
     return results
+
+
+def generate_deep_stored(
+    cloud_model: str,
+    param_name: str,
+    context_type: str,
+    follow_up_url: str,
+    tried_payloads: list[str],
+    *,
+    count: int = 10,
+    waf_hint: str | None = None,
+    ai_backend: str = "api",
+    cli_tool: str = "claude",
+    cli_model: str | None = None,
+    request_timeout_seconds: int = 120,
+) -> list[str]:
+    """Generate targeted stored XSS payloads after universal payloads missed.
+
+    Called when deep mode's stored universal payload sweep returns no confirms.
+    Sends tried payloads as negative examples and requests mutations.
+
+    Returns list of payload strings. Returns [] on error.
+    """
+    tried_str = "\n".join(f"  {p}" for p in tried_payloads[:5])
+    waf_line = f"\nKnown WAF: {waf_hint}" if waf_hint else ""
+
+    prompt = (
+        f"Stored XSS injection point detected.\n"
+        f"Parameter: {param_name}\n"
+        f"Context: {context_type}\n"
+        f"Follow-up render URL: {follow_up_url}{waf_line}\n\n"
+        f"These universal payloads were tried and did NOT execute:\n{tried_str}\n\n"
+        "The target stores the payload in a database and renders it on a separate page. "
+        "Stored XSS is typically less filtered than reflected. "
+        f"Generate {count} targeted payloads. Focus on: HTML sanitizer bypasses, "
+        "mutation XSS (mXSS) tricks, filter evasion using entity encoding, "
+        "alternative execution sinks (SVG, MathML, details/summary). "
+        "Each payload must call alert(document.domain) or confirm(document.domain).\n"
+        'Return ONLY a JSON array of payload strings: ["payload1","payload2",...]'
+    )
+
+    system_msg = (
+        "You are an expert offensive-security researcher specialising in stored XSS. "
+        "Return strict JSON only — no markdown, no commentary outside the JSON array."
+    )
+
+    resolved_model = cloud_model or OPENAI_FALLBACK_MODEL
+
+    def _parse_response(content: str) -> list[str]:
+        try:
+            data = _extract_json_blob(content)
+            if isinstance(data, list):
+                return [str(p).strip() for p in data if str(p).strip()][:count]
+            if isinstance(data, dict) and "payloads" in data:
+                return [str(p).strip() for p in data["payloads"] if str(p).strip()][:count]
+        except Exception:
+            pass
+        return []
+
+    if ai_backend == "cli":
+        try:
+            from ai_xss_generator.cli_runner import generate_via_cli_with_tool
+            raw, _used = generate_via_cli_with_tool(
+                cli_tool, prompt, model=cli_model or None,
+                timeout_seconds=request_timeout_seconds,
+            )
+            return _parse_response(raw.strip())
+        except Exception as exc:
+            log.debug("generate_deep_stored CLI error: %s", exc)
+        return []
+
+    from ai_xss_generator.config import load_api_key
+
+    def _call_api(base_url: str, api_key: str, model: str) -> list[str]:
+        headers: dict[str, str] = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        if "openrouter" in base_url:
+            headers["HTTP-Referer"] = "https://github.com/axss"
+            headers["X-Title"] = "axss"
+        import requests as _req
+        resp = _req.post(
+            f"{base_url}/chat/completions",
+            headers=headers,
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system_msg},
+                    {"role": "user",   "content": prompt},
+                ],
+                "temperature": 0.7,
+            },
+            timeout=max(1, request_timeout_seconds),
+        )
+        resp.raise_for_status()
+        content = resp.json()["choices"][0]["message"]["content"]
+        return _parse_response(content)
+
+    api_key = os.environ.get("OPENROUTER_API_KEY", "") or load_api_key("openrouter_api_key")
+    if api_key:
+        try:
+            return _call_api(OPENROUTER_BASE_URL, api_key, resolved_model)
+        except Exception as exc:
+            log.debug("generate_deep_stored OpenRouter error: %s", exc)
+
+    api_key = os.environ.get("OPENAI_API_KEY", "") or load_api_key("openai_api_key")
+    if api_key:
+        try:
+            return _call_api(OPENAI_BASE_URL, api_key, resolved_model)
+        except Exception as exc:
+            log.debug("generate_deep_stored OpenAI error: %s", exc)
+
+    return []

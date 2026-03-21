@@ -1125,6 +1125,13 @@ def _run(
         reflected  = [r for r in probe_results if r.is_reflected]
         coordinated_attempts = _coordinated_split_attempts(reflected)
 
+        # Stored XSS paths need longer timeout — each candidate needs inject + follow-up nav
+        if probe_results and any(
+            getattr(r, "discovery_style", "") == "stored_get" for r in probe_results
+        ):
+            _stored_deadline = start_time + 600.0
+            _timed_out = lambda: time.monotonic() > _stored_deadline  # noqa: E731
+
         # Cache probe results for reuse by future fast/normal/deep scans.
         try:
             from ai_xss_generator.cache import put_probe
@@ -1309,6 +1316,108 @@ def _run(
                     except Exception:
                         pass
                     return True
+
+                # ── Deep mode: stored XSS fast path ──
+                # When probe detected stored XSS (canary found on crawled page),
+                # skip the 1944-candidate T1 Cartesian loop and fire a targeted
+                # universal stored payload set instead.
+                _is_stored = (
+                    mode == "deep"
+                    and context_probe_result is not None
+                    and getattr(context_probe_result, "discovery_style", "") == "stored_get"
+                )
+
+                if _is_stored and not context_done and not _timed_out():
+                    from ai_xss_generator.payloads.golden_seeds import stored_universal_payloads
+                    _stored_payloads = stored_universal_payloads()
+                    _stored_tried: list[str] = []
+
+                    _console.debug(
+                        f"GET ?{_trunc(param_name, 20)} [{context_type}] "
+                        f"Stored path: firing {len(_stored_payloads)} universal payloads"
+                    )
+
+                    for _sp in _stored_payloads:
+                        if context_done or _timed_out():
+                            break
+                        _stored_tried.append(_sp)
+                        total_transforms_tried += 1
+                        result = executor.fire(
+                            url=url,
+                            param_name=param_name,
+                            payload=_sp,
+                            all_params=flat_params,
+                            transform_name="stored_universal",
+                            sink_url=sink_url,
+                        )
+                        _ai_tried_payloads.append((_sp, "stored_universal"))
+                        if result.confirmed:
+                            finding = _make_finding(
+                                url=url,
+                                probe_result=context_probe_result,
+                                context_type=context_type,
+                                result=result,
+                                waf=waf_hint,
+                                source="stored_universal",
+                                cloud_escalated=False,
+                            )
+                            if _record_context_finding(finding):
+                                context_done = True
+                                _v_steps.append("stored:universal-CONFIRMED")
+                                break
+
+                    if not context_done:
+                        _v_steps.append("stored:universal-miss")
+                        if use_cloud and not _timed_out():
+                            from ai_xss_generator.models import generate_deep_stored
+                            _stored_ai = generate_deep_stored(
+                                cloud_model=cloud_model,
+                                param_name=param_name,
+                                context_type=context_type,
+                                follow_up_url=sink_url or url,
+                                tried_payloads=_stored_tried[:3],
+                                waf_hint=waf_hint,
+                                ai_backend=ai_backend,
+                                cli_tool=cli_tool,
+                                cli_model=cli_model,
+                            )
+                            for _sap in _stored_ai:
+                                if context_done or _timed_out():
+                                    break
+                                total_transforms_tried += 1
+                                result = executor.fire(
+                                    url=url,
+                                    param_name=param_name,
+                                    payload=_sap,
+                                    all_params=flat_params,
+                                    transform_name="stored_ai",
+                                    sink_url=sink_url,
+                                )
+                                _ai_tried_payloads.append((_sap, "stored_ai"))
+                                if result.confirmed:
+                                    finding = _make_finding(
+                                        url=url,
+                                        probe_result=context_probe_result,
+                                        context_type=context_type,
+                                        result=result,
+                                        waf=waf_hint,
+                                        source="stored_ai",
+                                        cloud_escalated=True,
+                                    )
+                                    if _record_context_finding(finding):
+                                        context_done = True
+                                        _v_steps.append("stored:AI-CONFIRMED")
+                                        break
+                            if not context_done:
+                                _v_steps.append("stored:AI-miss")
+
+                    # Stored path complete — log summary and skip reflected pipeline
+                    if _is_stored:
+                        _v_summary = " → ".join(_v_steps) if _v_steps else "stored:no-steps"
+                        _console.verbose(
+                            f"GET ?{_trunc(param_name, 20)} [{context_type}] {_v_summary}"
+                        )
+                        continue
 
                 # ── Tier 1: deterministic context-specific payloads (normal + deep) ──
                 # Runs before AI/cloud to get cheap, context-aware confirmation
