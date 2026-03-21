@@ -341,7 +341,7 @@ Deep mode worker timeout stays at 300s for reflected paths. For stored paths (`_
 ### T1 early exit
 - When pre-rank returns 0 reflect: `tier1_candidates` is empty, T1 loop not entered, `T1:skip(0-reflect)` in `_v_steps`
 - When pre-rank returns >0 reflect: T1 fires normally
-- T3-scout receives golden seeds when `tier1_failed_seeds` is empty
+- T3-scout receives golden seeds when `_tier1_failed_payloads` is empty
 
 ### Stored branch
 - When `discovery_style == "stored_get"`: T1 candidates empty, universal payloads fired
