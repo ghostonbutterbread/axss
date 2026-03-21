@@ -1515,6 +1515,8 @@ def test_normal_mode_uses_t0_probe_not_fast_omni():
         patch("ai_xss_generator.active.worker._get_local_payloads", return_value=[]),
         patch("ai_xss_generator.models.generate_normal_scout", return_value=[]),
         patch("ai_xss_generator.seed_pool.SeedPool.add_survived"),
+        # Pre-rank: ensure at least one HTTP reflect so T1 is not skipped
+        patch("ai_xss_generator.active.executor._http_reflects_payload", return_value=True),
     ):
         _run(
             url=url, rate=25.0, waf_hint=None, model="", cloud_model="",
@@ -1597,3 +1599,198 @@ def test_dom_hit_priority_prefers_fragment_before_query_param() -> None:
     ordered = sorted([query_hit, hash_hit], key=_dom_hit_priority)
 
     assert ordered == [hash_hit, query_hit]
+
+
+# ── T1 early-exit on 0-reflect pre-rank ──────────────────────────────────────
+
+def _make_normal_t0_probe_result() -> ProbeResult:
+    """Build a T0 ProbeResult with html_body reflection — required for normal mode T1."""
+    return ProbeResult(
+        param_name="q",
+        original_value="x",
+        reflections=[
+            ReflectionContext(
+                context_type="html_body",
+                surviving_chars=frozenset({"<", ">", '"', "'"}),
+            )
+        ],
+        probe_mode="normal_t0",
+    )
+
+
+def test_t1_skipped_when_zero_reflect(monkeypatch):
+    """When all pre-rank HTTP checks return False, T1 loop must not fire."""
+    url = "https://example.test/search?q=x"
+    fire_calls: list[dict] = []
+    results: list[WorkerResult] = []
+
+    class FakeExecutor:
+        def __init__(self, auth_headers=None, mode="normal"):
+            pass
+        def start(self): pass
+        def stop(self): pass
+        def fire(self, **kwargs):
+            fire_calls.append(kwargs)
+            return SimpleNamespace(
+                confirmed=False, method="", detail="",
+                transform_name=kwargs["transform_name"],
+                payload=kwargs["payload"], fired_url=kwargs["url"],
+            )
+
+    with (
+        patch("ai_xss_generator.probe.probe_param_context", return_value=_make_normal_t0_probe_result()),
+        patch("ai_xss_generator.active.executor._http_reflects_payload", return_value=False),
+        patch("ai_xss_generator.cache.get_probe", return_value=None),
+        patch("ai_xss_generator.parser.parse_target", return_value=_fake_context(url)),
+        patch("scrapling.fetchers.FetcherSession", _FakeFetcherSession),
+        patch("ai_xss_generator.active.executor.ActiveExecutor", FakeExecutor),
+        patch(
+            "ai_xss_generator.active.transforms.all_variants_for_probe",
+            return_value=[("q", "html_body", [])],
+        ),
+        patch("ai_xss_generator.active.generator.payloads_for_context",
+              return_value=[PayloadCandidate(
+                  payload="<script>alert(1)</script>",
+                  title="T1 basic", explanation="basic",
+                  test_vector="<script>alert(1)</script>",
+                  tags=["html"], risk_score=8, bypass_family="raw",
+              )]),
+        patch("ai_xss_generator.active.generator.mutate_seeds", return_value=[]),
+        patch("ai_xss_generator.active.worker._get_local_payloads", return_value=[]),
+        patch("ai_xss_generator.models.generate_normal_scout", return_value=[]),
+        patch("ai_xss_generator.seed_pool.SeedPool.add_survived"),
+    ):
+        _run(
+            url=url, rate=25.0, waf_hint=None, model="", cloud_model="",
+            use_cloud=False, timeout_seconds=30, result_queue=None,
+            dedup_registry={}, dedup_lock=threading.Lock(),
+            findings_lock=threading.Lock(), start_time=time.monotonic(),
+            put_result=results.append, auth_headers=None, sink_url=None,
+            ai_backend="api", cli_tool="claude", cli_model=None,
+        )
+
+    # T1 must NOT have fired any payload because 0-reflect should empty tier1_candidates
+    tier1_fire_calls = [c for c in fire_calls if c.get("transform_name") == "tier1_deterministic"]
+    assert tier1_fire_calls == [], (
+        f"T1 should be skipped when 0-reflect; got {len(tier1_fire_calls)} tier1_deterministic fires"
+    )
+
+
+def test_t1_fires_when_some_reflect(monkeypatch):
+    """When at least one pre-rank HTTP check returns True, T1 fires normally."""
+    url = "https://example.test/search?q=x"
+    fire_calls: list[dict] = []
+    results: list[WorkerResult] = []
+
+    class FakeExecutor:
+        def __init__(self, auth_headers=None, mode="normal"):
+            pass
+        def start(self): pass
+        def stop(self): pass
+        def fire(self, **kwargs):
+            fire_calls.append(kwargs)
+            return SimpleNamespace(
+                confirmed=False, method="", detail="",
+                transform_name=kwargs["transform_name"],
+                payload=kwargs["payload"], fired_url=kwargs["url"],
+            )
+
+    with (
+        patch("ai_xss_generator.probe.probe_param_context", return_value=_make_normal_t0_probe_result()),
+        patch("ai_xss_generator.active.executor._http_reflects_payload", return_value=True),
+        patch("ai_xss_generator.cache.get_probe", return_value=None),
+        patch("ai_xss_generator.parser.parse_target", return_value=_fake_context(url)),
+        patch("scrapling.fetchers.FetcherSession", _FakeFetcherSession),
+        patch("ai_xss_generator.active.executor.ActiveExecutor", FakeExecutor),
+        patch(
+            "ai_xss_generator.active.transforms.all_variants_for_probe",
+            return_value=[("q", "html_body", [])],
+        ),
+        patch("ai_xss_generator.active.generator.payloads_for_context",
+              return_value=[PayloadCandidate(
+                  payload="<script>alert(1)</script>",
+                  title="T1 basic", explanation="basic",
+                  test_vector="<script>alert(1)</script>",
+                  tags=["html"], risk_score=8, bypass_family="raw",
+              )]),
+        patch("ai_xss_generator.active.generator.mutate_seeds", return_value=[]),
+        patch("ai_xss_generator.active.worker._get_local_payloads", return_value=[]),
+        patch("ai_xss_generator.models.generate_normal_scout", return_value=[]),
+        patch("ai_xss_generator.seed_pool.SeedPool.add_survived"),
+    ):
+        _run(
+            url=url, rate=25.0, waf_hint=None, model="", cloud_model="",
+            use_cloud=False, timeout_seconds=30, result_queue=None,
+            dedup_registry={}, dedup_lock=threading.Lock(),
+            findings_lock=threading.Lock(), start_time=time.monotonic(),
+            put_result=results.append, auth_headers=None, sink_url=None,
+            ai_backend="api", cli_tool="claude", cli_model=None,
+        )
+
+    # T1 must have fired (reflecting payload was promoted to top of tier1_candidates)
+    tier1_fire_calls = [c for c in fire_calls if c.get("transform_name") == "tier1_deterministic"]
+    assert tier1_fire_calls, (
+        f"T1 should fire when ≥1 pre-rank reflect; got fire_calls={[c['transform_name'] for c in fire_calls]}"
+    )
+
+
+def test_t3_scout_receives_golden_seeds_when_t1_skipped(monkeypatch):
+    """When T1 is skipped (0-reflect), T3-scout receives golden seeds not empty list."""
+    url = "https://example.test/search?q=x"
+    scout_calls: list[dict] = []
+    results: list[WorkerResult] = []
+
+    class FakeExecutor:
+        def __init__(self, auth_headers=None, mode="normal"):
+            pass
+        def start(self): pass
+        def stop(self): pass
+        def fire(self, **kwargs):
+            return SimpleNamespace(
+                confirmed=False, method="", detail="",
+                transform_name=kwargs["transform_name"],
+                payload=kwargs["payload"], fired_url=kwargs["url"],
+            )
+
+    def fake_scout(context_type, waf_hint, frameworks, seeds=None, **kwargs):
+        scout_calls.append({"context_type": context_type, "seeds": seeds})
+        return []
+
+    with (
+        patch("ai_xss_generator.probe.probe_param_context", return_value=_make_normal_t0_probe_result()),
+        patch("ai_xss_generator.active.executor._http_reflects_payload", return_value=False),
+        patch("ai_xss_generator.cache.get_probe", return_value=None),
+        patch("ai_xss_generator.parser.parse_target", return_value=_fake_context(url)),
+        patch("scrapling.fetchers.FetcherSession", _FakeFetcherSession),
+        patch("ai_xss_generator.active.executor.ActiveExecutor", FakeExecutor),
+        patch(
+            "ai_xss_generator.active.transforms.all_variants_for_probe",
+            return_value=[("q", "html_body", [])],
+        ),
+        patch("ai_xss_generator.active.generator.payloads_for_context",
+              return_value=[PayloadCandidate(
+                  payload="<script>alert(1)</script>",
+                  title="T1 basic", explanation="basic",
+                  test_vector="<script>alert(1)</script>",
+                  tags=["html"], risk_score=8, bypass_family="raw",
+              )]),
+        patch("ai_xss_generator.active.generator.mutate_seeds", return_value=[]),
+        patch("ai_xss_generator.active.worker._get_local_payloads", return_value=[]),
+        patch("ai_xss_generator.models.generate_normal_scout", side_effect=fake_scout),
+        patch("ai_xss_generator.seed_pool.SeedPool.add_survived"),
+    ):
+        _run(
+            url=url, rate=25.0, waf_hint=None, model="", cloud_model="",
+            use_cloud=True, timeout_seconds=30, result_queue=None,
+            dedup_registry={}, dedup_lock=threading.Lock(),
+            findings_lock=threading.Lock(), start_time=time.monotonic(),
+            put_result=results.append, auth_headers=None, sink_url=None,
+            ai_backend="api", cli_tool="claude", cli_model=None,
+        )
+
+    # generate_normal_scout must have been called (use_cloud=True)
+    assert scout_calls, "generate_normal_scout was not called — check use_cloud=True path"
+    seeds_passed = scout_calls[0]["seeds"]
+    assert seeds_passed, (
+        f"T3-scout must receive non-empty golden seeds when T1 is skipped; got seeds={seeds_passed!r}"
+    )

@@ -1387,12 +1387,10 @@ def _run(
                                 else:
                                     _non_reflecting.append(_tc)
                             # Reflecting payloads first, then remaining (sorted by risk_score)
-                            _ranked.sort(key=lambda c: -getattr(c, "risk_score", 0))
-                            _non_reflecting.sort(key=lambda c: -getattr(c, "risk_score", 0))
-                            tier1_candidates = _ranked + _non_reflecting + tier1_candidates[10:]
-                            # -vv: pre-rank result
-                            _prerank_top = ""
                             if _ranked:
+                                _ranked.sort(key=lambda c: -getattr(c, "risk_score", 0))
+                                _non_reflecting.sort(key=lambda c: -getattr(c, "risk_score", 0))
+                                tier1_candidates = _ranked + _non_reflecting + tier1_candidates[10:]
                                 _prerank_top = _trunc(_payload_text(_ranked[0]) or "", 50)
                                 _console.debug(
                                     f"GET ?{_trunc(param_name, 20)} [{context_type}] "
@@ -1400,9 +1398,13 @@ def _run(
                                     f"top: \"{_prerank_top}\""
                                 )
                             else:
+                                # 0 of N top candidates reflected — filter is blocking everything.
+                                # Skip all 1944 Playwright checks and escalate to T3-scout.
+                                tier1_candidates = []
+                                _v_steps.append("T1:skip(0-reflect)")
                                 _console.debug(
                                     f"GET ?{_trunc(param_name, 20)} [{context_type}] "
-                                    f"Pre-rank: 0/{len(_check_candidates)} reflect — order unchanged"
+                                    f"Pre-rank: 0/{len(_check_candidates)} reflect — T1 skipped"
                                 )
                         except Exception as _rank_exc:
                             log.debug("Tier 1 HTTP pre-rank failed: %s", _rank_exc)
@@ -1756,11 +1758,19 @@ def _run(
                             str(item).lower()
                             for item in getattr(_cached_context, "frameworks", [])[:3]
                         ]
+                        # Use failed T1 payloads as scout seeds (model learns from what failed).
+                        # When T1 was skipped (0-reflect) or T1 found nothing, fall back to
+                        # golden seeds so the scout has good starting material to mutate.
+                        if _tier1_failed_payloads:
+                            _effective_seeds = _tier1_failed_payloads[:3]
+                        else:
+                            from ai_xss_generator.payloads.golden_seeds import seeds_for_context as _gsc
+                            _effective_seeds = _gsc(context_type, n=3)
                         _scout_payloads = generate_normal_scout(
                             context_type,
                             waf_hint,
                             _scout_frameworks,
-                            seeds=tier1_seeds,
+                            seeds=_effective_seeds,
                             model=cloud_model,
                             ai_backend=ai_backend,
                             cli_tool=cli_tool,
@@ -4660,11 +4670,19 @@ def _run_post(
                             str(item).lower()
                             for item in getattr(generation_context, "frameworks", [])[:3]
                         ]
+                        # Use failed T1 payloads as scout seeds (model learns from what failed).
+                        # When T1 was skipped (0-reflect) or T1 found nothing, fall back to
+                        # golden seeds so the scout has good starting material to mutate.
+                        if _post_tier1_failed_payloads:
+                            _post_effective_seeds = _post_tier1_failed_payloads[:3]
+                        else:
+                            from ai_xss_generator.payloads.golden_seeds import seeds_for_context as _gsc
+                            _post_effective_seeds = _gsc(context_type, n=3)
                         _post_scout_payloads = generate_normal_scout(
                             context_type,
                             waf_hint,
                             _post_scout_frameworks,
-                            seeds=tier1_seeds,
+                            seeds=_post_effective_seeds,
                             model=cloud_model,
                             ai_backend=ai_backend,
                             cli_tool=cli_tool,
