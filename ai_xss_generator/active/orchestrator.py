@@ -418,11 +418,11 @@ def run_active_scan(
     # Normal and deep modes use per-URL/per-param generation; fast mode shares an upfront batch.
     fast_batch: list[Any] = []
     if config.mode == "fast" and url_list:
-        from ai_xss_generator.models import generate_fast_batch
-        step("Fast mode: generating payload batch…")
-        fast_batch = generate_fast_batch(
+        from ai_xss_generator.models import generate_fast_seeded_batch
+        step("Fast mode: generating payload library (7 context-specific batches)…")
+        fast_batch = generate_fast_seeded_batch(
             cloud_model=config.cloud_model,
-            waf=config.waf,
+            waf_hint=config.waf,
             ai_backend=config.ai_backend,
             cli_tool=config.cli_tool,
             cli_model=config.cli_model,

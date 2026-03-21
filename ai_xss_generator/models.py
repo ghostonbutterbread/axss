@@ -3168,3 +3168,188 @@ def generate_normal_scout(
 
     log.debug("generate_normal_scout: no API key available")
     return []
+
+
+# ---------------------------------------------------------------------------
+# Per-context prompt templates for seeded fast batch generation
+# ---------------------------------------------------------------------------
+
+_FAST_SEEDED_CONTEXT_DESCRIPTIONS: dict[str, str] = {
+    "html_body": "Injected directly into HTML document body between tags",
+    "html_attr_event": "Injected into an HTML attribute value where event handlers may be added",
+    "html_attr_url": "Injected into href, src, action, or formaction — supports javascript: URIs",
+    "js_string_dq": "Injected inside a JavaScript double-quoted string literal",
+    "js_string_sq": "Injected inside a JavaScript single-quoted string literal",
+    "js_template": "Injected inside a JavaScript template literal (backtick string)",
+    "url_fragment": "Injected into URL hash/fragment processed by client-side JavaScript",
+}
+
+_FAST_SEEDED_CONTEXT_PROMPT = """\
+Generate {count} XSS payloads for the "{context_type}" injection context.
+
+Context description: {context_description}
+
+Seed payloads (confirmed working — use as mutation starting points):
+{seeds_text}
+
+Mutation techniques to apply independently across your outputs:
+- Keyword case variation: oNlOaD, ScRiPt, AlErT
+- HTML entity encoding of event keywords: &#111;&#110;&#108;&#111;&#97;&#100;
+- URL / double-URL encoding: %6f%6e, %256f%256e
+- Whitespace substitution: %09 %0a %0d /**/ between attributes
+- Alternative event handlers compatible with this context
+- Alternative JS calls: alert() confirm() prompt() (confirm)``
+- Comment injection between tag parts: <!-- --> /**/
+- Null byte insertion: %00 between tag/event keywords{waf_instructions}
+
+Return JSON: {{"payloads": [{{"payload": "...", "title": "...", "tags": ["context:{context_type}"], "bypass_family": "...", "risk_score": 1}}]}}
+Generate exactly {count} payloads.\
+"""
+
+_FAST_SEEDED_WAF_INSTRUCTIONS = """
+- Known {waf} bypass patterns: focus on techniques that evade {waf} specifically"""
+
+
+def generate_fast_seeded_batch(
+    cloud_model: str,
+    waf_hint: str | None = None,
+    count_per_context: int = 8,
+    ai_backend: str = "api",
+    cli_tool: str = "claude",
+    cli_model: str | None = None,
+    request_timeout_seconds: int = 600,
+) -> list[PayloadCandidate]:
+    """Generate seeded context-specific payloads via 7 parallel API calls.
+
+    Replaces generate_fast_batch() in the fast mode scan path. Instead of one
+    cold 50-payload call, fires 7 concurrent context-specific calls each seeded
+    with 2-3 golden library payloads + mutation technique instructions.
+
+    Args:
+        cloud_model:              Cloud model identifier.
+        waf_hint:                 Known/detected WAF name — adds bypass instructions.
+        count_per_context:        Payloads to request per context (default 8, × 7 = 56 total).
+        ai_backend:               "api" (default) or "cli".
+        cli_tool:                 CLI tool name (for cli backend only).
+        cli_model:                CLI model (for cli backend only).
+        request_timeout_seconds:  Per-call HTTP timeout (default 600s = 10 min).
+
+    Returns:
+        Merged deduplicated list[PayloadCandidate]. Returns [] on total failure.
+    """
+    import concurrent.futures
+
+    from ai_xss_generator.payloads.golden_seeds import seeds_for_context
+    from ai_xss_generator.config import load_api_key
+
+    contexts = list(_FAST_SEEDED_CONTEXT_DESCRIPTIONS.keys())
+
+    system_msg = (
+        "You are an expert offensive-security researcher specialising in XSS. "
+        "Return strict JSON only — no markdown, no commentary outside the JSON object."
+    )
+
+    waf_instr = (
+        _FAST_SEEDED_WAF_INSTRUCTIONS.format(waf=waf_hint)
+        if waf_hint else ""
+    )
+
+    def _build_prompt(context_type: str) -> str:
+        seeds = seeds_for_context(context_type, n=3)
+        seeds_text = "\n".join(f"  {s}" for s in seeds) if seeds else "  (none available)"
+        return _FAST_SEEDED_CONTEXT_PROMPT.format(
+            count=count_per_context,
+            context_type=context_type,
+            context_description=_FAST_SEEDED_CONTEXT_DESCRIPTIONS[context_type],
+            seeds_text=seeds_text,
+            waf_instructions=waf_instr,
+        )
+
+    def _candidate_payload_text(c: Any) -> str:
+        return c.payload if hasattr(c, "payload") else str(c)
+
+    def _call_one_context(context_type: str) -> list[PayloadCandidate]:
+        prompt = _build_prompt(context_type)
+        source = f"fast_seeded:{context_type}"
+
+        if ai_backend == "cli":
+            try:
+                from ai_xss_generator.cli_runner import generate_via_cli_with_tool
+                raw, _used = generate_via_cli_with_tool(
+                    cli_tool, prompt, model=cli_model or None,
+                    timeout_seconds=request_timeout_seconds,
+                )
+                data = _extract_json_blob(raw)
+                return _normalize_payloads(data.get("payloads", []), source=source)
+            except Exception as exc:
+                log.debug("generate_fast_seeded_batch CLI error [%s]: %s", context_type, exc)
+                return []
+
+        def _api_call(base_url: str, api_key: str, model: str) -> list[PayloadCandidate]:
+            headers: dict[str, str] = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            }
+            if "openrouter" in base_url:
+                headers["HTTP-Referer"] = "https://github.com/axss"
+                headers["X-Title"] = "axss"
+            resp = requests.post(
+                f"{base_url}/chat/completions",
+                headers=headers,
+                json={
+                    "model": model,
+                    "response_format": {"type": "json_object"},
+                    "messages": [
+                        {"role": "system", "content": system_msg},
+                        {"role": "user",   "content": prompt},
+                    ],
+                    "temperature": 0.7,
+                },
+                timeout=max(1, request_timeout_seconds),
+            )
+            resp.raise_for_status()
+            content = resp.json()["choices"][0]["message"]["content"]
+            data = _extract_json_blob(content)
+            return _normalize_payloads(data.get("payloads", []), source=source)
+
+        resolved_model = cloud_model or OPENAI_FALLBACK_MODEL
+        api_key = os.environ.get("OPENROUTER_API_KEY", "") or load_api_key("openrouter_api_key")
+        if api_key:
+            try:
+                return _api_call(OPENROUTER_BASE_URL, api_key, resolved_model)
+            except Exception as exc:
+                log.debug("generate_fast_seeded_batch OpenRouter error [%s]: %s", context_type, exc)
+
+        api_key = os.environ.get("OPENAI_API_KEY", "") or load_api_key("openai_api_key")
+        if api_key:
+            try:
+                return _api_call(OPENAI_BASE_URL, api_key, resolved_model)
+            except Exception as exc:
+                log.debug("generate_fast_seeded_batch OpenAI error [%s]: %s", context_type, exc)
+
+        return []
+
+    log.info(
+        "Fast seeded batch: firing %d parallel context-specific calls (model=%s)…",
+        len(contexts), cloud_model,
+    )
+
+    results: list[PayloadCandidate] = []
+    seen_payloads: set[str] = set()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(contexts)) as executor:
+        futures = {executor.submit(_call_one_context, ctx): ctx for ctx in contexts}
+        for future in concurrent.futures.as_completed(futures):
+            ctx = futures[future]
+            try:
+                batch = future.result()
+                for candidate in batch:
+                    p_text = _candidate_payload_text(candidate)
+                    if p_text and p_text not in seen_payloads:
+                        seen_payloads.add(p_text)
+                        results.append(candidate)
+            except Exception as exc:
+                log.debug("generate_fast_seeded_batch future error [%s]: %s", ctx, exc)
+
+    log.info("Fast seeded batch complete: %d unique payloads", len(results))
+    return results
