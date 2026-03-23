@@ -2391,6 +2391,7 @@ def _probe_result_for_context(probe_result: Any, context_type: str) -> Any:
         reflection_transform=getattr(probe_result, "reflection_transform", ""),
         probe_mode=getattr(probe_result, "probe_mode", ""),
         tested_chars=getattr(probe_result, "tested_chars", ""),
+        discovered_sink_url=getattr(probe_result, "discovered_sink_url", ""),
         to_sinks=_to_sinks,
         error=getattr(probe_result, "error", None),
     )

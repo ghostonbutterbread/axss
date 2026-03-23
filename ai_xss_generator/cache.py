@@ -258,6 +258,7 @@ def _serialize_probe(probe_results: "list[ProbeResult]") -> dict[str, Any]:
             "probe_mode": pr.probe_mode,
             "reflection_transform": pr.reflection_transform,
             "discovery_style": pr.discovery_style,
+            "discovered_sink_url": getattr(pr, "discovered_sink_url", ""),
             "reflections": reflections,
         })
     return {"cached_at": time.time(), "results": results}
@@ -291,6 +292,7 @@ def _deserialize_probe(data: dict[str, Any]) -> "list[ProbeResult]":
             probe_mode=pr_data.get("probe_mode", ""),
             reflection_transform=pr_data.get("reflection_transform", ""),
             discovery_style=pr_data.get("discovery_style", ""),
+            discovered_sink_url=pr_data.get("discovered_sink_url", ""),
             reflections=reflections,
         ))
     return out
