@@ -267,6 +267,7 @@ class ProbeResult:
     discovery_style: str = ""
     probe_mode: str = ""
     tested_chars: str = PROBE_CHARS
+    discovered_sink_url: str = ""
 
     @property
     def is_reflected(self) -> bool:
@@ -1134,6 +1135,7 @@ def _probe_param(
                                 _clone_reflection_context(ctx, surviving_chars=_surviving)
                                 for ctx in _fu_refs
                             ],
+                            discovered_sink_url=_fu,
                         )
                 except Exception as _exc:
                     log.debug("probe_url: crawled-page sweep error for %s: %s", _fu, _exc)

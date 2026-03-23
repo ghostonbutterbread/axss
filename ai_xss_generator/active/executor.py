@@ -1118,6 +1118,11 @@ def _parse_test_vector(test_vector: str) -> tuple[dict[str, str], str, str]:
         path = parsed.path
     elif "#" in query:
         query, fragment = query.split("#", 1)
+    # Guard: only parse as URL params if the string looks like key=value pairs.
+    # Plain-text descriptions (e.g. "Inject into the highest-confidence sink.")
+    # would otherwise be treated as a param name (keep_blank_values=True quirk).
+    if "=" not in query:
+        return {}, fragment, path
     return dict(urllib.parse.parse_qsl(query, keep_blank_values=True)), fragment, path
 
 

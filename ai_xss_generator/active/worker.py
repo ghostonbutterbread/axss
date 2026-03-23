@@ -1332,9 +1332,17 @@ def _run(
                     _stored_payloads = stored_universal_payloads()
                     _stored_tried: list[str] = []
 
+                    # Use the render page where probe found the stored canary.
+                    # Falls back to the caller-supplied sink_url if probe didn't
+                    # discover one (e.g. explicit --sink-url flag).
+                    _effective_sink_url = (
+                        getattr(context_probe_result, "discovered_sink_url", "") or sink_url
+                    )
+
                     _console.debug(
                         f"GET ?{_trunc(param_name, 20)} [{context_type}] "
                         f"Stored path: firing {len(_stored_payloads)} universal payloads"
+                        + (f" → sink {_effective_sink_url}" if _effective_sink_url else "")
                     )
 
                     for _sp in _stored_payloads:
@@ -1348,7 +1356,7 @@ def _run(
                             payload=_sp,
                             all_params=flat_params,
                             transform_name="stored_universal",
-                            sink_url=sink_url,
+                            sink_url=_effective_sink_url,
                         )
                         _ai_tried_payloads.append((_sp, "stored_universal"))
                         if result.confirmed:
@@ -1374,7 +1382,7 @@ def _run(
                                 cloud_model=cloud_model,
                                 param_name=param_name,
                                 context_type=context_type,
-                                follow_up_url=sink_url or url,
+                                follow_up_url=_effective_sink_url or url,
                                 tried_payloads=_stored_tried[:3],
                                 waf_hint=waf_hint,
                                 ai_backend=ai_backend,
@@ -1391,7 +1399,7 @@ def _run(
                                     payload=_sap,
                                     all_params=flat_params,
                                     transform_name="stored_ai",
-                                    sink_url=sink_url,
+                                    sink_url=_effective_sink_url,
                                 )
                                 _ai_tried_payloads.append((_sap, "stored_ai"))
                                 if result.confirmed:
