@@ -1477,6 +1477,7 @@ def _run(
                             _check_candidates = tier1_candidates[:10]
                             _ranked: list[Any] = []
                             _non_reflecting: list[Any] = []
+                            _error_count = 0
                             for _tc in _check_candidates:
                                 _tc_text = _payload_text(_tc)
                                 if not _tc_text:
@@ -1493,7 +1494,11 @@ def _run(
                                 _reflects = _hrp(_tc_url, _tc_text, auth_headers or {})
                                 if _reflects is True:
                                     _ranked.append(_tc)
+                                elif _reflects is False:
+                                    _non_reflecting.append(_tc)
                                 else:
+                                    # None = curl/WAF error — treat as unknown, not confirmed non-reflecting
+                                    _error_count += 1
                                     _non_reflecting.append(_tc)
                             # Reflecting payloads first, then remaining (sorted by risk_score)
                             if _ranked:
@@ -1506,8 +1511,16 @@ def _run(
                                     f"Pre-rank: {len(_ranked)}/{len(_check_candidates)} reflect | "
                                     f"top: \"{_prerank_top}\""
                                 )
+                            elif _error_count == len(_check_candidates):
+                                # All checks errored (curl/WAF failure) — pre-rank inconclusive,
+                                # keep T1 candidates and let Playwright decide.
+                                _console.debug(
+                                    f"GET ?{_trunc(param_name, 20)} [{context_type}] "
+                                    f"Pre-rank: all {len(_check_candidates)} checks failed (curl/WAF) — "
+                                    f"T1 kept for Playwright"
+                                )
                             else:
-                                # 0 of N top candidates reflected — filter is blocking everything.
+                                # At least one confirmed False (no reflection) — filter is blocking.
                                 # Skip all 1944 Playwright checks and escalate to T3-scout.
                                 tier1_candidates = []
                                 _v_steps.append("T1:skip(0-reflect)")
@@ -4419,6 +4432,7 @@ def _run_post(
                             _post_check = post_tier1_candidates[:10]
                             _post_ranked: list[Any] = []
                             _post_non_reflecting: list[Any] = []
+                            _post_error_count = 0
                             for _ptc in _post_check:
                                 _ptc_text = _payload_text(_ptc)
                                 if not _ptc_text:
@@ -4434,7 +4448,10 @@ def _run_post(
                                 _ptc_reflects = _post_hrp(_ptc_url, _ptc_text, auth_headers or {})
                                 if _ptc_reflects is True:
                                     _post_ranked.append(_ptc)
+                                elif _ptc_reflects is False:
+                                    _post_non_reflecting.append(_ptc)
                                 else:
+                                    _post_error_count += 1
                                     _post_non_reflecting.append(_ptc)
                             _post_ranked.sort(key=lambda c: -getattr(c, "risk_score", 0))
                             _post_non_reflecting.sort(key=lambda c: -getattr(c, "risk_score", 0))
