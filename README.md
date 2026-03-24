@@ -5,7 +5,7 @@ AI-assisted XSS scanning for authorized testing. `axss` crawls a target, probes 
 ## What it does
 
 - Reflected XSS: GET parameter discovery, probing, deterministic context-specific payloads, programmatic mutations, AI-assisted generation, browser confirmation
-- Stored XSS: POST form submission, sink auto-discovery, sink-context override before generation
+- Stored XSS: POST form submission, sink auto-discovery, sink-context override before generation; deep mode fires 12 universal payloads before AI escalation
 - DOM XSS: runtime source→sink discovery with AI-generated payloads and static fallbacks
 - Blind XSS: OOB token injection for payloads that execute out-of-band (admin panels, logs, emails) — **requires `--blind-callback URL`**; disabled by default
 - href/formaction bypass: detects `javascript:` URI injection points (e.g. `<a href="javascript:...">`) and clicks them post-navigation to confirm execution
@@ -82,6 +82,13 @@ Tier 3 — Cloud
   Normal: lightweight seed mutation scout (3 payloads, encoding-heavy)
   Deep: constraint-aware mutation from top failed payloads + blocked chars
         ↓ hit → done (source: cloud_model)
+        ↓ miss
+
+Fallback — Golden Seeds
+  Curated context-specific payloads covering non-obvious bypass techniques
+  (tab-char in javascript:, split-parameter payloads, unusual event handlers, etc.)
+  Fire after all tiers miss — last resort before declaring no finding
+        ↓ hit → done (source: golden_seed)
         ↓ miss → no finding for this param
 ```
 
@@ -149,7 +156,9 @@ One line printed after each (param, context) combination completes, showing how 
 [>] GET ?src [js_string_dq] T1:miss → T1.5:miss → triage:block(score=3)
 [>] GET ?id [html_body] T1:miss → T1.5:miss → triage:skip(fast) → T3-scout:miss
 [>] POST /search [html_body] T1:miss → T1.5:miss → triage:escalate → Deep-T3:CONFIRMED
+[>] GET ?url [html_attr_url] T1:miss → T1.5:miss → triage:escalate → Deep-T3:miss → fallback:CONFIRMED
 [>] DOM example.tld/app taint:3 paths → CONFIRMED
+[>] GET ?name [stored] stored:universal-CONFIRMED
 ```
 
 No payload content shown — good for a quick audit of what happened.
@@ -292,6 +301,24 @@ axss scan --urls urls.txt -r 2
 # Uncapped (default)
 axss scan -u "https://target.tld"
 ```
+
+## Known limitations
+
+The following attack surfaces are not yet covered. Each is a planned future module:
+
+| Surface | Status | Why it's hard |
+|---------|--------|---------------|
+| **WebSocket XSS** | Not implemented | Requires establishing a WS connection, injecting payloads into frames, and listening for execution callbacks — fundamentally different from HTTP request/response |
+| **PostMessage XSS** | Not implemented | Needs a controlled parent frame to send crafted messages and observe handler behavior |
+| **HTTP header injection** (Referer, Origin, X-Forwarded-For) | Not implemented | Scanner currently only injects into URL params and POST form fields |
+| **Prototype pollution → XSS** | Not implemented | Requires DOM observation after property clobber, not simple reflection detection |
+| **Alphanumeric/charset-bypass probes** | Not implemented | Alphanumeric canary gets filtered before reflection; needs bypass-aware probe that avoids special chars entirely |
+| **Overlong UTF-8 / charset-encoded payloads** | Not implemented | Payload library doesn't contain non-standard byte sequences (e.g. `\xC0\xBC` for `<`) |
+| **DOM XSS via `location.hash` / `location.search`** | Partial | Runtime taint tracer hooks eval/innerHTML sinks but doesn't yet model all client-side URL source → sink flows for SPAs |
+| **File upload XSS** (SVG, HTML, XML) | Partial | Upload detection and basic SVG fallbacks exist; confirmation via served file URL not yet reliable |
+| **Pre-rank on WSL** | Infrastructure | `curl_cffi` (scrapling) returns `None` for all HTTP checks on some targets in WSL — T1 fires all 1,944 candidates via Playwright, exhausting the budget before AI escalation |
+
+The long-term goal is a modular surface architecture where each surface (WebSocket, PostMessage, header injection, file upload) is a self-contained module that understands its own attack grammar, probing strategy, and execution verification — so the right module is selected based on what the crawler discovers.
 
 ## Notes
 

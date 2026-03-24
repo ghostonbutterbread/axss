@@ -46,6 +46,11 @@ input
       Normal: generate_normal_scout() — seeds + "mutate with encoding" — 3 payloads.
       Deep: constraint-aware mutation — top 5 failed payloads + blocked_on per payload — 8 payloads.
       Hit → ConfirmedFinding(source="cloud_model"), stop.
+  - Fallback: golden seed library
+      Curated context-specific payloads covering non-obvious bypass techniques:
+      tab-char in javascript:, split-parameter injection, unusual event handlers, etc.
+      Fires after cloud miss as a last resort.
+      Hit → ConfirmedFinding(source="golden_seed"), stop.
 
 5. execute
   - Playwright browser execution
@@ -80,8 +85,9 @@ input
 - Manual `--sink-url` always wins if provided.
 - Otherwise stored sink discovery is:
   1. redirect `Location`
-  2. crawled-page canary sweep
+  2. crawled-page canary sweep — `discovered_sink_url` is propagated through `ProbeResult` and the probe cache so subsequent runs reuse it without re-sweeping
 - When a sink page is discovered, its rendering context overrides the POST response context before payload generation.
+- **Deep mode fast path:** when a stored XSS context is confirmed, 12 universal stored payloads fire first (`stored:universal-CONFIRMED`) before any AI escalation. This catches common cases (`<script>alert()</script>`, `<img onerror>`, etc.) without a cloud call.
 
 ## DOM XSS behavior
 
@@ -189,6 +195,8 @@ Tier chain token reference:
 | `triage:skip(omni)` | `fast_omni` context bypasses triage entirely |
 | `T3-scout:CONFIRMED/miss` | Normal mode Tier 3 cloud scout result |
 | `Deep-T3:CONFIRMED/miss` | Deep mode Tier 3 constraint-aware cloud mutation result |
+| `fallback:CONFIRMED/miss` | Golden seed fallback result (fires after cloud miss) |
+| `stored:universal-CONFIRMED` | Deep mode stored XSS fast path confirmed via universal payload |
 | `timeout` | Pipeline was still running when the per-URL time limit hit |
 
 `--skip-triage` (deep mode only)
@@ -213,6 +221,7 @@ Tier chain token reference:
 | `local_model` | Local model generation hit (deep mode) |
 | `cloud_model` | Cloud generation hit (normal scout or deep mutation) |
 | `dom_xss_runtime` | DOM taint analysis hit |
+| `golden_seed` | Golden seed fallback hit (post-cloud miss) |
 
 ## Scope resolution order
 
@@ -242,6 +251,23 @@ Deduplication and other in-memory operations are never rate-limited. Set `--rate
 - Reports go to `~/.axss/reports/`
 - Config lives in `~/.axss/config.json`
 - Keys live in `~/.axss/keys` — includes slots for H1, Bugcrowd, and Intigriti API credentials
+
+## Known limitations and future surface modules
+
+The following surfaces are not yet covered. Each is tracked as a future module:
+
+| Surface | Gap | Notes |
+|---------|-----|-------|
+| WebSocket XSS | Not implemented | Requires WS frame injection and execution callback listener |
+| PostMessage XSS | Not implemented | Needs controlled parent frame to send crafted messages |
+| HTTP header injection (Referer, Origin, X-Forwarded-For) | Not implemented | Scanner only injects into URL params and form fields |
+| Prototype pollution → XSS | Not implemented | Requires DOM observation after property clobber |
+| Alphanumeric/charset-filtered probes | Not implemented | Alphanumeric canary gets filtered; bypass-aware probe needed |
+| Overlong UTF-8 / charset-encoded payloads | Not implemented | Non-standard byte sequences not in payload library |
+| DOM XSS (full client-side flow) | Partial | Runtime tracer hooks sinks but does not fully model all SPA URL source → sink flows |
+| File upload XSS (SVG, HTML, XML) | Partial | Upload detection and basic SVG fallbacks work; served-file confirmation unreliable |
+
+**Pre-rank infrastructure note:** `curl_cffi` (scrapling) returns `None` for all HTTP pre-rank checks on some targets (reproducible on xssy.uk in WSL). `None` is treated as an error, not as a confirmed non-reflect — T1 fires all candidates via Playwright, consuming budget before AI escalation. Fix: native Playwright HEAD checks or smarter T1 pruning.
 
 ## Automation guidance
 
