@@ -123,6 +123,7 @@ def _work_item_key(kind: str, item: Any) -> str:
 # ---------------------------------------------------------------------------
 
 _LIVENESS_TIMEOUT = 5          # seconds per HEAD/GET
+_LIVENESS_SLOW_THRESHOLD = 3.0 # seconds; URLs slower than this are dropped as "too slow to scan"
 _LIVENESS_WORKERS = 50         # max concurrent connections (further capped by rate)
 _LIVENESS_MIN_LIST  = 2        # skip check for tiny lists
 
@@ -195,11 +196,15 @@ def _filter_live_urls(
     auth_headers: dict[str, str] | None = None,
     rate_limiter: _GlobalRateLimiter | None = None,
 ) -> list[str]:
-    """HEAD-check every URL concurrently; drop only URLs that are provably gone.
+    """HEAD-check every URL concurrently; drop URLs that are dead or too slow to scan.
 
-    "Provably gone" means:
+    "Dead" means:
       - The host is unreachable (DNS failure, connection refused, timeout)
       - The server returned 404 Not Found or 410 Gone
+
+    "Too slow" means the HEAD/GET response took ≥ _LIVENESS_SLOW_THRESHOLD seconds.
+    Slow URLs would stall per-param probe fetches (20s timeout each) and waste the
+    entire worker budget without producing useful results.
 
     Everything else is treated as alive.  In particular:
       - 401/403 — server is up; auth or a WAF JS challenge is gating it.
@@ -231,8 +236,9 @@ def _filter_live_urls(
 
     limiter = rate_limiter or _GlobalRateLimiter(0)
 
-    def _check(url: str) -> tuple[str, bool, str]:
+    def _check(url: str) -> tuple[str, bool, str, float]:
         limiter.acquire()
+        t0 = time.monotonic()
         try:
             r = requests.head(url, headers=req_headers,
                               timeout=_LIVENESS_TIMEOUT, allow_redirects=True)
@@ -243,10 +249,11 @@ def _filter_live_urls(
                                  timeout=_LIVENESS_TIMEOUT,
                                  allow_redirects=True, stream=True)
                 r.close()
+            elapsed = time.monotonic() - t0
             alive = r.status_code not in _GONE_STATUSES
-            return url, alive, str(r.status_code)
+            return url, alive, str(r.status_code), elapsed
         except RequestException as exc:
-            return url, False, str(exc)
+            return url, False, str(exc), time.monotonic() - t0
 
     # Cap concurrent connections to rate when rate-limited so we never
     # burst more threads than the token bucket allows per second.
@@ -257,26 +264,41 @@ def _filter_live_urls(
         n_workers = min(rate_ceil, _LIVENESS_WORKERS, len(url_list))
 
     step(f"Pre-flight liveness check: probing {len(url_list)} URL(s)…")
-    results: list[tuple[str, bool, str]] = []
+    results: list[tuple[str, bool, str, float]] = []
     with ThreadPoolExecutor(max_workers=n_workers) as pool:
         futures = {pool.submit(_check, u): u for u in url_list}
         for fut in as_completed(futures):
             results.append(fut.result())
 
-    dead = [(u, reason) for u, ok, reason in results if not ok]
-    live_set = {u for u, ok, _ in results if ok}
+    dead = [(u, reason) for u, ok, reason, _ in results if not ok]
+    slow = [
+        (u, elapsed)
+        for u, ok, _, elapsed in results
+        if ok and elapsed >= _LIVENESS_SLOW_THRESHOLD
+    ]
+    live_set = {u for u, ok, _, elapsed in results if ok and elapsed < _LIVENESS_SLOW_THRESHOLD}
     # Preserve original order
     live = [u for u in url_list if u in live_set]
 
     if dead:
-        warn(f"Pre-flight: removed {len(dead)} dead URL(s) "
-             f"({len(live)} of {len(url_list)} alive)")
+        warn(f"Pre-flight: removed {len(dead)} dead URL(s)")
         for dead_url, reason in dead[:5]:
             warn(f"  dead  {dead_url}  →  {reason}")
         if len(dead) > 5:
             warn(f"  … and {len(dead) - 5} more")
-    else:
+    if slow:
+        warn(
+            f"Pre-flight: removed {len(slow)} slow URL(s) "
+            f"(response time ≥ {_LIVENESS_SLOW_THRESHOLD:.0f}s — likely stalled or rate-limiting)"
+        )
+        for slow_url, elapsed in slow[:5]:
+            warn(f"  slow  {slow_url}  →  {elapsed:.1f}s")
+        if len(slow) > 5:
+            warn(f"  … and {len(slow) - 5} more")
+    if not dead and not slow:
         info(f"Pre-flight: all {len(live)} URL(s) alive")
+    else:
+        info(f"Pre-flight: {len(live)} of {len(url_list)} URL(s) will be scanned")
 
     return live
 
@@ -335,22 +357,26 @@ def _dedup_urls_by_path_shape(url_list: list[str]) -> list[str]:
         norm = _path_shape(p.path)
         entries.append((url, p.netloc, norm))
 
-    # Pass 2 — sibling detection
-    # Group by (netloc, parent_norm_path); parent = everything except last segment
-    parent_groups: dict[str, list[int]] = defaultdict(list)
+    # Pass 2 — multi-depth sibling detection
+    # For each URL and each non-parametric segment position j, build a "masked key"
+    # where position j is replaced with '*' and everything else is preserved.
+    # If ≥ SIBLING_THRESHOLD URLs share the same masked key, position j is parametric
+    # for all of them.  This handles middle-segment variation (e.g. /tag/*/feed)
+    # not just last-segment variation that the old parent-group approach covered.
+    position_groups: dict[tuple, list[tuple[int, int]]] = defaultdict(list)
     for i, (_, netloc, norm_path) in enumerate(entries):
         parts = [s for s in norm_path.split('/') if s]
-        if len(parts) >= 1:
-            parent = netloc + '/' + '/'.join(parts[:-1])
-            parent_groups[parent].append(i)
+        for j, seg in enumerate(parts):
+            if seg == '*':          # already parametric from pass 1
+                continue
+            masked = tuple(parts[:j]) + ('*',) + tuple(parts[j + 1:])
+            position_groups[(netloc, masked)].append((i, j))
 
-    # Indices whose last segment should be forced to '*'
-    sibling_collapse: set[int] = {
-        idx
-        for idxs in parent_groups.values()
-        if len(idxs) >= _SIBLING_THRESHOLD
-        for idx in idxs
-    }
+    # Collect (url_idx, seg_pos) pairs that are parametric by sibling count
+    parametric_positions: set[tuple[int, int]] = set()
+    for url_pos_pairs in position_groups.values():
+        if len(url_pos_pairs) >= _SIBLING_THRESHOLD:
+            parametric_positions.update(url_pos_pairs)
 
     # Build final shape keys and pick representatives
     seen_shapes: dict[str, str] = {}   # final_shape_key → representative URL
@@ -358,10 +384,12 @@ def _dedup_urls_by_path_shape(url_list: list[str]) -> list[str]:
     collapsed_examples: list[str] = []
 
     for i, (url, netloc, norm_path) in enumerate(entries):
-        if i in sibling_collapse:
-            parts = [s for s in norm_path.split('/') if s]
-            parts[-1] = '*'
-            norm_path = '/' + '/'.join(parts)
+        parts = [s for s in norm_path.split('/') if s]
+        final_parts = [
+            '*' if (seg == '*' or (i, j) in parametric_positions) else seg
+            for j, seg in enumerate(parts)
+        ]
+        norm_path = '/' + '/'.join(final_parts)
 
         p = urllib.parse.urlparse(url)
         shape_key = f"{p.scheme}://{netloc}{norm_path}"
@@ -412,6 +440,23 @@ def _strip_tracking_params(url_list: list[str]) -> list[str]:
     return result
 
 
+def _filter_urls_with_params(url_list: list[str]) -> list[str]:
+    """Drop URLs that have no query parameters.
+
+    These can never be reflected-XSS targets, and in normal mode DOM scanning
+    also only exercises query-param sources — so they would always produce a
+    no_params result without firing a single payload.
+    """
+    result = [u for u in url_list if urllib.parse.urlparse(u).query]
+    dropped = len(url_list) - len(result)
+    if dropped:
+        warn(
+            f"Pre-flight: removed {dropped} URL(s) with no query parameters "
+            f"({len(result)} remaining)"
+        )
+    return result
+
+
 def run_active_scan(
     urls: Sequence[str],
     config: ActiveScanConfig,
@@ -450,10 +495,20 @@ def run_active_scan(
                 rate_limiter=rate_limiter,
             )
 
+    # Split into param-bearing URLs (for reflected GET and normal-mode DOM) vs all URLs
+    # (for deep-mode DOM, which can test non-query-param sources like fragment/referrer).
+    # Filtering happens even when scan_reflected is off so the DOM list stays clean in
+    # normal mode where _dom_sources would be empty for no-param URLs anyway.
+    url_list_with_params: list[str] = (
+        _filter_urls_with_params(url_list)
+        if url_list and config.mode != "deep"
+        else url_list
+    )
+
     # Fast mode: generate one payload batch upfront for all workers to share.
     # Normal and deep modes use per-URL/per-param generation; fast mode shares an upfront batch.
     fast_batch: list[Any] = []
-    if config.mode == "fast" and url_list:
+    if config.mode == "fast" and url_list_with_params:
         from ai_xss_generator.models import generate_fast_seeded_batch
         step("Fast mode: generating payload library (7 context-specific batches)…")
         fast_batch = generate_fast_seeded_batch(
@@ -473,8 +528,13 @@ def run_active_scan(
     # are consumed by both pass-types of the *same* URL rather than two different
     # URLs running in parallel.  This keeps the full rate budget focused on one
     # URL at a time instead of spreading it thin across the entire list.
-    get_items: list[tuple[str, Any]] = [("get", u) for u in url_list] if config.scan_reflected else []
-    dom_items: list[tuple[str, Any]] = [("dom", u) for u in url_list] if config.scan_dom else []
+    #
+    # GET (reflected) always uses param-bearing URLs only.
+    # DOM uses param-bearing URLs in fast/normal mode (only query-param sources tested);
+    # in deep mode DOM can test non-query-param sources so the full url_list is used.
+    _dom_url_list = url_list if config.mode == "deep" else url_list_with_params
+    get_items: list[tuple[str, Any]] = [("get", u) for u in url_list_with_params] if config.scan_reflected else []
+    dom_items: list[tuple[str, Any]] = [("dom", u) for u in _dom_url_list] if config.scan_dom else []
     paired = [item for pair in zip(get_items, dom_items) for item in pair]
     paired += get_items[len(dom_items):]   # remainder when scan_dom is off
     paired += dom_items[len(get_items):]   # remainder when scan_reflected is off
@@ -509,7 +569,7 @@ def run_active_scan(
             info("Session complete — all work items were already finished in a prior run.")
             _print_summary(prior_results)
             return prior_results
-        if config.scan_reflected and not url_list:
+        if config.scan_reflected and not url_list_with_params:
             _reasons.append("no GET URLs with testable query parameters")
         if config.scan_stored and not post_form_list:
             _reasons.append("no POST forms discovered (try without --no-crawl)")
@@ -670,7 +730,7 @@ def run_active_scan(
             if not proc.is_alive():
                 proc.join(timeout=1)
                 completed += 1
-                log.debug("Worker done for %s (%d/%d)", plabel, completed, total_count)
+                info(f"[worker] done ({elapsed:.0f}s) → {plabel}  [{completed}/{total_count}]")
             else:
                 still_running.append((proc, plabel, pkind, started_at, result_url))
         active_procs = still_running
@@ -1043,6 +1103,8 @@ def _log_result(r: WorkerResult) -> None:
         info(f"[active] {label} — {r.url}{budget_note}")
         if r.dead_reason:
             info(f"    {r.dead_reason}")
+    elif r.status == "no_params":
+        info(f"[active] skip (no testable params) — {r.url}")
     elif r.status == "error":
         warn(f"[active] error — {r.url}: {r.error}{budget_note}")
 

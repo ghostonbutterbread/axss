@@ -2000,14 +2000,19 @@ def main(argv: list[str] | None = None) -> int:
         _want_uploads   = True
         _want_dom       = True
 
-    # Default: no explicit flag → active scan all types
+    # Default: no explicit flag → active scan all types.
+    # --fast is reflected-only by design; don't enable DOM/stored unless explicitly requested.
     # --generate takes explicit precedence; XSS type flags also activate the scanner.
     if not _want_generate and not _is_active_mode:
-        _want_reflected = True
-        _want_stored    = True
-        _want_uploads   = True
-        _want_dom       = True
         _is_active_mode = True
+        if getattr(args, "fast", False):
+            # Fast mode defaults to reflected-only; user must add --dom/--stored explicitly.
+            _want_reflected = True
+        else:
+            _want_reflected = True
+            _want_stored    = True
+            _want_uploads   = True
+            _want_dom       = True
 
     # --- Active scan mode ---
     # --generate always wins: if explicitly requested, route to payload generation
