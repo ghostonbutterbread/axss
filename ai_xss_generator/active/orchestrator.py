@@ -351,34 +351,30 @@ def _filter_dead_domains(
     if not domains:
         return url_list
 
-    step(f"Domain reachability check: probing {len(domains)} domain(s)…")
+    step(f"Verifying {len(domains)} host(s) are live…")
 
     dead_domains: set[str] = set()
 
-    def _probe(root_url: str) -> tuple[str, bool, str]:
+    def _probe(root_url: str) -> tuple[str, bool]:
         try:
             r = requests.head(
                 root_url, headers=req_headers,
                 timeout=_DOMAIN_CHECK_TIMEOUT, allow_redirects=True,
             )
             # Any HTTP response = domain is reachable (even error codes)
-            return root_url, True, str(r.status_code)
-        except RequestException as exc:
-            return root_url, False, str(exc)
+            return root_url, True
+        except RequestException:
+            return root_url, False
 
     n_workers = min(len(domains), _LIVENESS_WORKERS)
     with ThreadPoolExecutor(max_workers=n_workers) as pool:
         futures = {pool.submit(_probe, root): root for root in domains}
         for fut in as_completed(futures):
-            root, alive, reason = fut.result()
+            root, alive = fut.result()
             if not alive:
                 dead_domains.add(root)
-                warn(f"Domain unreachable (dropping all its URLs): {root}  →  {reason}")
-            else:
-                log.debug("Domain reachable: %s (%s)", root, reason)
 
     if not dead_domains:
-        info(f"Domain check: all {len(domains)} domain(s) reachable")
         return url_list
 
     result = [
@@ -388,8 +384,7 @@ def _filter_dead_domains(
     ]
     dropped = len(url_list) - len(result)
     warn(
-        f"Domain check: dropped {dropped} URL(s) across {len(dead_domains)} dead domain(s) "
-        f"({len(result)} remaining)"
+        f"Pre-flight: removed {dropped} URL(s) on {len(dead_domains)} unreachable host(s)"
     )
     return result
 
