@@ -930,6 +930,7 @@ def run_worker(
     research: bool = False,
     fast_batch: "list[Any] | None" = None,
     skip_triage: bool = False,
+    shared_rate_limiter: Any = None,
 ) -> None:
     """Target function for multiprocessing.Process.
 
@@ -973,6 +974,7 @@ def run_worker(
             research=research,
             fast_batch=fast_batch,
             skip_triage=skip_triage,
+            shared_rate_limiter=shared_rate_limiter,
         )
     except Exception as exc:
         log.exception("Worker crashed for %s", url)
@@ -1009,6 +1011,7 @@ def _run(
     research: bool = False,
     fast_batch: "list[Any] | None" = None,
     skip_triage: bool = False,
+    shared_rate_limiter: Any = None,
 ) -> None:
     deadline = start_time + active_worker_timeout_budget(
         timeout_seconds,
@@ -1119,6 +1122,7 @@ def _run(
         probe_results = probe_url(
             url, rate=rate, waf=waf_hint, auth_headers=auth_headers,
             sink_url=sink_url, crawled_pages=crawled_pages,
+            shared_rate_limiter=shared_rate_limiter,
         )
 
         injectable = [r for r in probe_results if r.is_injectable]
@@ -4039,6 +4043,7 @@ def run_post_worker(
     research: bool = False,
     fast_batch: "list[Any] | None" = None,
     skip_triage: bool = False,
+    shared_rate_limiter: Any = None,
 ) -> None:
     """Worker entry point for POST form targets. Mirrors run_worker() for GET URLs."""
     start_time = time.monotonic()
@@ -4076,6 +4081,7 @@ def run_post_worker(
             research=research,
             fast_batch=fast_batch,
             skip_triage=skip_triage,
+            shared_rate_limiter=shared_rate_limiter,
         )
     except Exception as exc:
         log.exception("POST worker crashed for %s", post_form.action_url)
@@ -4113,6 +4119,7 @@ def _run_post(
     research: bool = False,
     fast_batch: "list[Any] | None" = None,
     skip_triage: bool = False,
+    shared_rate_limiter: Any = None,
 ) -> None:
     from ai_xss_generator.probe import probe_post_form
     from ai_xss_generator.active.executor import ActiveExecutor
@@ -4190,6 +4197,7 @@ def _run_post(
             auth_headers=auth_headers,
             crawled_pages=crawled_pages,
             sink_url=sink_url,
+            shared_rate_limiter=shared_rate_limiter,
         )
         injectable = [r for r in probe_results if r.is_injectable]
         reflected = [r for r in probe_results if r.is_reflected]

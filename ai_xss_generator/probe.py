@@ -1349,6 +1349,7 @@ def probe_url(
     auth_headers: dict[str, str] | None = None,
     sink_url: str | None = None,
     crawled_pages: list[str] | None = None,
+    shared_rate_limiter: Any = None,
 ) -> list[ProbeResult]:
     """Probe all query parameters of *url* for XSS reflection contexts.
 
@@ -1513,7 +1514,9 @@ def probe_url(
     else:
         # Parallel probe: each thread gets its own FetcherSession; the shared
         # token-bucket rate limiter ensures the global req/s cap is respected.
-        rl = _RateLimiter(rate)
+        # If a cross-process shared limiter is provided by the orchestrator, use
+        # it so the total rate stays within budget across all concurrent workers.
+        rl = shared_rate_limiter if shared_rate_limiter is not None else _RateLimiter(rate)
         _cycle_lock = threading.Lock()
 
         def _next_ua_proxy() -> tuple[str, str | None]:
@@ -1601,6 +1604,7 @@ def probe_post_form(
     auth_headers: dict[str, str] | None = None,
     crawled_pages: list[str] | None = None,
     sink_url: str | None = None,
+    shared_rate_limiter: Any = None,
 ) -> list[ProbeResult]:
     """Probe POST form parameters for XSS reflection.
 
@@ -1631,6 +1635,12 @@ def probe_post_form(
     """
     delay = (1.0 / rate) if rate > 0 else 0
     canary = _make_canary()
+
+    def _wait_post() -> None:
+        if shared_rate_limiter is not None:
+            shared_rate_limiter.acquire()
+        elif delay > 0:
+            time.sleep(delay)
 
     ua_list = _load_rotation_values(os.environ.get("AXSS_USER_AGENTS")) or [
         "axss/0.1 (+authorized security testing; scrapling)"
@@ -1667,8 +1677,7 @@ def probe_post_form(
             # --- Step 1: GET source page to extract fresh CSRF token ---
             csrf_value: str | None = None
             if csrf_field:
-                if delay > 0:
-                    time.sleep(delay)
+                _wait_post()
                 try:
                     source_resp = _session_get(session, source_page_url, req_kwargs)
                     source_html = _resp_html(source_resp)
@@ -1701,8 +1710,7 @@ def probe_post_form(
                 return body
 
             # --- Step 2: Reflection probe ---
-            if delay > 0:
-                time.sleep(delay)
+            _wait_post()
             try:
                 resp1 = session.post(
                     action_url,
@@ -1747,8 +1755,7 @@ def probe_post_form(
                 ))
                 for _fu in _follow_up_candidates:
                     try:
-                        if delay > 0:
-                            time.sleep(delay)
+                        _wait_post()
                         _fu_resp = _session_get(session, _fu, req_kwargs)
                         _fu_html = _resp_html(_fu_resp)
                         _fu_refs = _find_reflections(_fu_html, canary)
@@ -1776,8 +1783,7 @@ def probe_post_form(
                 continue
 
             # --- Step 3: Char survival probe ---
-            if delay > 0:
-                time.sleep(delay)
+            _wait_post()
             surviving = frozenset()
             try:
                 # Refresh CSRF token for the second POST if needed
@@ -1809,8 +1815,7 @@ def probe_post_form(
 
                 if follow_up_url:
                     # Char survival is on the follow-up page, not the POST response.
-                    if delay > 0:
-                        time.sleep(delay)
+                    _wait_post()
                     try:
                         _fu_resp2 = _session_get(session, follow_up_url, req_kwargs)
                         surviving = _analyze_char_survival(_resp_html(_fu_resp2), canary)

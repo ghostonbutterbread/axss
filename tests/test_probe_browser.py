@@ -188,6 +188,7 @@ def test_get_worker_prefetch_uses_browser_fetch_for_strong_waf() -> None:
             ai_backend="api",
             cli_tool="claude",
             cli_model=None,
+            mode="deep",
         )
 
     assert browser_fetch.called

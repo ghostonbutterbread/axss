@@ -157,6 +157,39 @@ class _GlobalRateLimiter:
         return self._interval == 0
 
 
+class _SharedRateLimiter:
+    """Cross-process leaky-bucket rate limiter using shared memory.
+
+    A single instance is created in the orchestrator and passed to every worker
+    process so the aggregate HTTP request rate never exceeds *rate* req/s
+    regardless of how many workers run concurrently.
+
+    Uses multiprocessing.Value + multiprocessing.Lock so the next-allowed
+    timestamp is visible and updated atomically across all worker processes.
+    """
+
+    def __init__(self, rate: float) -> None:
+        self._interval = (1.0 / rate) if rate > 0 else 0.0
+        self._next_allowed: Any = multiprocessing.Value('d', 0.0)
+        self._lock: Any = multiprocessing.Lock()
+
+    @property
+    def uncapped(self) -> bool:
+        return self._interval == 0.0
+
+    def acquire(self) -> None:
+        if self._interval == 0.0:
+            return
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                if now >= self._next_allowed.value:
+                    self._next_allowed.value = now + self._interval
+                    return
+                wait_time = self._next_allowed.value - now
+            time.sleep(min(wait_time, 0.05))
+
+
 def _filter_live_urls(
     url_list: list[str],
     auth_headers: dict[str, str] | None = None,
@@ -400,8 +433,11 @@ def run_active_scan(
     upload_target_list = list(upload_targets)
     crawled_pages_list = list(crawled_pages)
 
-    # Single rate limiter shared across ALL phases of this scan session
+    # Pre-flight liveness checks use a thread-local rate limiter (process-local).
     rate_limiter = _GlobalRateLimiter(config.rate)
+    # Scan workers share a single cross-process rate limiter so the aggregate
+    # HTTP request rate never exceeds config.rate regardless of worker count.
+    scan_rate_limiter = _SharedRateLimiter(config.rate)
 
     # Pre-flight: strip tracking params, deduplicate parametric path variants, then drop dead URLs
     if url_list:
@@ -432,17 +468,21 @@ def run_active_scan(
         else:
             warn("Fast batch generation failed — workers will fall back to per-URL generation")
 
-    # Build work items filtered by enabled scan types
-    work_items: list[tuple[str, Any]] = []
-    if config.scan_reflected:
-        work_items += [("get", u) for u in url_list]
+    # Build work items filtered by enabled scan types.
+    # GET and DOM items are interleaved per URL so the two concurrent worker slots
+    # are consumed by both pass-types of the *same* URL rather than two different
+    # URLs running in parallel.  This keeps the full rate budget focused on one
+    # URL at a time instead of spreading it thin across the entire list.
+    get_items: list[tuple[str, Any]] = [("get", u) for u in url_list] if config.scan_reflected else []
+    dom_items: list[tuple[str, Any]] = [("dom", u) for u in url_list] if config.scan_dom else []
+    paired = [item for pair in zip(get_items, dom_items) for item in pair]
+    paired += get_items[len(dom_items):]   # remainder when scan_dom is off
+    paired += dom_items[len(get_items):]   # remainder when scan_reflected is off
+    work_items: list[tuple[str, Any]] = paired
     if config.scan_stored:
         work_items += [("post", pf) for pf in post_form_list]
     if config.scan_uploads:
         work_items += [("upload", ut) for ut in upload_target_list]
-
-    if config.scan_dom:
-        work_items += [("dom", u) for u in url_list]
 
     # Session resume: filter out already-completed work items and restore
     # prior results so _print_summary / write_report include all findings.
@@ -688,19 +728,14 @@ def run_active_scan(
                     except StopIteration:
                         break
 
-                    # Normal mode with rate >= 2: split rate evenly between GET and DOM streams
-                    if config.mode == "normal" and config.rate >= 2:
-                        _get_rate = config.rate / 2
-                    else:
-                        _get_rate = config.rate
-
                     if kind == "get":
                         next_url = item
                         proc = multiprocessing.Process(
                             target=run_worker,
                             kwargs={
                                 "url": next_url,
-                                "rate": _get_rate,
+                                "rate": config.rate,
+                                "shared_rate_limiter": scan_rate_limiter,
                                 "waf_hint": config.waf,
                                 "model": config.model,
                                 "cloud_model": config.cloud_model,
@@ -779,7 +814,8 @@ def run_active_scan(
                             target=run_post_worker,
                             kwargs={
                                 "post_form": pf,
-                                "rate": _get_rate,
+                                "rate": config.rate,
+                                "shared_rate_limiter": scan_rate_limiter,
                                 "waf_hint": config.waf,
                                 "model": config.model,
                                 "cloud_model": config.cloud_model,

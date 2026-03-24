@@ -327,7 +327,16 @@ def emit_basic_config(config_path: str, *, model: str, backend: str, cli_tool: s
         "",
         '  // Preferred hosted model when ai_backend is "api". Use the provider/model format,',
         '  // for example "anthropic/claude-3-5-sonnet" or "openai/gpt-4.1-mini".',
-        f'  "cloud_model": {json.dumps(cloud_model)}',
+        f'  "cloud_model": {json.dumps(cloud_model)},',
+        "",
+        '  // Deep mode reasoning model. Defaults to cloud_model when omitted. Override to use',
+        '  // a stronger reasoning model for --deep triage (e.g. "anthropic/claude-opus-4",',
+        '  // "openai/o3-mini"). Omit or set to "" to inherit cloud_model.',
+        '  // "deep_model": "anthropic/claude-opus-4",',
+        "",
+        '  // Max injection points to promote to deep-mode triage per scan (0 = unlimited).',
+        '  // Points are ranked by local triage score; the top N get --deep treatment.',
+        '  "deep_limit": 0',
         "}",
         "",
     ]
@@ -346,6 +355,14 @@ def emit_advanced_config(config_path: str, *, model: str, backend: str, cli_tool
         "",
         '  // Uses more than just the local model. Set to false to stay local-only.',
         '  "enable_remote_escalation": true,',
+        "",
+        '  // Preferred hosted model when ai.roles.*.backend is "api". Also the default',
+        '  // for deep_model when that field is omitted.',
+        f'  "cloud_model": {json.dumps(cloud_model)},',
+        "",
+        '  // CLI model override when backend is "cli". Use null for the tool default,',
+        '  // or set the exact model string the CLI expects (e.g. "claude-opus-4-6").',
+        '  "cli_model": null,',
         "",
         '  // Advanced role-based AI routing. generation handles payload creation,',
         '  // reasoning is reserved for analysis and planning.',
@@ -368,7 +385,16 @@ def emit_advanced_config(config_path: str, *, model: str, backend: str, cli_tool
         '        "fallback_models": []',
         '      }',
         '    }',
-        '  }',
+        '  },',
+        "",
+        '  // Deep mode reasoning model. Defaults to cloud_model when omitted. Override to use',
+        '  // a stronger reasoning model for --deep triage (e.g. "anthropic/claude-opus-4",',
+        '  // "openai/o3-mini"). Omit or set to "" to inherit cloud_model.',
+        '  // "deep_model": "anthropic/claude-opus-4",',
+        "",
+        '  // Max injection points to promote to deep-mode triage per scan (0 = unlimited).',
+        '  // Points are ranked by local triage score; the top N get --deep treatment.',
+        '  "deep_limit": 0',
         "}",
         "",
     ]
@@ -392,6 +418,8 @@ else:
     cfg.setdefault("use_cloud", cfg.get("enable_remote_escalation", True))
     cfg.setdefault("cloud_model", "anthropic/claude-3-5-sonnet")
     cfg.setdefault("cli_model", None)
+    cfg.setdefault("deep_model", "")
+    cfg.setdefault("deep_limit", 0)
     try:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2)
@@ -445,6 +473,7 @@ KEYS
     _append_key_if_missing "h1_token"            "# HackerOne API token — https://hackerone.com/settings/api_token/edit"
     _append_key_if_missing "bugcrowd_api_key"    "# Bugcrowd API key — used by --scope bc:SLUG"
     _append_key_if_missing "intigriti_api_token" "# Intigriti personal access token — used by --scope ig:HANDLE"
+    _append_key_if_missing "xssy_jwt"            "# xssy.uk JWT — copy from localStorage key userData.token after logging in"
   fi
 
   # 5. ollama serve log placeholder (created lazily, just ensure dir is ready)
