@@ -126,6 +126,7 @@ _LIVENESS_TIMEOUT = 5          # seconds per HEAD/GET
 _LIVENESS_SLOW_THRESHOLD = 3.0 # seconds; URLs slower than this are dropped as "too slow to scan"
 _LIVENESS_WORKERS = 50         # max concurrent connections (further capped by rate)
 _LIVENESS_MIN_LIST  = 2        # skip check for tiny lists
+_DOMAIN_CHECK_TIMEOUT = 5      # seconds per domain root probe
 
 
 class _GlobalRateLimiter:
@@ -301,6 +302,96 @@ def _filter_live_urls(
         info(f"Pre-flight: {len(live)} of {len(url_list)} URL(s) will be scanned")
 
     return live
+
+
+# ---------------------------------------------------------------------------
+# Pre-flight: domain reachability filter
+# ---------------------------------------------------------------------------
+
+def _filter_dead_domains(
+    url_list: list[str],
+    auth_headers: dict[str, str] | None = None,
+) -> list[str]:
+    """Probe the root of each unique domain; drop ALL URLs for domains that are
+    unreachable at the network level.
+
+    Only network-level failures are considered dead:
+      - DNS resolution failure (ERR_NAME_NOT_RESOLVED)
+      - Connection refused
+      - Timeout (no response within _DOMAIN_CHECK_TIMEOUT seconds)
+
+    Any HTTP response — even 401, 403, 429, 5xx — means the domain is up.
+    Those status codes indicate auth walls or WAF JS challenges that Playwright
+    can handle; plain requests cannot, so we must not drop them.
+
+    This is the right pre-check for --urls mode where per-URL liveness is
+    skipped but a completely downed domain would otherwise waste every worker
+    budget spawned against it.
+    """
+    import requests
+    from requests.exceptions import RequestException
+
+    req_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        )
+    }
+    req_headers.update(auth_headers or {})
+
+    # One probe per unique (scheme, netloc)
+    domains: dict[str, str] = {}  # root_url → representative domain key
+    for url in url_list:
+        p = urllib.parse.urlparse(url)
+        key = f"{p.scheme}://{p.netloc}"
+        if key not in domains:
+            domains[key] = key
+
+    if not domains:
+        return url_list
+
+    step(f"Domain reachability check: probing {len(domains)} domain(s)…")
+
+    dead_domains: set[str] = set()
+
+    def _probe(root_url: str) -> tuple[str, bool, str]:
+        try:
+            r = requests.head(
+                root_url, headers=req_headers,
+                timeout=_DOMAIN_CHECK_TIMEOUT, allow_redirects=True,
+            )
+            # Any HTTP response = domain is reachable (even error codes)
+            return root_url, True, str(r.status_code)
+        except RequestException as exc:
+            return root_url, False, str(exc)
+
+    n_workers = min(len(domains), _LIVENESS_WORKERS)
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        futures = {pool.submit(_probe, root): root for root in domains}
+        for fut in as_completed(futures):
+            root, alive, reason = fut.result()
+            if not alive:
+                dead_domains.add(root)
+                warn(f"Domain unreachable (dropping all its URLs): {root}  →  {reason}")
+            else:
+                log.debug("Domain reachable: %s (%s)", root, reason)
+
+    if not dead_domains:
+        info(f"Domain check: all {len(domains)} domain(s) reachable")
+        return url_list
+
+    result = [
+        u for u in url_list
+        if f"{urllib.parse.urlparse(u).scheme}://{urllib.parse.urlparse(u).netloc}"
+        not in dead_domains
+    ]
+    dropped = len(url_list) - len(result)
+    warn(
+        f"Domain check: dropped {dropped} URL(s) across {len(dead_domains)} dead domain(s) "
+        f"({len(result)} remaining)"
+    )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -493,6 +584,13 @@ def run_active_scan(
                 url_list,
                 auth_headers=config.auth_headers,
                 rate_limiter=rate_limiter,
+            )
+        else:
+            # Per-URL liveness skipped (--urls mode), but still probe each unique
+            # domain root so a completely downed host doesn't burn worker budgets.
+            url_list = _filter_dead_domains(
+                url_list,
+                auth_headers=config.auth_headers,
             )
 
     # Split into param-bearing URLs (for reflected GET and normal-mode DOM) vs all URLs
