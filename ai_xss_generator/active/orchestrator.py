@@ -550,7 +550,9 @@ def run_active_scan(
     upload_targets: "Sequence[UploadTarget]" = (),
     crawled_pages: Sequence[str] = (),
     session: "Any | None" = None,
-) -> list[WorkerResult]:
+    config_summary: str = "",
+    auth_summary: str = "",
+) -> tuple[list[WorkerResult], "Path"]:
     """Spawn isolated worker processes for each URL and collect results.
 
     Workers run up to `config.workers` at a time. A shared Manager provides:
@@ -712,6 +714,19 @@ def run_active_scan(
     _pause_requested = False
     _pause_announced = False
 
+    # ── Live report setup ──────────────────────────────────────────────────
+    from ai_xss_generator.active.reporter import (
+        _resolve_output_path, serialize_result, write_live_report,
+    )
+    _live_base: Path = _resolve_output_path(config.output_path, url_list)
+    _ndjson_path: Path = _live_base.with_suffix(".ndjson")
+    # Write empty/initial HTML so the file exists from scan start
+    write_live_report(results, config_summary, auth_summary, _live_base, scan_complete=False)
+    info(f"[report] Live HTML → {_live_base.with_suffix('.html')}")
+    info(f"[report] Live log  → {_ndjson_path}")
+    _last_html_write: float = time.monotonic()
+    _HTML_WRITE_INTERVAL: float = 60.0  # rewrite HTML at most every 60 s (confirmed findings always trigger)
+
     def _build_panel() -> tuple[str, str, str]:
         """Build the three panel line strings from current scan state."""
         import shutil as _sh
@@ -776,7 +791,7 @@ def run_active_scan(
         return sep, bar, workers
 
     def _record_result(r: WorkerResult) -> None:
-        nonlocal confirmed_count
+        nonlocal confirmed_count, _last_html_write
         results.append(r)
         _log_result(r)
         if r.status == "confirmed":
@@ -784,6 +799,20 @@ def run_active_scan(
         if session is not None:
             from ai_xss_generator.session import checkpoint as _checkpoint
             _checkpoint(session, r.url, r)
+        # Append to NDJSON live log
+        try:
+            with _ndjson_path.open("a", encoding="utf-8") as _nf:
+                _nf.write(serialize_result(r) + "\n")
+        except Exception:
+            pass
+        # Rewrite HTML on every confirmed finding, or every 60 s
+        _now = time.monotonic()
+        if r.status == "confirmed" or (_now - _last_html_write) >= _HTML_WRITE_INTERVAL:
+            try:
+                write_live_report(results, config_summary, auth_summary, _live_base, scan_complete=False)
+                _last_html_write = _now
+            except Exception:
+                pass
 
     def _drain_queue() -> None:
         import queue as _queue
@@ -1045,7 +1074,7 @@ def run_active_scan(
         )
 
     _print_summary(results)
-    return results
+    return results, _live_base
 
 
 def _run_blind_pass(

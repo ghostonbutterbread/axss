@@ -173,11 +173,12 @@ def test_upload_only_batch_mode_crawls_each_seed(monkeypatch, tmp_path) -> None:
         )
 
     def _fake_run_active_scan(urls, scan_config, **kwargs):
+        from pathlib import Path
         captured["urls"] = list(urls)
         captured["scan_uploads"] = scan_config.scan_uploads
         captured["scan_stored"] = scan_config.scan_stored
         captured["upload_targets"] = list(kwargs.get("upload_targets", []))
-        return []
+        return [], Path("/tmp/fake_report")
 
     monkeypatch.setattr("ai_xss_generator.cli.resolve_ai_config", lambda config, args=None: SimpleNamespace(
         model="qwen3.5:9b",

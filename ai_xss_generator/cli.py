@@ -1436,14 +1436,6 @@ def _run_active_scan(
             warn(str(_session_exc))
             warn("Continuing anyway — pass --no-session-check to suppress this check.")
 
-    results = run_active_scan(
-        urls, scan_config,
-        post_forms=post_forms,
-        upload_targets=upload_targets,
-        crawled_pages=crawled_pages,
-        session=session,
-    )
-
     config_summary = (
         f"rate={args.rate:g} req/s | workers={scan_config.workers} | "
         f"model={scan_config.model} | waf={waf or 'none'} | "
@@ -1455,10 +1447,22 @@ def _run_active_scan(
         + (f" | waf_source={Path(args.waf_source).name}" if getattr(args, "waf_source", None) else "")
     )
     auth_summary = auth_profile_ref or ("ad hoc headers/cookies" if auth_headers else "none")
+
+    results, live_base = run_active_scan(
+        urls, scan_config,
+        post_forms=post_forms,
+        upload_targets=upload_targets,
+        crawled_pages=crawled_pages,
+        session=session,
+        config_summary=config_summary,
+        auth_summary=auth_summary,
+    )
+
     report_path = write_report(
         results,
         config_summary=config_summary,
         auth_summary=auth_summary,
+        base_path=live_base,
     )
     success(f"Report written to: {report_path}")
     success(f"HTML report written to: {Path(report_path).with_suffix('.html')}")

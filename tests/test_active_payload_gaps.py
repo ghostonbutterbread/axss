@@ -168,7 +168,7 @@ def test_write_report_emits_html_companion(tmp_path) -> None:
     assert written == str(report_path)
     assert html_path.exists()
     html_report = html_path.read_text(encoding="utf-8")
-    assert "axss Active Scan Report" in html_report
+    assert "axss" in html_report and "Scan Report" in html_report
     assert "Confirmed Findings" in html_report
     assert "badge-confirmed" in html_report
     assert "tag_injection" in html_report
