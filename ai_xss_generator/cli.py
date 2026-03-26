@@ -1136,33 +1136,34 @@ def _run_active_scan(
     """Route active scans through the orchestrator."""
     from ai_xss_generator.active.orchestrator import ActiveScanConfig, run_active_scan
     from ai_xss_generator.active.reporter import write_report
-    from ai_xss_generator.parser import read_url_list
+    from ai_xss_generator.parser import resolve_url_input
 
     ai_config = resolved_ai_config or resolve_ai_config(config, args=args)
 
-    if args.urls:
-        try:
-            urls = read_url_list(args.urls)
-        except Exception as exc:
-            print(f"Error reading URL list: {exc}")
-            return 1
-    else:
-        urls = [args.url]
+    try:
+        urls = resolve_url_input(args.urls)
+    except Exception as exc:
+        print(f"Error reading URL list: {exc}")
+        return 1
+
+    no_crawl = getattr(args, "no_crawl", False)
+    force_crawl = getattr(args, "crawl", False)
+    crawl_enabled = (force_crawl or len(urls) == 1) and not no_crawl
 
     upload_only_batch_discovery = bool(
-        args.urls
+        len(urls) > 1
         and scan_uploads
         and not scan_reflected
         and not scan_stored
         and not scan_dom
-        and not getattr(args, "no_crawl", False)
+        and crawl_enabled
     )
 
     # WAF auto-detect from first URL — only when not crawling (the crawl will
     # detect WAF from its seed fetch, saving a redundant round-trip).
     waf = resolved_waf
-    no_crawl = getattr(args, "no_crawl", False)
-    if not waf and urls and (no_crawl or (not args.url and not upload_only_batch_discovery)):
+    # (no_crawl, force_crawl, crawl_enabled already defined above)
+    if not waf and urls and (not crawl_enabled and not upload_only_batch_discovery):
         step(f"Probing for WAF on {urls[0]}...")
         detected = _try_detect_waf(urls[0], getattr(args, "verbose", False))
         if detected:
@@ -1209,14 +1210,14 @@ def _run_active_scan(
     post_forms: list = []
     upload_targets: list = []
     crawled_pages: list = []
-    if scan_uploads and args.urls and not upload_only_batch_discovery:
+    if scan_uploads and len(urls) > 1 and not upload_only_batch_discovery:
         info(
-            "Upload scanning in --urls batch mode only tests upload forms already discovered "
+            "Upload scanning in batch mode only tests upload forms already discovered "
             "from crawlable entry pages; raw URL lists do not discover upload endpoints on their own."
         )
-    if scan_uploads and args.url and no_crawl:
+    if scan_uploads and not crawl_enabled:
         info(
-            "Upload scanning with --no-crawl needs a known upload target; the scanner will not "
+            "Upload scanning with crawl disabled needs a known upload target; the scanner will not "
             "discover multipart forms when crawling is disabled."
         )
     def _crawl_seed(seed_url: str, *, status_label: str | None = None) -> Any:
@@ -1303,56 +1304,78 @@ def _run_active_scan(
             )
         else:
             info("Upload discovery found no multipart forms on the provided seed URLs.")
-    elif args.url and not no_crawl:
+    elif crawl_enabled:
         from ai_xss_generator.cache import get_sitemap, put_sitemap, sitemap_age_minutes, cache_sweep
-        cache_sweep()  # evict expired artifacts before starting
+        cache_sweep()
         _scope_spec = getattr(args, "scope", None) or "auto"
         _fresh = getattr(args, "fresh", False)
-        _cached_crawl = None if _fresh else get_sitemap(urls[0], _scope_spec)
-        if _cached_crawl is not None:
-            crawl_result = _cached_crawl
-            _age_min = sitemap_age_minutes(urls[0], _scope_spec) or 0
-            step(
-                f"Sitemap cache hit — skipping crawl "
-                f"({len(crawl_result.get_urls)} URL(s), "
-                f"{len(crawl_result.post_forms)} form(s), "
-                f"~{_age_min}m old). Use --fresh to re-crawl."
-            )
-        else:
-            crawl_result = _crawl_seed(urls[0])
-            try:
-                put_sitemap(urls[0], _scope_spec, crawl_result)
-            except Exception:
-                pass  # cache write failure is non-fatal
 
-        post_forms = crawl_result.post_forms
-        upload_targets = getattr(crawl_result, "upload_targets", [])
-        crawled_pages = crawl_result.visited_urls
-        if crawl_result.get_urls:
-            msg = f"Crawl complete: {len(crawl_result.get_urls)} GET URL(s) with testable params"
-            if post_forms:
-                msg += f" + {len(post_forms)} POST form(s) discovered"
-            if upload_targets:
-                msg += f" + {len(upload_targets)} upload form(s) discovered"
-            success(msg)
-            urls = crawl_result.get_urls
-        elif post_forms or upload_targets:
-            parts = []
-            if post_forms:
-                parts.append(f"{len(post_forms)} POST form(s) discovered")
-            if upload_targets:
-                parts.append(f"{len(upload_targets)} upload form(s) discovered")
-            success(f"Crawl complete: {' + '.join(parts)} (no GET params)")
-            # urls stays as [args.url] — original URL is still needed for report labeling
-        else:
-            info("Crawl found no URLs with testable params — testing provided URL directly")
-            post_forms = []
-            upload_targets = []
+        if len(urls) == 1:
+            # Single-URL crawl path (existing logic)
+            _cached_crawl = None if _fresh else get_sitemap(urls[0], _scope_spec)
+            if _cached_crawl is not None:
+                crawl_result = _cached_crawl
+                _age_min = sitemap_age_minutes(urls[0], _scope_spec) or 0
+                step(
+                    f"Sitemap cache hit — skipping crawl "
+                    f"({len(crawl_result.get_urls)} URL(s), "
+                    f"{len(crawl_result.post_forms)} form(s), "
+                    f"~{_age_min}m old). Use --fresh to re-crawl."
+                )
+            else:
+                crawl_result = _crawl_seed(urls[0])
+                try:
+                    put_sitemap(urls[0], _scope_spec, crawl_result)
+                except Exception:
+                    pass
 
-        # Use WAF detected from crawl seed if auto-detect hasn't found one yet
-        if not waf and crawl_result.detected_waf:
-            waf = crawl_result.detected_waf
-            success(f"WAF detected: {waf_label(waf)}")
+            post_forms = crawl_result.post_forms
+            upload_targets = getattr(crawl_result, "upload_targets", [])
+            crawled_pages = crawl_result.visited_urls
+            if crawl_result.get_urls:
+                msg = f"Crawl complete: {len(crawl_result.get_urls)} GET URL(s) with testable params"
+                if post_forms:
+                    msg += f" + {len(post_forms)} POST form(s) discovered"
+                if upload_targets:
+                    msg += f" + {len(upload_targets)} upload form(s) discovered"
+                success(msg)
+                urls = crawl_result.get_urls
+            elif post_forms or upload_targets:
+                parts = []
+                if post_forms:
+                    parts.append(f"{len(post_forms)} POST form(s) discovered")
+                if upload_targets:
+                    parts.append(f"{len(upload_targets)} upload form(s) discovered")
+                success(f"Crawl complete: {' + '.join(parts)} (no GET params)")
+            else:
+                info("Crawl found no URLs with testable params — testing provided URL directly")
+                post_forms = []
+                upload_targets = []
+
+            if not waf and crawl_result.detected_waf:
+                waf = crawl_result.detected_waf
+                success(f"WAF detected: {waf_label(waf)}")
+
+        else:
+            # Multi-URL crawl (--crawl flag explicitly set)
+            all_get_urls: list[str] = []
+            for idx, seed in enumerate(urls, 1):
+                crawl_result = _crawl_seed(seed, status_label=f"({idx}/{len(urls)})")
+                if crawl_result:
+                    post_forms.extend(crawl_result.post_forms)
+                    upload_targets.extend(getattr(crawl_result, "upload_targets", []))
+                    all_get_urls.extend(crawl_result.get_urls)
+                    crawled_pages.extend(crawl_result.visited_urls)
+                    if not waf and crawl_result.detected_waf:
+                        waf = crawl_result.detected_waf
+                        success(f"WAF detected: {waf_label(waf)}")
+            if all_get_urls:
+                success(
+                    f"Crawl complete: {len(all_get_urls)} GET URL(s) across {len(urls)} seed(s)"
+                )
+                urls = all_get_urls
+            else:
+                info("Crawl found no URLs with testable params — testing provided URLs directly")
 
     # ── Dry-run: print attack surface and exit ────────────────────────────────
     if getattr(args, "dry_run", False):
@@ -1432,7 +1455,7 @@ def _run_active_scan(
         research=getattr(args, "research", False),
         # --urls = pre-enumerated list: skip liveness by default, --live overrides
         # -u     = crawler-discovered: always check (list is small and fresh)
-        skip_liveness=bool(args.urls) and not getattr(args, "live", False),
+        skip_liveness=len(urls) > 1 and not getattr(args, "live", False),
         skip_triage=getattr(args, "skip_triage", False),
     )
 
