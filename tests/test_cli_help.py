@@ -54,8 +54,8 @@ class CliHelpTest(unittest.TestCase):
 
     def test_scan_help(self) -> None:
         help_text = _subparser_help("scan")
-        self.assertIn("-u TARGET, --url TARGET", help_text)
-        self.assertIn("--urls FILE", help_text)
+        self.assertIn("-u TARGET, --urls TARGET", help_text)
+        self.assertIn("--crawl", help_text)
         self.assertIn("--interesting", help_text)
         self.assertIn("--deep", help_text)
         self.assertIn("--fast", help_text)

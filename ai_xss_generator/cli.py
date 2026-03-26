@@ -383,7 +383,8 @@ def _build_scan_parser(
             "Examples:\n"
             "  axss scan -u https://example.com\n"
             "  axss scan -u https://example.com --deep\n"
-            "  axss scan --urls urls.txt --reflected --stored\n"
+            "  axss scan -u urls.txt --reflected --stored\n"
+            "  axss scan -u https://a.com,https://b.com\n"
             "  axss scan --interesting targets.txt\n"
             "  axss scan -u https://example.com --dry-run\n"
             "  axss scan -u https://example.com --scope h1:myprogram\n"
@@ -396,14 +397,14 @@ def _build_scan_parser(
 
     target = scan.add_mutually_exclusive_group()
     target.add_argument(
-        "-u", "--url",
+        "-u", "--urls",
         metavar="TARGET",
-        help="Single target URL to crawl and scan.",
-    )
-    target.add_argument(
-        "--urls",
-        metavar="FILE",
-        help="Scan one URL per line from a file (assumes pre-enumerated endpoints, skips crawl).",
+        dest="urls",
+        help=(
+            "Target URL, comma-separated list of URLs, or path to a file of URLs (one per line). "
+            "A single URL triggers crawl; multiple URLs skip crawl (use --crawl to override). "
+            "e.g. -u https://example.com  or  -u targets.txt  or  -u https://a.com,https://b.com"
+        ),
     )
     scan.add_argument(
         "--interesting",
@@ -463,6 +464,15 @@ def _build_scan_parser(
         action="store_true",
         default=False,
         help="Skip crawling and test only the provided URL directly.",
+    )
+    scan.add_argument(
+        "--crawl",
+        action="store_true",
+        default=False,
+        help=(
+            "Force crawl even when multiple URLs are provided. "
+            "Crawls from each URL in the list and merges discovered endpoints."
+        ),
     )
     scan.add_argument(
         "--scope",
@@ -623,6 +633,7 @@ _ARG_DEFAULTS: dict[str, object] = {
     "deep_limit": None,
     "dry_run": False,
     "resume": False,
+    "crawl": False,
     "no_crawl": False,
     "scope": None,
     "depth": 2,
