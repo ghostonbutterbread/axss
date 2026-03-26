@@ -1148,11 +1148,10 @@ def _run_active_scan(
 
     no_crawl = getattr(args, "no_crawl", False)
     force_crawl = getattr(args, "crawl", False)
-    crawl_enabled = (force_crawl or len(urls) == 1) and not no_crawl
-
     if force_crawl and no_crawl:
         print("Error: --crawl and --no-crawl are mutually exclusive")
         return 1
+    crawl_enabled = (force_crawl or len(urls) == 1) and not no_crawl
 
     upload_only_batch_discovery = bool(
         len(urls) > 1
