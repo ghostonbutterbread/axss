@@ -57,7 +57,7 @@ class CliHelpTest(unittest.TestCase):
         help_text = _subparser_help("scan")
         self.assertIn("-u TARGET, --url TARGET", help_text)
         self.assertIn("--urls FILE", help_text)
-        self.assertIn("--interesting FILE", help_text)
+        self.assertIn("--interesting", help_text)
         self.assertIn("--deep", help_text)
         self.assertIn("--fast", help_text)
         self.assertNotIn("--obliterate", help_text)
@@ -227,6 +227,41 @@ class TestNewFlags(unittest.TestCase):
             cwd="/home/ryushe/tools/axss"
         )
         self.assertIn("--test-triage", result.stdout)
+
+
+class TestResolveUrlInput(unittest.TestCase):
+    def test_single_url(self):
+        from ai_xss_generator.parser import resolve_url_input
+        result = resolve_url_input("https://example.com")
+        self.assertEqual(result, ["https://example.com"])
+
+    def test_csv_of_urls(self):
+        from ai_xss_generator.parser import resolve_url_input
+        result = resolve_url_input("https://a.com, https://b.com , https://c.com")
+        self.assertEqual(result, ["https://a.com", "https://b.com", "https://c.com"])
+
+    def test_file_path(self, tmp_path=None):
+        import tempfile, os
+        from ai_xss_generator.parser import resolve_url_input
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            f.write("https://x.com\nhttps://y.com\n# comment\n\n")
+            path = f.name
+        try:
+            result = resolve_url_input(path)
+            self.assertEqual(result, ["https://x.com", "https://y.com"])
+        finally:
+            os.unlink(path)
+
+    def test_missing_file_raises(self):
+        from ai_xss_generator.parser import resolve_url_input
+        with self.assertRaises(ValueError):
+            resolve_url_input("/nonexistent/path/urls.txt")
+
+    def test_http_url_not_treated_as_file(self):
+        from ai_xss_generator.parser import resolve_url_input
+        # A URL that looks like it might be a path — must not hit the filesystem
+        result = resolve_url_input("http://example.com/path/to/resource")
+        self.assertEqual(result, ["http://example.com/path/to/resource"])
 
 
 if __name__ == "__main__":

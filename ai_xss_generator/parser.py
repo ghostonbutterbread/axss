@@ -658,6 +658,21 @@ def read_url_list(path_value: str) -> list[str]:
     return urls
 
 
+def resolve_url_input(value: str) -> list[str]:
+    """Resolve a URL input value to a list of URLs.
+
+    Accepts:
+    - A single URL: "https://example.com"
+    - A CSV of URLs: "https://a.com,https://b.com"
+    - A file path: "targets.txt" (one URL per line)
+    """
+    if value.startswith(("http://", "https://")):
+        if "," in value:
+            return [u.strip() for u in value.split(",") if u.strip()]
+        return [value]
+    return read_url_list(value)
+
+
 def _build_context(
     *,
     html: str,
