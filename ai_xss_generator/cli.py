@@ -1150,13 +1150,17 @@ def _run_active_scan(
     force_crawl = getattr(args, "crawl", False)
     crawl_enabled = (force_crawl or len(urls) == 1) and not no_crawl
 
+    if force_crawl and no_crawl:
+        print("Error: --crawl and --no-crawl are mutually exclusive")
+        return 1
+
     upload_only_batch_discovery = bool(
         len(urls) > 1
         and scan_uploads
         and not scan_reflected
         and not scan_stored
         and not scan_dom
-        and crawl_enabled
+        and not no_crawl
     )
 
     # WAF auto-detect from first URL — only when not crawling (the crawl will
@@ -1215,7 +1219,7 @@ def _run_active_scan(
             "Upload scanning in batch mode only tests upload forms already discovered "
             "from crawlable entry pages; raw URL lists do not discover upload endpoints on their own."
         )
-    if scan_uploads and not crawl_enabled:
+    if scan_uploads and not crawl_enabled and len(urls) == 1:
         info(
             "Upload scanning with crawl disabled needs a known upload target; the scanner will not "
             "discover multipart forms when crawling is disabled."
@@ -1453,8 +1457,8 @@ def _run_active_scan(
         keep_searching=getattr(args, "keep_searching", False),
         extreme=getattr(args, "extreme", False),
         research=getattr(args, "research", False),
-        # --urls = pre-enumerated list: skip liveness by default, --live overrides
-        # -u     = crawler-discovered: always check (list is small and fresh)
+        # multi-URL input = pre-enumerated list: skip liveness by default, --live overrides
+        # single-URL input = crawler will discover URLs: always check (list is small and fresh)
         skip_liveness=len(urls) > 1 and not getattr(args, "live", False),
         skip_triage=getattr(args, "skip_triage", False),
     )
