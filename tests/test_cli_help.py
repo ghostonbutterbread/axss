@@ -32,8 +32,7 @@ class CliHelpTest(unittest.TestCase):
 
     def test_generate_help(self) -> None:
         help_text = _subparser_help("generate")
-        self.assertIn("-u TARGET, --url TARGET", help_text)
-        self.assertIn("--urls FILE", help_text)
+        self.assertIn("-u TARGET, --urls TARGET", help_text)
         self.assertIn("-i FILE_OR_SNIPPET, --input FILE_OR_SNIPPET", help_text)
         self.assertIn("--public", help_text)
         self.assertIn("--merge-batch", help_text)

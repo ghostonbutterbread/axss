@@ -326,7 +326,7 @@ def _build_generate_parser(
             "Examples:\n"
             "  axss generate -u https://example.com\n"
             "  axss generate -u https://example.com --public --waf cloudflare\n"
-            "  axss generate --urls urls.txt --merge-batch -o payloads.json\n"
+            "  axss generate -u urls.txt --merge-batch -o payloads.json\n"
             "  axss generate -i page.html --display heat\n"
             "  axss generate --public --waf modsecurity         (no target — dump public payloads)\n"
             f"  axss generate -u https://example.com -m {config_default_model} -t 15"
@@ -338,14 +338,13 @@ def _build_generate_parser(
 
     target = gen.add_mutually_exclusive_group()
     target.add_argument(
-        "-u", "--url",
+        "-u", "--urls",
         metavar="TARGET",
-        help="Fetch and parse a live URL. e.g. -u https://example.com",
-    )
-    target.add_argument(
-        "--urls",
-        metavar="FILE",
-        help="Fetch one URL per line from a file.",
+        dest="urls",
+        help=(
+            "Target URL, comma-separated list of URLs, or path to a file of URLs (one per line). "
+            "e.g. -u https://example.com  or  -u targets.txt  or  -u https://a.com,https://b.com"
+        ),
     )
     target.add_argument(
         "-i", "--input",
@@ -406,12 +405,15 @@ def _build_scan_parser(
         metavar="FILE",
         help="Scan one URL per line from a file (assumes pre-enumerated endpoints, skips crawl).",
     )
-    target.add_argument(
+    scan.add_argument(
         "--interesting",
-        metavar="FILE",
+        nargs="?",
+        const=True,
+        metavar="FILE|URL",
         help=(
-            "Rank URLs from a file by XSS potential using the AI backend. "
-            "Writes a markdown triage report to help narrow targets before a full scan."
+            "Rank URLs by XSS potential using the AI backend and write a markdown triage report. "
+            "Pass a file of URLs (one per line) or a single URL directly. "
+            "Combine with --urls to rank that URL list without repeating the filename."
         ),
     )
 
@@ -1788,7 +1790,7 @@ def main(argv: list[str] | None = None) -> int:
     _set_verbose(verbose_level)
     _configure_logging(verbose_level)
 
-    has_target = bool(args.url or args.urls or args.input or args.interesting)
+    has_target = bool(args.url or args.urls or args.input or (args.interesting is not None))
 
     # Validate: need at least a target or --public
     if not has_target and not args.public:
@@ -1938,14 +1940,32 @@ def main(argv: list[str] | None = None) -> int:
     waf_knowledge = _load_waf_knowledge_profile(getattr(args, "waf_source", None), args.verbose)
 
     # --- Interesting URL triage mode ---
-    if args.interesting:
+    if args.interesting is not None:
         from ai_xss_generator.interesting import analyze_interesting_urls, write_interesting_report
 
-        step(f"Reading URL list: {args.interesting}")
-        try:
-            urls = read_url_list(args.interesting)
-        except Exception as exc:
-            parser.error(str(exc))
+        # Resolve the URL source: explicit file, inline URL, or fall back to --urls
+        if args.interesting is True:
+            if not args.urls:
+                parser.error(
+                    "--interesting without a FILE or URL argument requires --urls FILE"
+                )
+            source_label = args.urls
+            step(f"Reading URL list: {args.urls}")
+            try:
+                urls = read_url_list(args.urls)
+            except Exception as exc:
+                parser.error(str(exc))
+        elif isinstance(args.interesting, str) and args.interesting.startswith(("http://", "https://")):
+            source_label = args.interesting
+            urls = [args.interesting]
+            step(f"Interesting triage for URL: {args.interesting}")
+        else:
+            source_label = args.interesting
+            step(f"Reading URL list: {args.interesting}")
+            try:
+                urls = read_url_list(args.interesting)
+            except Exception as exc:
+                parser.error(str(exc))
 
         if ai_config.ai_backend == "api":
             warn(
@@ -1971,7 +1991,7 @@ def main(argv: list[str] | None = None) -> int:
 
         report_path = write_interesting_report(
             interesting_results,
-            source_file=args.interesting,
+            source_file=source_label,
             ai_config=ai_config,
         )
         success(f"Report written to: {report_path}")
