@@ -2002,7 +2002,8 @@ def main(argv: list[str] | None = None) -> int:
             source_label = args.interesting
             step(f"Reading URL list: {args.interesting}")
             try:
-                urls = read_url_list(args.interesting)
+                from ai_xss_generator.parser import resolve_url_input
+                urls = resolve_url_input(args.interesting)
             except Exception as exc:
                 parser.error(str(exc))
 
