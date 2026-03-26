@@ -1827,20 +1827,20 @@ def main(argv: list[str] | None = None) -> int:
     _set_verbose(verbose_level)
     _configure_logging(verbose_level)
 
-    has_target = bool(args.url or args.urls or args.input or (args.interesting is not None))
+    has_target = bool(args.urls or args.input or (args.interesting is not None))
 
     # Validate: need at least a target or --public
     if not has_target and not args.public:
         if args.command == "generate":
-            parser.error("axss generate requires -u/--url, --urls, -i/--input, or --public")
+            parser.error("axss generate requires -u/--urls, -i/--input, or --public")
         else:
-            parser.error("axss scan requires -u/--url, --urls, or --interesting")
+            parser.error("axss scan requires -u/--urls or --interesting")
 
     # --- Validate rate ---
     if not math.isfinite(args.rate) or args.rate < 0:
         parser.error("--rate must be a finite number >= 0 (use 0 for uncapped)")
     # Only display rate info when we will actually make HTTP requests
-    if has_target and (args.url or args.urls):
+    if has_target and args.urls:
         rate_label = "uncapped" if args.rate == 0 else f"{args.rate:g} req/sec"
         info(f"Rate limit: {rate_label}")
 
@@ -1855,10 +1855,11 @@ def main(argv: list[str] | None = None) -> int:
             touch_profile_last_used,
         )
 
-        target_hint = str(args.url or "")
-        if not target_hint and args.urls:
+        target_hint = ""
+        if args.urls:
             try:
-                _targets = read_url_list(args.urls)
+                from ai_xss_generator.parser import resolve_url_input
+                _targets = resolve_url_input(args.urls)
                 target_hint = _targets[0] if _targets else ""
             except Exception:
                 target_hint = ""
@@ -1984,12 +1985,13 @@ def main(argv: list[str] | None = None) -> int:
         if args.interesting is True:
             if not args.urls:
                 parser.error(
-                    "--interesting without a FILE or URL argument requires --urls FILE"
+                    "--interesting without a FILE argument requires -u/--urls"
                 )
             source_label = args.urls
             step(f"Reading URL list: {args.urls}")
             try:
-                urls = read_url_list(args.urls)
+                from ai_xss_generator.parser import resolve_url_input
+                urls = resolve_url_input(args.urls)
             except Exception as exc:
                 parser.error(str(exc))
         elif isinstance(args.interesting, str) and args.interesting.startswith(("http://", "https://")):
@@ -2081,9 +2083,9 @@ def main(argv: list[str] | None = None) -> int:
     if _is_active_mode and not _want_generate:
         info(f"XSS generation role: {_format_ai_role(ai_config.generation_role)}")
         info(f"XSS reasoning role: {_format_ai_role(ai_config.reasoning_role)}")
-        if not (args.url or args.urls):
+        if not args.urls:
             parser.error(
-                "active scanning requires -u/--url or --urls — "
+                "active scanning requires -u/--urls — "
                 "use -i/--input with --generate for local file payload generation"
             )
         return _run_active_scan(
