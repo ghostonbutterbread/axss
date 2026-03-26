@@ -24,7 +24,7 @@ from ai_xss_generator.findings import (
 )
 from ai_xss_generator.models import check_api_keys, generate_payloads, list_ollama_models, search_ollama_models
 from ai_xss_generator.output import render_batch_json, render_heat, render_json, render_list, render_summary
-from ai_xss_generator.parser import BatchParseError, parse_target, parse_targets, read_url_list
+from ai_xss_generator.parser import BatchParseError, parse_target, parse_targets, resolve_url_input
 from ai_xss_generator.plugin_system import PluginRegistry
 from ai_xss_generator.public_payloads import FetchResult, fetch_public_payloads, select_reference_payloads
 from ai_xss_generator.types import GenerationResult, ParsedContext
@@ -1136,7 +1136,6 @@ def _run_active_scan(
     """Route active scans through the orchestrator."""
     from ai_xss_generator.active.orchestrator import ActiveScanConfig, run_active_scan
     from ai_xss_generator.active.reporter import write_report
-    from ai_xss_generator.parser import resolve_url_input
 
     ai_config = resolved_ai_config or resolve_ai_config(config, args=args)
 
@@ -1858,7 +1857,6 @@ def main(argv: list[str] | None = None) -> int:
         target_hint = ""
         if args.urls:
             try:
-                from ai_xss_generator.parser import resolve_url_input
                 _targets = resolve_url_input(args.urls)
                 target_hint = _targets[0] if _targets else ""
             except Exception:
@@ -1988,9 +1986,7 @@ def main(argv: list[str] | None = None) -> int:
                     "--interesting without a FILE argument requires -u/--urls"
                 )
             source_label = args.urls
-            step(f"Reading URL list: {args.urls}")
             try:
-                from ai_xss_generator.parser import resolve_url_input
                 urls = resolve_url_input(args.urls)
             except Exception as exc:
                 parser.error(str(exc))
@@ -2000,9 +1996,7 @@ def main(argv: list[str] | None = None) -> int:
             step(f"Interesting triage for URL: {args.interesting}")
         else:
             source_label = args.interesting
-            step(f"Reading URL list: {args.interesting}")
             try:
-                from ai_xss_generator.parser import resolve_url_input
                 urls = resolve_url_input(args.interesting)
             except Exception as exc:
                 parser.error(str(exc))
@@ -2107,15 +2101,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.urls:
         try:
-            from ai_xss_generator.parser import resolve_url_input
             _resolved = resolve_url_input(args.urls)
         except Exception as exc:
             parser.error(str(exc))
+            return 1  # unreachable; parser.error() exits
 
         if len(_resolved) > 1:
             # --- Batch mode (multiple URLs) ---
             urls = _resolved
-            step(f"Reading URL list: {args.urls}")
 
             # WAF auto-detect from first URL if not manually set
             if not resolved_waf and urls:
