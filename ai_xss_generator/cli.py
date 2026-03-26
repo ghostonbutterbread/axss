@@ -2103,119 +2103,129 @@ def main(argv: list[str] | None = None) -> int:
 
     # --- Payload generation mode (--generate or fallback) ---
 
-    # --- Batch URLs mode ---
+    _url = ""  # will be set to resolved single URL; empty for -i mode
+
     if args.urls:
-        step(f"Reading URL list: {args.urls}")
         try:
-            urls = read_url_list(args.urls)
+            from ai_xss_generator.parser import resolve_url_input
+            _resolved = resolve_url_input(args.urls)
         except Exception as exc:
             parser.error(str(exc))
 
-        # WAF auto-detect from first URL if not manually set
-        if not resolved_waf and urls:
-            step(f"Probing for WAF on {urls[0]}...")
-            detected = _try_detect_waf(urls[0], args.verbose)
-            if detected:
-                resolved_waf = detected
-                success(f"WAF detected: {waf_label(detected)}")
+        if len(_resolved) > 1:
+            # --- Batch mode (multiple URLs) ---
+            urls = _resolved
+            step(f"Reading URL list: {args.urls}")
+
+            # WAF auto-detect from first URL if not manually set
+            if not resolved_waf and urls:
+                step(f"Probing for WAF on {urls[0]}...")
+                detected = _try_detect_waf(urls[0], args.verbose)
+                if detected:
+                    resolved_waf = detected
+                    success(f"WAF detected: {waf_label(detected)}")
+                else:
+                    info("No WAF fingerprint detected.")
+
+            # If WAF was auto-detected, add its bypass payloads
+            if args.public and resolved_waf and fetch_result is not None and not _waf_manual:
+                from ai_xss_generator.public_payloads import _waf_candidates
+                waf_extra = _waf_candidates(resolved_waf)
+                if waf_extra:
+                    fetch_result.add(f"waf_{resolved_waf}", waf_extra)
+                    reference_payloads = select_reference_payloads(fetch_result.payloads, limit=20)
+
+            step(f"Fetching and parsing {len(urls)} URL(s)...")
+            try:
+                contexts, errors = parse_targets(urls=urls, parser_plugins=registry.parsers, rate=args.rate, waf=resolved_waf, auth_headers=auth_headers or None)
+            except Exception as exc:
+                parser.error(str(exc))
+
+            contexts = [_attach_waf_knowledge_to_context(context, waf_knowledge) for context in contexts]
+
+            if not contexts and errors:
+                parser.error(errors[0].error)
+
+            step(f"Generating payloads with {selected_model}...")
+            info(f"XSS generation role: {_format_ai_role(ai_config.generation_role)}")
+            info(f"XSS reasoning role: {_format_ai_role(ai_config.reasoning_role)}")
+            results = [
+                _build_result(
+                    context,
+                    model=selected_model,
+                    registry=registry,
+                    verbose=args.verbose,
+                    reference_payloads=reference_payloads,
+                    waf=resolved_waf,
+                    use_cloud=use_cloud,
+                    cloud_model=cloud_model,
+                    ai_backend=ai_backend,
+                    cli_tool=cli_tool,
+                    cli_model=cli_model,
+                    deep=getattr(args, "deep", False),
+                )
+                for context in contexts
+            ]
+
+            merged_result: GenerationResult | None = None
+            if args.merge_batch and contexts:
+                step("Merging batch contexts...")
+                merged_context = _merge_contexts(contexts, source=f"batch:{args.urls}")
+                merged_result = _build_result(
+                    merged_context,
+                    model=selected_model,
+                    registry=registry,
+                    verbose=args.verbose,
+                    reference_payloads=reference_payloads,
+                    waf=resolved_waf,
+                    use_cloud=use_cloud,
+                    cloud_model=cloud_model,
+                    ai_backend=ai_backend,
+                    cli_tool=cli_tool,
+                    cli_model=cli_model,
+                    deep=getattr(args, "deep", False),
+                )
+
+            success(f"Done. {sum(len(r.payloads) for r in results)} total payloads ranked.")
+            print()
+
+            if args.merge_batch and merged_result is not None:
+                _print_single_result(merged_result, args.display, args.top, waf=resolved_waf)
+                if errors:
+                    print()
+                    print("Errors:")
+                    for error in errors:
+                        print(f"- {error.url}: {error.error}")
             else:
-                info("No WAF fingerprint detected.")
+                _print_batch_results(
+                    results,
+                    output_mode=args.display,
+                    top=args.top,
+                    errors=errors,
+                    waf=resolved_waf,
+                )
 
-        # If WAF was auto-detected (not manually set), add its bypass payloads now
-        if args.public and resolved_waf and fetch_result is not None and not _waf_manual:
-            from ai_xss_generator.public_payloads import _waf_candidates
-            waf_extra = _waf_candidates(resolved_waf)
-            if waf_extra:
-                fetch_result.add(f"waf_{resolved_waf}", waf_extra)
-                reference_payloads = select_reference_payloads(fetch_result.payloads, limit=20)
+            if args.output:
+                json_body = render_batch_json(
+                    results,
+                    errors=[error.to_dict() for error in errors],
+                    merged_result=merged_result,
+                )
+                Path(args.output).write_text(json_body, encoding="utf-8")
+                success(f"JSON written to {args.output}")
+            return 0
 
-        step(f"Fetching and parsing {len(urls)} URL(s)...")
-        try:
-            contexts, errors = parse_targets(urls=urls, parser_plugins=registry.parsers, rate=args.rate, waf=resolved_waf, auth_headers=auth_headers or None)
-        except Exception as exc:
-            parser.error(str(exc))
-
-        contexts = [_attach_waf_knowledge_to_context(context, waf_knowledge) for context in contexts]
-
-        if not contexts and errors:
-            parser.error(errors[0].error)
-
-        step(f"Generating payloads with {selected_model}...")
-        info(f"XSS generation role: {_format_ai_role(ai_config.generation_role)}")
-        info(f"XSS reasoning role: {_format_ai_role(ai_config.reasoning_role)}")
-        results = [
-            _build_result(
-                context,
-                model=selected_model,
-                registry=registry,
-                verbose=args.verbose,
-                reference_payloads=reference_payloads,
-                waf=resolved_waf,
-                use_cloud=use_cloud,
-                cloud_model=cloud_model,
-                ai_backend=ai_backend,
-                cli_tool=cli_tool,
-                cli_model=cli_model,
-                deep=getattr(args, "deep", False),
-            )
-            for context in contexts
-        ]
-
-        merged_result: GenerationResult | None = None
-        if args.merge_batch and contexts:
-            step("Merging batch contexts...")
-            merged_context = _merge_contexts(contexts, source=f"batch:{args.urls}")
-            merged_result = _build_result(
-                merged_context,
-                model=selected_model,
-                registry=registry,
-                verbose=args.verbose,
-                reference_payloads=reference_payloads,
-                waf=resolved_waf,
-                use_cloud=use_cloud,
-                cloud_model=cloud_model,
-                ai_backend=ai_backend,
-                cli_tool=cli_tool,
-                cli_model=cli_model,
-                deep=getattr(args, "deep", False),
-            )
-
-        success(f"Done. {sum(len(r.payloads) for r in results)} total payloads ranked.")
-        print()
-
-        if args.merge_batch and merged_result is not None:
-            _print_single_result(merged_result, args.display, args.top, waf=resolved_waf)
-            if errors:
-                print()
-                print("Errors:")
-                for error in errors:
-                    print(f"- {error.url}: {error.error}")
         else:
-            _print_batch_results(
-                results,
-                output_mode=args.display,
-                top=args.top,
-                errors=errors,
-                waf=resolved_waf,
-            )
+            # Single URL from -u/--urls
+            _url = _resolved[0]
 
-        if args.output:
-            json_body = render_batch_json(
-                results,
-                errors=[error.to_dict() for error in errors],
-                merged_result=merged_result,
-            )
-            Path(args.output).write_text(json_body, encoding="utf-8")
-            success(f"JSON written to {args.output}")
-        return 0
-
-    # --- Single target mode (-u / -i) ---
-    target = args.url or args.input or ""
+    # --- Single target mode (_url from -u/--urls, or args.input) ---
+    target = _url or args.input or ""
 
     # WAF auto-detect for live URL
-    if args.url and not resolved_waf:
-        step(f"Probing for WAF on {args.url}...")
-        detected = _try_detect_waf(args.url, args.verbose)
+    if _url and not resolved_waf:
+        step(f"Probing for WAF on {_url}...")
+        detected = _try_detect_waf(_url, args.verbose)
         if detected:
             resolved_waf = detected
             success(f"WAF detected: {waf_label(detected)}")
@@ -2232,14 +2242,14 @@ def main(argv: list[str] | None = None) -> int:
 
     step(f"Fetching/parsing target: {target}")
     try:
-        context = parse_target(url=args.url, html_value=args.input, parser_plugins=registry.parsers, rate=args.rate, waf=resolved_waf, auth_headers=auth_headers or None)
+        context = parse_target(url=_url or None, html_value=args.input, parser_plugins=registry.parsers, rate=args.rate, waf=resolved_waf, auth_headers=auth_headers or None)
     except Exception as exc:
         parser.error(str(exc))
 
     context = _attach_waf_knowledge_to_context(context, waf_knowledge)
 
     # --- Active probing (default for live URLs with query params) ---
-    probe_enabled = args.url and not args.no_probe and "?" in args.url
+    probe_enabled = _url and not args.no_probe and "?" in _url
     if probe_enabled:
         step("Active probing query parameters...")
 
@@ -2251,7 +2261,7 @@ def main(argv: list[str] | None = None) -> int:
 
         from ai_xss_generator.probe import enrich_context, probe_url
 
-        probe_results = probe_url(args.url, rate=args.rate, waf=resolved_waf, on_result=live_cb, auth_headers=auth_headers or None)
+        probe_results = probe_url(_url, rate=args.rate, waf=resolved_waf, on_result=live_cb, auth_headers=auth_headers or None)
         param_count = len(probe_results)
         injectable = sum(1 for r in probe_results if r.is_injectable)
         reflected = sum(1 for r in probe_results if r.is_reflected)
