@@ -119,6 +119,14 @@ def _add_shared_args(p: argparse.ArgumentParser, config_default_model: str) -> N
         help="Never escalate to a cloud LLM. Guarantees offline-only operation.",
     )
     p.add_argument(
+        "--remote-only",
+        action="store_true",
+        help=(
+            "Skip local Ollama and use the configured remote backend directly. "
+            "Use with --backend cli --cli-tool codex to force Codex-backed generation."
+        ),
+    )
+    p.add_argument(
         "--backend",
         metavar="BACKEND",
         choices=("api", "cli"),
@@ -626,6 +634,7 @@ _ARG_DEFAULTS: dict[str, object] = {
     "top": 20,
     "model": None,
     "no_cloud": False,
+    "remote_only": False,
     "backend": None,
     "cli_tool": None,
     "cli_model": None,
@@ -881,6 +890,7 @@ def _build_result(
     reference_payloads: list | None = None,
     waf: str | None = None,
     use_cloud: bool = True,
+    remote_only: bool = False,
     cloud_model: str = "anthropic/claude-3-5-sonnet",
     ai_backend: str = "api",
     cli_tool: str = "claude",
@@ -895,6 +905,7 @@ def _build_result(
         reference_payloads=reference_payloads,
         waf=waf,
         use_cloud=use_cloud,
+        remote_only=remote_only,
         cloud_model=cloud_model,
         ai_backend=ai_backend,
         cli_tool=cli_tool,
@@ -1375,6 +1386,7 @@ def _run_active_scan(
         model=ai_config.model,
         cloud_model=ai_config.cloud_model,
         use_cloud=ai_config.use_cloud,
+        remote_only=ai_config.remote_only,
         waf=waf,
         timeout_seconds=getattr(args, "timeout", 300),
         output_path=getattr(args, "output", None),
@@ -2029,6 +2041,7 @@ def main(argv: list[str] | None = None) -> int:
                 reference_payloads=reference_payloads,
                 waf=resolved_waf,
                 use_cloud=use_cloud,
+                remote_only=ai_config.remote_only,
                 cloud_model=cloud_model,
                 ai_backend=ai_backend,
                 cli_tool=cli_tool,
@@ -2050,6 +2063,7 @@ def main(argv: list[str] | None = None) -> int:
                 reference_payloads=reference_payloads,
                 waf=resolved_waf,
                 use_cloud=use_cloud,
+                remote_only=ai_config.remote_only,
                 cloud_model=cloud_model,
                 ai_backend=ai_backend,
                 cli_tool=cli_tool,
@@ -2163,6 +2177,7 @@ def main(argv: list[str] | None = None) -> int:
         reference_payloads=reference_payloads,
         waf=resolved_waf,
         use_cloud=use_cloud,
+        remote_only=ai_config.remote_only,
         cloud_model=cloud_model,
         ai_backend=ai_backend,
         cli_tool=cli_tool,

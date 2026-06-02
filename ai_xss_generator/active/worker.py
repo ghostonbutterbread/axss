@@ -901,6 +901,7 @@ def run_worker(
     dedup_registry: DictProxy,
     dedup_lock: Any,
     findings_lock: Any,
+    remote_only: bool = False,
     auth_headers: dict[str, str] | None = None,
     sink_url: str | None = None,
     crawled_pages: list[str] | None = None,
@@ -936,6 +937,7 @@ def run_worker(
             model=model,
             cloud_model=cloud_model,
             use_cloud=use_cloud,
+            remote_only=remote_only,
             timeout_seconds=timeout_seconds,
             result_queue=result_queue,
             dedup_registry=dedup_registry,
@@ -978,6 +980,7 @@ def _run(
     findings_lock: Any,
     start_time: float,
     put_result: Any,
+    remote_only: bool = False,
     auth_headers: dict[str, str] | None = None,
     sink_url: str | None = None,
     crawled_pages: list[str] | None = None,
@@ -1279,7 +1282,13 @@ def _run(
                 # is worth cloud API spend. It does NOT generate payloads.
                 # In --fast mode or fast_omni context, triage is skipped and cloud always runs.
                 _triage_approved = True  # default when local model unavailable
-                if context_type != "fast_omni" and escalation_policy.use_local and not context_done and not _timed_out():
+                if (
+                    context_type != "fast_omni"
+                    and escalation_policy.use_local
+                    and not remote_only
+                    and not context_done
+                    and not _timed_out()
+                ):
                     local_model_rounds += 1
                     _triage = _triage_with_local_model(
                         probe_result=context_probe_result,
@@ -2519,6 +2528,7 @@ def run_dom_worker(
     result_queue: "multiprocessing.Queue",
     dedup_registry: "DictProxy",
     dedup_lock: Any,
+    remote_only: bool = False,
     auth_headers: dict[str, str] | None = None,
     ai_backend: str = "api",
     cli_tool: str = "claude",
@@ -2552,6 +2562,7 @@ def run_dom_worker(
             model=model,
             cloud_model=cloud_model,
             use_cloud=use_cloud,
+            remote_only=remote_only,
             timeout_seconds=timeout_seconds,
             put_result=_put_result,
             dedup_registry=dedup_registry,
@@ -2585,6 +2596,7 @@ def _run_dom(
     put_result: Any,
     dedup_registry: "DictProxy",
     dedup_lock: Any,
+    remote_only: bool = False,
     auth_headers: dict[str, str] | None = None,
     ai_backend: str = "api",
     cli_tool: str = "claude",
@@ -2745,8 +2757,8 @@ def _run_dom(
                 ai_engine = ""
                 ai_note = ""
                 local_stage = None
-                # fast/normal mode: bypass local model — cloud fires immediately
-                local_done = (not escalation_policy.use_local) or mode in ("fast", "normal")
+                # fast/normal/remote-only mode: bypass local model — cloud fires immediately
+                local_done = remote_only or (not escalation_policy.use_local) or mode in ("fast", "normal")
                 local_payloads: list[str] = []
                 local_payloads_tried = False
                 cloud_stage = None
@@ -2770,7 +2782,7 @@ def _run_dom(
                     context_type=f"dom:{hit.source_type}:{hit.sink}",
                 )
 
-                if escalation_policy.use_local and not _timed_out():
+                if escalation_policy.use_local and not remote_only and not _timed_out():
                     local_model_rounds += 1
                     local_stage = _start_async_payload_stage(lambda: _get_dom_local_payloads(
                         context=dom_context,
@@ -3394,6 +3406,7 @@ def run_post_worker(
     dedup_registry: "DictProxy",
     dedup_lock: Any,
     findings_lock: Any,
+    remote_only: bool = False,
     auth_headers: dict[str, str] | None = None,
     crawled_pages: list[str] | None = None,
     sink_url: str | None = None,
@@ -3424,6 +3437,7 @@ def run_post_worker(
             model=model,
             cloud_model=cloud_model,
             use_cloud=use_cloud,
+            remote_only=remote_only,
             timeout_seconds=timeout_seconds,
             dedup_registry=dedup_registry,
             dedup_lock=dedup_lock,
@@ -3466,6 +3480,7 @@ def _run_post(
     findings_lock: Any,
     start_time: float,
     put_result: Any,
+    remote_only: bool = False,
     auth_headers: dict[str, str] | None = None,
     crawled_pages: list[str] | None = None,
     sink_url: str | None = None,
@@ -3753,7 +3768,13 @@ def _run_post(
                 # Local model triage gate for POST params — mirrors GET behaviour.
                 # fast_omni skips triage (no probe data, cloud always runs).
                 _triage_approved = True
-                if context_type != "fast_omni" and escalation_policy.use_local and not context_done and not _timed_out():
+                if (
+                    context_type != "fast_omni"
+                    and escalation_policy.use_local
+                    and not remote_only
+                    and not context_done
+                    and not _timed_out()
+                ):
                     local_model_rounds += 1
                     _triage = _triage_with_local_model(
                         probe_result=context_probe_result,

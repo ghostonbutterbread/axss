@@ -61,6 +61,7 @@ class ActiveScanConfig:
     model: str = "qwen3.5:9b"
     cloud_model: str = "anthropic/claude-3-5-sonnet"
     use_cloud: bool = True
+    remote_only: bool = False   # skip local Ollama and go directly to remote backend
     waf: str | None = None
     timeout_seconds: int = 300     # 5 minutes per URL
     output_path: str | None = None  # markdown report output; None = auto
@@ -704,6 +705,7 @@ def run_active_scan(
                                 "model": config.model,
                                 "cloud_model": config.cloud_model,
                                 "use_cloud": config.use_cloud,
+                                "remote_only": config.remote_only,
                                 "timeout_seconds": config.timeout_seconds,
                                 "result_queue": result_queue,
                                 "dedup_registry": dedup_registry,
@@ -738,6 +740,7 @@ def run_active_scan(
                                 "model": config.model,
                                 "cloud_model": config.cloud_model,
                                 "use_cloud": config.use_cloud,
+                                "remote_only": config.remote_only,
                                 "timeout_seconds": config.timeout_seconds,
                                 "result_queue": result_queue,
                                 "dedup_registry": dedup_registry,
@@ -781,6 +784,7 @@ def run_active_scan(
                                 "model": config.model,
                                 "cloud_model": config.cloud_model,
                                 "use_cloud": config.use_cloud,
+                                "remote_only": config.remote_only,
                                 "timeout_seconds": config.timeout_seconds,
                                 "result_queue": result_queue,
                                 "dedup_registry": dedup_registry,

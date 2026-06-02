@@ -2753,6 +2753,7 @@ def generate_payloads(
     past_lessons: list[Any] | None = None,
     memory_profile: dict[str, Any] | None = None,
     local_timeout_seconds: int = 120,
+    remote_only: bool = False,
     deep: bool = False,
     # Legacy params — accepted but ignored
     allowed_memory_tiers: Any = None,
@@ -2761,8 +2762,9 @@ def generate_payloads(
     """Generate, rank, and return payloads for *context*.
 
     Escalation chain:
-      1. Local Ollama (with curated findings and probe lessons injected into prompt)
-      2. If local output is weak AND use_cloud=True AND an API key exists:
+      1. Local Ollama (with curated findings and probe lessons injected into prompt),
+         unless remote_only=True.
+      2. If local output is weak AND use_cloud=True:
          → OpenRouter (preferred) or OpenAI
       3. Fall through to heuristic-only if everything above fails
 
@@ -2805,26 +2807,30 @@ def generate_payloads(
     ai_payloads: list[PayloadCandidate] = []
 
     # ── Step 1: Local Ollama ──────────────────────────────────────────────────
-    try:
-        ai_payloads, resolved_model = _generate_with_ollama(
-            context,
-            model,
-            reference_payloads=reference_payloads,
-            waf=waf,
-            past_findings=past_findings,
-            past_lessons=past_lessons,
-            request_timeout_seconds=local_timeout_seconds,
-        )
-        engine = "ollama"
-        used_fallback = False
-    except Exception:
-        pass
+    if not remote_only:
+        try:
+            ai_payloads, resolved_model = _generate_with_ollama(
+                context,
+                model,
+                reference_payloads=reference_payloads,
+                waf=waf,
+                past_findings=past_findings,
+                past_lessons=past_lessons,
+                request_timeout_seconds=local_timeout_seconds,
+            )
+            engine = "ollama"
+            used_fallback = False
+        except Exception:
+            pass
 
     # ── Step 2: Cloud escalation (only when local is weak and cloud allowed) ──
     cloud_used = False
     if _is_weak_output(ai_payloads) and use_cloud:
         if progress is not None:
-            progress("Local model output weak — attempting cloud escalation...")
+            if remote_only:
+                progress("Remote-only mode — attempting configured remote backend...")
+            else:
+                progress("Local model output weak — attempting cloud escalation...")
 
         cloud_payloads, cloud_engine = _try_cloud(
             context,

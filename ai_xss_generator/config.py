@@ -138,6 +138,8 @@ class AppConfig:
     # Cloud escalation — set to False to never leave local Ollama.
     # Ignored entirely when no API key (OPENAI_API_KEY / OPENROUTER_API_KEY) is set.
     use_cloud: bool = True
+    # Skip local Ollama entirely and use the configured remote backend directly.
+    remote_only: bool = False
     # Preferred OpenRouter model (only used when ai_backend="api").
     # Example: "anthropic/claude-3-5-sonnet", "google/gemini-2.0-flash-001"
     cloud_model: str = "anthropic/claude-3-5-sonnet"
@@ -167,6 +169,7 @@ class AppConfig:
 class ResolvedAIConfig:
     model: str
     use_cloud: bool
+    remote_only: bool
     cloud_model: str
     ai_backend: str
     cli_tool: str
@@ -286,6 +289,9 @@ def load_config() -> AppConfig:
     use_cloud = raw.get("enable_remote_escalation", raw.get("use_cloud", True))
     if not isinstance(use_cloud, bool):
         use_cloud = True
+    remote_only = raw.get("remote_only", raw.get("skip_local_model", False))
+    if not isinstance(remote_only, bool):
+        remote_only = False
 
     cloud_model = raw.get("cloud_model", "anthropic/claude-3-5-sonnet")
     if not isinstance(cloud_model, str) or not cloud_model.strip():
@@ -314,6 +320,7 @@ def load_config() -> AppConfig:
     return AppConfig(
         default_model=default_model.strip(),
         use_cloud=use_cloud,
+        remote_only=remote_only,
         cloud_model=cloud_model.strip(),
         api_fallback_models=api_fallback_models,
         ai_backend=ai_backend,
@@ -352,6 +359,11 @@ def resolve_ai_config(
     if no_cloud is None:
         no_cloud = bool(getattr(args, "no_cloud", False)) if args is not None else False
     resolved_use_cloud = bool(config.use_cloud) and not bool(no_cloud)
+    resolved_remote_only = bool(config.remote_only) or (
+        bool(getattr(args, "remote_only", False)) if args is not None else False
+    )
+    if resolved_remote_only:
+        resolved_use_cloud = not bool(no_cloud)
 
     default_role = AIRoleConfig()
     resolved_generation_role = (
@@ -439,6 +451,7 @@ def resolve_ai_config(
     return ResolvedAIConfig(
         model=resolved_model.strip(),
         use_cloud=resolved_use_cloud,
+        remote_only=resolved_remote_only,
         cloud_model=resolved_cloud_model.strip(),
         api_fallback_models=resolved_api_fallback_models,
         ai_backend=resolved_backend,

@@ -64,6 +64,60 @@ def test_resolve_ai_config_applies_args_overrides() -> None:
     assert resolved.generation_role.tool == "codex"
 
 
+def test_resolve_ai_config_remote_only_enables_remote_backend() -> None:
+    config = AppConfig(
+        default_model="qwen3.5:9b",
+        use_cloud=False,
+        remote_only=False,
+        cloud_model="anthropic/claude-3-5-sonnet",
+        api_fallback_models=(),
+        ai_backend="api",
+        cli_tool="claude",
+        cli_model=None,
+    )
+    args = SimpleNamespace(
+        model=None,
+        no_cloud=False,
+        remote_only=True,
+        backend="cli",
+        cli_tool="codex",
+        cli_model=None,
+    )
+
+    resolved = resolve_ai_config(config, args=args)
+
+    assert resolved.remote_only is True
+    assert resolved.use_cloud is True
+    assert resolved.ai_backend == "cli"
+    assert resolved.cli_tool == "codex"
+
+
+def test_resolve_ai_config_no_cloud_still_overrides_remote_only() -> None:
+    config = AppConfig(
+        default_model="qwen3.5:9b",
+        use_cloud=True,
+        remote_only=True,
+        cloud_model="anthropic/claude-3-5-sonnet",
+        api_fallback_models=(),
+        ai_backend="cli",
+        cli_tool="codex",
+        cli_model=None,
+    )
+    args = SimpleNamespace(
+        model=None,
+        no_cloud=True,
+        remote_only=False,
+        backend=None,
+        cli_tool=None,
+        cli_model=None,
+    )
+
+    resolved = resolve_ai_config(config, args=args)
+
+    assert resolved.remote_only is True
+    assert resolved.use_cloud is False
+
+
 def test_resolve_ai_config_sanitizes_invalid_values() -> None:
     config = AppConfig(
         default_model="",
@@ -129,6 +183,7 @@ def test_load_config_accepts_comments_and_new_key_names(tmp_path, monkeypatch) -
           // Local-only fallback model
           "local_model": "qwen3.5:27b",
           "enable_remote_escalation": false,
+          "remote_only": true,
           "ai_backend": "cli",
           "cli_tool": "claude",
           "cli_model": null,
@@ -143,6 +198,7 @@ def test_load_config_accepts_comments_and_new_key_names(tmp_path, monkeypatch) -
 
     assert loaded.default_model == "qwen3.5:27b"
     assert loaded.use_cloud is False
+    assert loaded.remote_only is True
     assert loaded.ai_backend == "cli"
     assert loaded.cli_tool == "claude"
 
